@@ -22,3 +22,6 @@ Thumbs.db
 # Test/build scratch
 tests/fixtures/generated/
 *.log
+
+# oh-my-claudecode local session state
+.omc/
