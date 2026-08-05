@@ -100,7 +100,7 @@ pub fn spawn_cli(
     );
 
     let mut wrap = if is_batch {
-        let mut w = CommandWrap::with_new("cmd.exe", |c| {
+        let w = CommandWrap::with_new("cmd.exe", |c| {
             c.arg("/d").arg("/s").arg("/c");
             let mut full = std::ffi::OsString::from("\"");
             full.push(program.as_os_str());
@@ -122,6 +122,11 @@ pub fn spawn_cli(
             }
             configure(c, cwd, envs);
         });
+        // Only Windows has `.cmd` shims, so only Windows wraps here. The
+        // rebinding keeps `w` immutable elsewhere, which would otherwise be
+        // an unused-`mut` warning on Linux and macOS.
+        #[cfg(windows)]
+        let mut w = w;
         #[cfg(windows)]
         w.wrap(JobObject);
         w

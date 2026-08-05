@@ -36,7 +36,7 @@ jobs:
     name: Verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -51,7 +51,7 @@ jobs:
             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
             libxdo-dev libssl-dev patchelf
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: npm
@@ -87,7 +87,7 @@ jobs:
             args: ""
             rust-targets: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -108,7 +108,7 @@ jobs:
             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
             libxdo-dev libssl-dev patchelf
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: npm

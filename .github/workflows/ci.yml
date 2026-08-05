@@ -38,7 +38,7 @@ jobs:
         # protected-location logic each have per-OS branches with per-OS tests.
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # rust-toolchain.toml pins the version and components; rustup honours it
       # automatically on first cargo invocation.
@@ -65,7 +65,7 @@ jobs:
       # The desktop crate is part of the cargo workspace, so `cargo test
       # --workspace` compiles Tauri and therefore needs Node and the installed
       # frontend dependencies present.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: npm
@@ -85,9 +85,9 @@ jobs:
     name: Frontend
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: npm
@@ -109,7 +109,7 @@ jobs:
     name: Security and licenses
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -121,7 +121,7 @@ jobs:
         with:
           tool: cargo-audit,cargo-deny
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: npm

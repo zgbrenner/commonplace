@@ -852,8 +852,16 @@ mod tests {
         assert_eq!(response["result"]["isError"], false, "{response}");
         assert_eq!(std::fs::read_to_string(&target).expect("read"), "# hello");
 
+        // The journal deliberately records the *resolved* path, which can be
+        // spelled differently from the one we asked for: on some Windows
+        // machines the temp directory contains an 8.3 short name (for example
+        // `RUNNER~1`) that canonicalization expands. Compare both canonically
+        // rather than asserting on one platform's spelling.
         let op = h.journal.recv().await.expect("journal entry");
-        assert_eq!(op.source, target);
+        assert_eq!(
+            std::fs::canonicalize(&op.source).expect("canonicalize journaled path"),
+            std::fs::canonicalize(&target).expect("canonicalize target"),
+        );
 
         let mut saw_artifact = false;
         while let Ok(event) = h.events.try_recv() {
