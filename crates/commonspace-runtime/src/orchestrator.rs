@@ -303,6 +303,7 @@ pub fn user_facing_error(message: impl Into<String>, recovery: Option<String>) -
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use commonspace_documents::{FileOpKind, FileOperation};
@@ -313,7 +314,7 @@ mod tests {
         std::fs::create_dir_all(&ws_dir).expect("workspace dir");
         let storage = Arc::new(Storage::open_in_memory().expect("storage"));
         let workspace = storage
-            .create_workspace("Test", &[ws_dir.clone()])
+            .create_workspace("Test", std::slice::from_ref(&ws_dir))
             .expect("workspace row");
         let orchestrator = Orchestrator::new(Arc::clone(&storage), tmp.path().join("backups"));
         (tmp, orchestrator, workspace.id, ws_dir)
@@ -362,7 +363,7 @@ mod tests {
         std::fs::write(&target, "original").expect("seed");
 
         let backups = BackupStore::new(orchestrator.backup_root.join(workspace.as_ref()));
-        let fs = SafeFs::new(PathGuard::new([&dir]), backups);
+        let fs = SafeFs::new(PathGuard::new(std::slice::from_ref(&dir)), backups);
         let (_, op) = fs.overwrite_file(&target, b"changed").expect("overwrite");
         storage.record_file_operation(None, &op).expect("journal");
         assert_eq!(std::fs::read_to_string(&target).expect("read"), "changed");
@@ -379,7 +380,7 @@ mod tests {
         let target = dir.join("notes.md");
         std::fs::write(&target, "original").expect("seed");
         let backups = BackupStore::new(orchestrator.backup_root.join(workspace.as_ref()));
-        let fs = SafeFs::new(PathGuard::new([&dir]), backups);
+        let fs = SafeFs::new(PathGuard::new(std::slice::from_ref(&dir)), backups);
         let (_, op) = fs.overwrite_file(&target, b"changed").expect("overwrite");
         storage.record_file_operation(None, &op).expect("journal");
 

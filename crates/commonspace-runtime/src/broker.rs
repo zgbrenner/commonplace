@@ -40,6 +40,22 @@ impl PermissionOutcome {
     }
 }
 
+/// One thing to ask the user about.
+#[derive(Debug, Clone)]
+pub struct Ask {
+    pub task_id: TaskId,
+    pub operation: OperationClass,
+    /// Plain-language description shown in the dialog.
+    pub summary: String,
+    /// Resolved paths involved — what the user is actually approving.
+    pub paths: Vec<PathBuf>,
+    /// Itemized sub-operations for batch requests.
+    pub items: Vec<String>,
+    pub risk: RiskLevel,
+    /// True when the action cannot be undone; the dialog warns explicitly.
+    pub irreversible: bool,
+}
+
 /// A remembered approval: an operation class, optionally narrowed to paths
 /// under a prefix.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -75,15 +91,19 @@ impl PermissionBroker {
     /// answers via [`PermissionBroker::respond`].
     pub async fn request(
         &self,
-        task_id: &TaskId,
-        operation: OperationClass,
-        summary: String,
-        paths: Vec<PathBuf>,
-        items: Vec<String>,
-        risk: RiskLevel,
-        irreversible: bool,
+        ask: Ask,
         events: &tokio::sync::mpsc::UnboundedSender<AgentEvent>,
     ) -> PermissionOutcome {
+        let Ask {
+            task_id,
+            operation,
+            summary,
+            paths,
+            items,
+            risk,
+            irreversible,
+        } = ask;
+        let task_id = &task_id;
         let grant = Grant {
             operation,
             scope_key: scope_key(&paths),
@@ -218,6 +238,7 @@ fn scope_key(paths: &[PathBuf]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -241,13 +262,15 @@ mod tests {
             async move {
                 broker2
                     .request(
-                        &task,
-                        OperationClass::Delete,
-                        "Delete files".into(),
-                        paths,
-                        vec![],
-                        RiskLevel::High,
-                        false,
+                        Ask {
+                            task_id: task,
+                            operation: OperationClass::Delete,
+                            summary: "Delete files".into(),
+                            paths,
+                            items: vec![],
+                            risk: RiskLevel::High,
+                            irreversible: false,
+                        },
                         &tx,
                     )
                     .await
@@ -335,13 +358,15 @@ mod tests {
         let (tx, mut rx) = sink();
         let outcome = broker
             .request(
-                &task,
-                OperationClass::Delete,
-                "Delete files".into(),
-                vec!["C:/ws/docs/b.txt".into()],
-                vec![],
-                RiskLevel::High,
-                false,
+                Ask {
+                    task_id: task.clone(),
+                    operation: OperationClass::Delete,
+                    summary: "Delete files".into(),
+                    paths: vec!["C:/ws/docs/b.txt".into()],
+                    items: vec![],
+                    risk: RiskLevel::High,
+                    irreversible: false,
+                },
                 &tx,
             )
             .await;
@@ -394,13 +419,15 @@ mod tests {
         drop(rx);
         let outcome = broker
             .request(
-                &task,
-                OperationClass::Delete,
-                "Delete".into(),
-                vec!["C:/ws/a.txt".into()],
-                vec![],
-                RiskLevel::High,
-                true,
+                Ask {
+                    task_id: task.clone(),
+                    operation: OperationClass::Delete,
+                    summary: "Delete".into(),
+                    paths: vec!["C:/ws/a.txt".into()],
+                    items: vec![],
+                    risk: RiskLevel::High,
+                    irreversible: true,
+                },
                 &tx,
             )
             .await;
@@ -418,13 +445,15 @@ mod tests {
         let waiter = tokio::spawn(async move {
             broker2
                 .request(
-                    &task2,
-                    OperationClass::Delete,
-                    "Delete".into(),
-                    vec!["C:/ws/a.txt".into()],
-                    vec![],
-                    RiskLevel::High,
-                    true,
+                    Ask {
+                        task_id: task2,
+                        operation: OperationClass::Delete,
+                        summary: "Delete".into(),
+                        paths: vec!["C:/ws/a.txt".into()],
+                        items: vec![],
+                        risk: RiskLevel::High,
+                        irreversible: true,
+                    },
                     &tx,
                 )
                 .await

@@ -208,6 +208,7 @@ fn quote_for_cmd(arg: &str) -> std::ffi::OsString {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::path::PathBuf;

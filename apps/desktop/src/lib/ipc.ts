@@ -44,10 +44,13 @@ const backendErrorSchema = z.object({
   recovery: z.string().nullish(),
 });
 
+// The third type parameter is `unknown`: several schemas accept a narrower
+// input than they produce (Rust omits empty arrays, Zod fills them back in),
+// so the input and output types legitimately differ.
 async function call<T>(
   command: string,
   args: Record<string, unknown>,
-  schema: z.ZodType<T>,
+  schema: z.ZodType<T, z.ZodTypeDef, unknown>,
 ): Promise<T> {
   try {
     const raw = await invoke(command, args);
@@ -176,7 +179,7 @@ export const revealArtifact = (taskId: string, artifactId: string) =>
 
 /* --------------------------------------------------------------- settings */
 
-export const getSetting = <T>(key: string, schema: z.ZodType<T>) =>
+export const getSetting = <T>(key: string, schema: z.ZodType<T, z.ZodTypeDef, unknown>) =>
   call("get_setting", { key }, schema.nullish());
 
 export const setSetting = (key: string, value: unknown) =>

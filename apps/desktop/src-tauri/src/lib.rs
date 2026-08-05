@@ -40,6 +40,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            use tauri::Manager;
             let state = AppState::initialize(app.handle())?;
             // Any task still marked live belongs to a previous process that
             // did not shut down cleanly; fail it with an explanation rather
@@ -75,5 +76,11 @@ pub fn run() {
             commands::set_setting,
         ])
         .run(tauri::generate_context!())
-        .expect("Commonspace failed to start");
+        // Nothing has a window yet at this point, so there is no UI to show an
+        // error in; log it and exit non-zero rather than panicking silently.
+        .unwrap_or_else(|error| {
+            tracing::error!(%error, "Commonspace failed to start");
+            eprintln!("Commonspace failed to start: {error}");
+            std::process::exit(1);
+        });
 }

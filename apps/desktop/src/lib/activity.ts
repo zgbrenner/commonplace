@@ -149,12 +149,15 @@ export function applyEvent(state: ConversationState, event: AgentEvent): Convers
     case "task.completed":
       return { ...state, finished: true, summary: event.summary };
 
-    default: {
-      // Exhaustiveness: a new event type must be handled explicitly.
-      const _never: never = event;
-      return state;
-    }
+    default:
+      // Exhaustiveness: if a new event type is added without a case above,
+      // this line stops compiling.
+      return assertHandled(event, state);
   }
+}
+
+function assertHandled(_event: never, state: ConversationState): ConversationState {
+  return state;
 }
 
 /** Plain-language sentence describing a permission request's operation. */

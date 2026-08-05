@@ -25,10 +25,16 @@ pub struct CommandError {
 
 impl CommandError {
     fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), recovery: None }
+        Self {
+            message: message.into(),
+            recovery: None,
+        }
     }
     fn with_recovery(message: impl Into<String>, recovery: impl Into<String>) -> Self {
-        Self { message: message.into(), recovery: Some(recovery.into()) }
+        Self {
+            message: message.into(),
+            recovery: Some(recovery.into()),
+        }
     }
 }
 
@@ -83,7 +89,9 @@ pub async fn list_connections(state: State<'_, AppState>) -> Result<Vec<Connecti
 /// Plain-language, accurate statement of who pays for what.
 fn billing_note(auth: &AuthStatus) -> String {
     match auth {
-        AuthStatus::Subscription { plan_hint: Some(plan) } => format!(
+        AuthStatus::Subscription {
+            plan_hint: Some(plan),
+        } => format!(
             "Connected through your {plan} subscription. Usage counts against that plan's limits, \
              not against a separate Commonspace charge."
         ),
@@ -106,7 +114,9 @@ fn billing_note(auth: &AuthStatus) -> String {
         AuthStatus::NotInstalled => {
             "The provider's official tool isn't installed on this computer yet.".into()
         }
-        AuthStatus::Error { detail } => format!("Commonspace couldn't check this connection: {detail}"),
+        AuthStatus::Error { detail } => {
+            format!("Commonspace couldn't check this connection: {detail}")
+        }
     }
 }
 
@@ -161,7 +171,11 @@ pub fn list_workspaces(state: State<'_, AppState>) -> Result<Vec<WorkspaceInfo>>
         .storage()
         .list_workspaces()?
         .into_iter()
-        .map(|w| WorkspaceInfo { id: w.id.0, name: w.name, roots: w.roots })
+        .map(|w| WorkspaceInfo {
+            id: w.id.0,
+            name: w.name,
+            roots: w.roots,
+        })
         .collect())
 }
 
@@ -180,7 +194,11 @@ pub fn create_workspace(
     // Folders are authorized by the user through the native picker; store the
     // resolved paths so later scope checks compare like with like.
     let workspace = state.storage().create_workspace(&name, &roots)?;
-    Ok(WorkspaceInfo { id: workspace.id.0, name: workspace.name, roots: workspace.roots })
+    Ok(WorkspaceInfo {
+        id: workspace.id.0,
+        name: workspace.name,
+        roots: workspace.roots,
+    })
 }
 
 #[tauri::command]
@@ -304,7 +322,10 @@ pub async fn start_task(
         AuthStatus::Subscription { .. } | AuthStatus::ApiKey | AuthStatus::LocalModel => {}
         AuthStatus::NotInstalled => {
             return Err(CommandError::with_recovery(
-                format!("{} isn't installed on this computer.", args.provider.display_name()),
+                format!(
+                    "{} isn't installed on this computer.",
+                    args.provider.display_name()
+                ),
                 "Open Connections to install it.",
             ));
         }
@@ -349,7 +370,10 @@ pub async fn start_task(
 
     let task_id = handle.task_id.0.clone();
     state.track(handle);
-    Ok(StartedTask { task_id, conversation_id: conversation.0 })
+    Ok(StartedTask {
+        task_id,
+        conversation_id: conversation.0,
+    })
 }
 
 fn title_from_prompt(prompt: &str) -> String {
@@ -458,13 +482,21 @@ pub fn open_artifact(
 }
 
 #[tauri::command]
-pub fn reveal_artifact(state: State<'_, AppState>, task_id: String, artifact_id: String) -> Result<()> {
+pub fn reveal_artifact(
+    state: State<'_, AppState>,
+    task_id: String,
+    artifact_id: String,
+) -> Result<()> {
     let artifact = find_artifact(&state, &task_id, &artifact_id)?;
     tauri_plugin_opener::reveal_item_in_dir(&artifact.path)
         .map_err(|e| CommandError::new(format!("Commonspace couldn't show that file: {e}")))
 }
 
-fn find_artifact(state: &State<'_, AppState>, task_id: &str, artifact_id: &str) -> Result<Artifact> {
+fn find_artifact(
+    state: &State<'_, AppState>,
+    task_id: &str,
+    artifact_id: &str,
+) -> Result<Artifact> {
     state
         .storage()
         .list_artifacts(&TaskId(task_id.to_string()))?
@@ -491,12 +523,16 @@ pub fn set_setting(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
     #[test]
     fn titles_are_trimmed_and_never_empty() {
-        assert_eq!(title_from_prompt("Organize my downloads\nplease"), "Organize my downloads");
+        assert_eq!(
+            title_from_prompt("Organize my downloads\nplease"),
+            "Organize my downloads"
+        );
         assert_eq!(title_from_prompt("   "), "New task");
         let long = "a".repeat(200);
         let title = title_from_prompt(&long);
@@ -506,7 +542,9 @@ mod tests {
 
     #[test]
     fn billing_notes_are_specific_and_truthful() {
-        let sub = billing_note(&AuthStatus::Subscription { plan_hint: Some("Claude Max".into()) });
+        let sub = billing_note(&AuthStatus::Subscription {
+            plan_hint: Some("Claude Max".into()),
+        });
         assert!(sub.contains("Claude Max"));
         assert!(sub.contains("not against a separate Commonspace charge"));
 

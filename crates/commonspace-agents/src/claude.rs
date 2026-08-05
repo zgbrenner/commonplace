@@ -585,6 +585,7 @@ fn commonspace_tool_title(tool: &str, input: &Value) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

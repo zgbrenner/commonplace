@@ -206,6 +206,7 @@ fn strongest(a: PolicyVerdict, b: PolicyVerdict) -> PolicyVerdict {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use commonspace_core::OperationClass::*;

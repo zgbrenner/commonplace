@@ -160,6 +160,7 @@ fn reject_windows_hazards(path: &Path) -> Result<(), PathGuardError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

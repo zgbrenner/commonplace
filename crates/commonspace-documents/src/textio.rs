@@ -50,6 +50,7 @@ pub fn read_text(path: &Path, max_bytes: usize) -> std::io::Result<DecodedText> 
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

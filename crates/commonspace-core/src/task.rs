@@ -91,9 +91,9 @@ pub struct TransitionError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::TaskState::*;
-    use super::*;
 
     #[test]
     fn happy_path_with_approval() {

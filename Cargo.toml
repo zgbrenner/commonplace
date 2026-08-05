@@ -7,7 +7,7 @@ members = [
     "crates/commonspace-storage",
     "crates/commonspace-agents",
     "crates/commonspace-runtime",
-    # "apps/desktop/src-tauri",  # joined once the Tauri shell is scaffolded
+    "apps/desktop/src-tauri",
 ]
 
 [workspace.package]

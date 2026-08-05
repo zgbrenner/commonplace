@@ -9,6 +9,8 @@
 //! (`scripts/smoke-providers` wraps this.) Mock-only tests are never treated
 //! as proof that the adapters work — these are the proof.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use commonspace_agents::adapter::{AgentAdapter, SessionRequest};
 use commonspace_agents::{ClaudeCodeAdapter, CodexCliAdapter};
 use commonspace_core::{AgentEvent, AuthStatus, InstallStatus, TaskId};

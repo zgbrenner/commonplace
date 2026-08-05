@@ -362,6 +362,7 @@ fn display_name(path: &Path) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -526,6 +527,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    // Clearing the read-only flag is the point of the cleanup below.
+    #[allow(clippy::permissions_set_readonly_false)]
     fn read_only_target_fails_gracefully() {
         let fx = fixture();
         let target = fx.ws.join("locked.txt");
@@ -540,7 +543,7 @@ mod tests {
             "overwriting a read-only file must error, not panic"
         );
 
-        // cleanup so tempdir can be removed
+        // Cleanup so the tempdir can be removed.
         let mut perms = std::fs::metadata(&target).unwrap().permissions();
         perms.set_readonly(false);
         std::fs::set_permissions(&target, perms).unwrap();

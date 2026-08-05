@@ -310,7 +310,11 @@ export type TaskSummary = z.infer<typeof taskSummarySchema>;
  * Parse a value from the backend, throwing a descriptive error on mismatch.
  * Used at every IPC boundary — never trust the shape, even from our own Rust.
  */
-export function parseFromBackend<T>(schema: z.ZodType<T>, value: unknown, context: string): T {
+export function parseFromBackend<T>(
+  schema: z.ZodType<T, z.ZodTypeDef, unknown>,
+  value: unknown,
+  context: string,
+): T {
   const result = schema.safeParse(value);
   if (!result.success) {
     throw new Error(`${context}: unexpected data from Commonspace — ${result.error.message}`);

@@ -345,7 +345,7 @@ async fn dispatch(
             gate(
                 context,
                 OperationClass::Read,
-                &[path.clone()],
+                std::slice::from_ref(&path),
                 None,
                 &format!("Look through {}", display_name(&path)),
             )
@@ -365,7 +365,7 @@ async fn dispatch(
             gate(
                 context,
                 OperationClass::Read,
-                &[path.clone()],
+                std::slice::from_ref(&path),
                 None,
                 &format!("Read {}", display_name(&path)),
             )
@@ -389,7 +389,7 @@ async fn dispatch(
             gate(
                 context,
                 OperationClass::Read,
-                &[path.clone()],
+                std::slice::from_ref(&path),
                 None,
                 "Check for duplicates",
             )
@@ -409,7 +409,7 @@ async fn dispatch(
             gate(
                 context,
                 OperationClass::Create,
-                &[path.clone()],
+                std::slice::from_ref(&path),
                 None,
                 &format!("Create {}", display_name(&path)),
             )
@@ -433,7 +433,7 @@ async fn dispatch(
             gate(
                 context,
                 OperationClass::Modify,
-                &[path.clone()],
+                std::slice::from_ref(&path),
                 None,
                 &format!("Update {}", display_name(&path)),
             )
@@ -464,7 +464,7 @@ async fn dispatch(
             gate(
                 context,
                 class,
-                &[from.clone()],
+                std::slice::from_ref(&from),
                 Some(to.clone()),
                 &format!("Move {} to {}", display_name(&from), to.display()),
             )
@@ -488,7 +488,7 @@ async fn dispatch(
             gate(
                 context,
                 OperationClass::Delete,
-                &[path.clone()],
+                std::slice::from_ref(&path),
                 None,
                 &format!("Move {} to the trash", display_name(&path)),
             )
@@ -543,13 +543,20 @@ async fn gate(
             let outcome = context
                 .broker
                 .request(
-                    &context.task_id,
-                    class,
-                    summary.to_string(),
-                    paths,
-                    Vec::new(),
-                    risk_of(class),
-                    matches!(class, OperationClass::Delete) && false,
+                    crate::broker::Ask {
+                        task_id: context.task_id.clone(),
+                        operation: class,
+                        summary: summary.to_string(),
+                        paths,
+                        items: Vec::new(),
+                        risk: risk_of(class),
+                        // Deletions go to the OS trash and keep a backup, so
+                        // nothing Commonspace does through these tools is
+                        // irreversible today. This flag exists for the
+                        // operations that will be (permanent delete, send,
+                        // publish) and must be set honestly when they land.
+                        irreversible: false,
+                    },
                     &context.events,
                 )
                 .await;
@@ -586,7 +593,7 @@ fn started(context: &ToolContext, call_id: &ToolCallId, title: &str, detail: Opt
 fn record(
     context: &ToolContext,
     op: &FileOperation,
-    path: &PathBuf,
+    path: &std::path::Path,
     modified_existing: bool,
     change_summary: Option<String>,
 ) {
@@ -599,7 +606,7 @@ fn record(
                 .map(|e| e.to_string_lossy().to_lowercase())
                 .unwrap_or_default(),
         ),
-        path: path.clone(),
+        path: path.to_path_buf(),
         name: display_name(path),
         modified_existing,
         backup_path: op.backup.clone(),
@@ -623,6 +630,7 @@ fn display_name(path: &std::path::Path) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use commonspace_core::{DecisionScope, PermissionDecision};
