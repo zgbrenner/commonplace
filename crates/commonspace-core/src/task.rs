@@ -73,7 +73,10 @@ impl TaskState {
         if self.can_transition_to(next) {
             Ok(next)
         } else {
-            Err(TransitionError { from: self, to: next })
+            Err(TransitionError {
+                from: self,
+                to: next,
+            })
         }
     }
 }

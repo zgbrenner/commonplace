@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 /// True when the resolved path lies inside a protected location.
 pub fn is_protected_location(resolved: &Path) -> bool {
-    protected_roots().iter().any(|p| path_starts_with(resolved, p))
+    protected_roots()
+        .iter()
+        .any(|p| path_starts_with(resolved, p))
 }
 
 /// Compute the protected roots for this machine.
@@ -36,8 +38,21 @@ fn protected_roots() -> Vec<PathBuf> {
     #[cfg(not(windows))]
     {
         for p in [
-            "/bin", "/sbin", "/usr", "/etc", "/boot", "/lib", "/lib64", "/var", "/proc", "/sys",
-            "/dev", "/System", "/Library", "/private/etc", "/private/var",
+            "/bin",
+            "/sbin",
+            "/usr",
+            "/etc",
+            "/boot",
+            "/lib",
+            "/lib64",
+            "/var",
+            "/proc",
+            "/sys",
+            "/dev",
+            "/System",
+            "/Library",
+            "/private/etc",
+            "/private/var",
         ] {
             roots.push(PathBuf::from(p));
         }
@@ -66,8 +81,18 @@ fn protected_roots() -> Vec<PathBuf> {
         }
         #[cfg(windows)]
         {
-            roots.push(home.join("AppData").join("Roaming").join("Microsoft").join("Credentials"));
-            roots.push(home.join("AppData").join("Local").join("Microsoft").join("Credentials"));
+            roots.push(
+                home.join("AppData")
+                    .join("Roaming")
+                    .join("Microsoft")
+                    .join("Credentials"),
+            );
+            roots.push(
+                home.join("AppData")
+                    .join("Local")
+                    .join("Microsoft")
+                    .join("Credentials"),
+            );
         }
         #[cfg(target_os = "macos")]
         {
@@ -90,14 +115,20 @@ mod tests {
     fn credential_dirs_are_protected() {
         let home = dirs::home_dir().expect("home dir");
         assert!(is_protected_location(&home.join(".ssh").join("id_ed25519")));
-        assert!(is_protected_location(&home.join(".aws").join("credentials")));
-        assert!(is_protected_location(&home.join(".claude").join("session.json")));
+        assert!(is_protected_location(
+            &home.join(".aws").join("credentials")
+        ));
+        assert!(is_protected_location(
+            &home.join(".claude").join("session.json")
+        ));
     }
 
     #[test]
     fn system_dirs_are_protected() {
         #[cfg(windows)]
-        assert!(is_protected_location(Path::new(r"C:\Windows\System32\cmd.exe")));
+        assert!(is_protected_location(Path::new(
+            r"C:\Windows\System32\cmd.exe"
+        )));
         #[cfg(not(windows))]
         assert!(is_protected_location(Path::new("/etc/passwd")));
     }
@@ -105,6 +136,8 @@ mod tests {
     #[test]
     fn ordinary_user_paths_are_not_protected() {
         let home = dirs::home_dir().expect("home dir");
-        assert!(!is_protected_location(&home.join("Documents").join("report.docx")));
+        assert!(!is_protected_location(
+            &home.join("Documents").join("report.docx")
+        ));
     }
 }

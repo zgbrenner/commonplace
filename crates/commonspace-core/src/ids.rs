@@ -38,15 +38,51 @@ macro_rules! id_type {
     };
 }
 
-id_type!(#[doc = "A workspace: one or more authorized folder roots."] WorkspaceId, "ws");
-id_type!(#[doc = "A conversation thread."] ConversationId, "conv");
-id_type!(#[doc = "A single chat message."] MessageId, "msg");
-id_type!(#[doc = "A task (one delegated unit of work)."] TaskId, "task");
-id_type!(#[doc = "A provider-side session (maps to CLI session/thread ids)."] SessionId, "sess");
-id_type!(#[doc = "A tool invocation within a session."] ToolCallId, "tool");
-id_type!(#[doc = "A permission request awaiting or holding a decision."] PermissionRequestId, "perm");
-id_type!(#[doc = "A generated or modified artifact."] ArtifactId, "art");
-id_type!(#[doc = "A journaled file operation (unit of undo)."] FileOperationId, "fop");
+id_type!(
+    #[doc = "A workspace: one or more authorized folder roots."]
+    WorkspaceId,
+    "ws"
+);
+id_type!(
+    #[doc = "A conversation thread."]
+    ConversationId,
+    "conv"
+);
+id_type!(
+    #[doc = "A single chat message."]
+    MessageId,
+    "msg"
+);
+id_type!(
+    #[doc = "A task (one delegated unit of work)."]
+    TaskId,
+    "task"
+);
+id_type!(
+    #[doc = "A provider-side session (maps to CLI session/thread ids)."]
+    SessionId,
+    "sess"
+);
+id_type!(
+    #[doc = "A tool invocation within a session."]
+    ToolCallId,
+    "tool"
+);
+id_type!(
+    #[doc = "A permission request awaiting or holding a decision."]
+    PermissionRequestId,
+    "perm"
+);
+id_type!(
+    #[doc = "A generated or modified artifact."]
+    ArtifactId,
+    "art"
+);
+id_type!(
+    #[doc = "A journaled file operation (unit of undo)."]
+    FileOperationId,
+    "fop"
+);
 
 #[cfg(test)]
 mod tests {

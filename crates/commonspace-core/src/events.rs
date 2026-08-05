@@ -59,7 +59,10 @@ pub struct AgentErrorInfo {
 #[serde(tag = "type")]
 pub enum AgentEvent {
     #[serde(rename = "message.started")]
-    MessageStarted { message_id: MessageId, role: MessageRole },
+    MessageStarted {
+        message_id: MessageId,
+        role: MessageRole,
+    },
 
     #[serde(rename = "message.delta")]
     MessageDelta { message_id: MessageId, text: String },
@@ -175,11 +178,16 @@ mod tests {
         // Guard against tag typos: parse each dotted name back.
         for (ev, tag) in [
             (
-                AgentEvent::Warning { message: "w".into() },
+                AgentEvent::Warning {
+                    message: "w".into(),
+                },
                 "warning",
             ),
             (
-                AgentEvent::TaskCompleted { summary: "done".into(), usage: None },
+                AgentEvent::TaskCompleted {
+                    summary: "done".into(),
+                    usage: None,
+                },
                 "task.completed",
             ),
             (

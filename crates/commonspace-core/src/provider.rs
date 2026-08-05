@@ -36,10 +36,15 @@ impl ProviderId {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum InstallStatus {
-    Installed { version: String, path: PathBuf },
+    Installed {
+        version: String,
+        path: PathBuf,
+    },
     NotInstalled,
     /// Present but unusable (wrong version, broken install, …).
-    Broken { detail: String },
+    Broken {
+        detail: String,
+    },
 }
 
 /// Truthful authentication state. The Connections screen renders these
@@ -59,7 +64,9 @@ pub enum AuthStatus {
     ApiKey,
     /// Running locally; nothing leaves the machine.
     LocalModel,
-    Error { detail: String },
+    Error {
+        detail: String,
+    },
 }
 
 /// How a provider connection is paid for / powered — shown to the user with

@@ -111,7 +111,10 @@ impl PathGuard {
         reject_windows_hazards(requested)?;
 
         let resolved = soft_canonicalize::soft_canonicalize(requested).map_err(|source| {
-            PathGuardError::Resolve { path: requested.to_path_buf(), source }
+            PathGuardError::Resolve {
+                path: requested.to_path_buf(),
+                source,
+            }
         })?;
         let resolved = dunce::simplified(&resolved).to_path_buf();
 
@@ -123,7 +126,10 @@ impl PathGuard {
             .find(|root| path_starts_with(&resolved, root))
             .cloned();
 
-        Ok(ResolvedPath { resolved, within_root })
+        Ok(ResolvedPath {
+            resolved,
+            within_root,
+        })
     }
 }
 
@@ -179,7 +185,11 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("ws")).unwrap();
         let sneaky = dir.path().join("ws").join("..").join("outside.txt");
         let r = guard.resolve(&sneaky).unwrap();
-        assert!(!r.in_scope(), "resolved {:?} must be out of scope", r.resolved);
+        assert!(
+            !r.in_scope(),
+            "resolved {:?} must be out of scope",
+            r.resolved
+        );
     }
 
     #[test]
@@ -220,7 +230,9 @@ mod tests {
     fn alternate_data_streams_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let guard = PathGuard::new([dir.path()]);
-        let err = guard.resolve(&dir.path().join("report.txt:hidden")).unwrap_err();
+        let err = guard
+            .resolve(&dir.path().join("report.txt:hidden"))
+            .unwrap_err();
         assert!(matches!(err, PathGuardError::AlternateDataStream(_)));
     }
 

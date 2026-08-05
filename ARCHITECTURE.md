@@ -33,12 +33,13 @@ commonplace/                     # repo name; product name is Commonspace
 │       └── src-tauri/           # thin Tauri shell: command/event wiring only
 ├── crates/
 │   ├── commonspace-core/        # domain types, normalized event protocol,
-│   │                            #   task state machine, ids, errors, fs tools
+│   │                            #   task state machine, ids, errors
 │   ├── commonspace-agents/      # AgentAdapter trait, Claude Code + Codex
 │   │                            #   adapters, process lifecycle management
-│   ├── commonspace-permissions/ # deterministic policy engine, path guard,
-│   │                            #   audit journal
-│   ├── commonspace-documents/   # Markdown/text/PDF/DOCX tooling + validation
+│   ├── commonspace-permissions/ # deterministic policy engine, path guard
+│   │                            #   (pure evaluation; no fs mutation)
+│   ├── commonspace-documents/   # document formats (Markdown/text/PDF/DOCX)
+│   │                            #   + safe file operations, backups, undo
 │   └── commonspace-storage/     # SQLite (rusqlite) + migrations + repositories
 ├── packages/
 │   └── protocol/                # TypeScript types + Zod schemas mirroring

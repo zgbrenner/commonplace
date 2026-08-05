@@ -143,8 +143,12 @@ impl PolicyEngine {
             OperationClass::Move => {
                 let cross_folder = match (&request.destination, resolved_targets.first()) {
                     (Some(dest), Some(src)) => {
-                        let dest_parent =
-                            self.guard.resolve(dest)?.resolved.parent().map(PathBuf::from);
+                        let dest_parent = self
+                            .guard
+                            .resolve(dest)?
+                            .resolved
+                            .parent()
+                            .map(PathBuf::from);
                         let src_parent = src.resolved.parent().map(PathBuf::from);
                         dest_parent != src_parent
                     }
@@ -174,11 +178,15 @@ impl PolicyEngine {
 }
 
 fn deny(reason: impl Into<String>) -> PolicyVerdict {
-    PolicyVerdict::Deny { reason: reason.into() }
+    PolicyVerdict::Deny {
+        reason: reason.into(),
+    }
 }
 
 fn approval(reason: impl Into<String>) -> PolicyVerdict {
-    PolicyVerdict::RequireApproval { reason: reason.into() }
+    PolicyVerdict::RequireApproval {
+        reason: reason.into(),
+    }
 }
 
 fn rank(v: &PolicyVerdict) -> u8 {
@@ -208,7 +216,12 @@ mod tests {
     }
 
     fn req(class: OperationClass, targets: Vec<PathBuf>) -> PolicyRequest {
-        PolicyRequest { class, targets, destination: None, permanent: false }
+        PolicyRequest {
+            class,
+            targets,
+            destination: None,
+            permanent: false,
+        }
     }
 
     #[test]
@@ -216,7 +229,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("a.txt");
         std::fs::write(&f, "x").unwrap();
-        let v = engine_for(dir.path()).evaluate(&req(Read, vec![f])).unwrap();
+        let v = engine_for(dir.path())
+            .evaluate(&req(Read, vec![f]))
+            .unwrap();
         assert_eq!(v, PolicyVerdict::Allow);
     }
 
@@ -244,7 +259,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("a.txt");
         std::fs::write(&f, "x").unwrap();
-        let v = engine_for(dir.path()).evaluate(&req(Modify, vec![f])).unwrap();
+        let v = engine_for(dir.path())
+            .evaluate(&req(Modify, vec![f]))
+            .unwrap();
         assert!(matches!(v, PolicyVerdict::RequireApproval { .. }));
     }
 
@@ -256,7 +273,10 @@ mod tests {
         std::fs::write(&a, "x").unwrap();
         std::fs::write(&b, "x").unwrap();
         let e = engine_for(dir.path());
-        assert_eq!(e.evaluate(&req(Rename, vec![a.clone()])).unwrap(), PolicyVerdict::Allow);
+        assert_eq!(
+            e.evaluate(&req(Rename, vec![a.clone()])).unwrap(),
+            PolicyVerdict::Allow
+        );
         assert!(matches!(
             e.evaluate(&req(Rename, vec![a, b])).unwrap(),
             PolicyVerdict::RequireApproval { .. }
@@ -272,7 +292,10 @@ mod tests {
         let e = engine_for(dir.path());
         let mut r = req(Move, vec![src.clone()]);
         r.destination = Some(dir.path().join("out/a.txt"));
-        assert!(matches!(e.evaluate(&r).unwrap(), PolicyVerdict::RequireApproval { .. }));
+        assert!(matches!(
+            e.evaluate(&r).unwrap(),
+            PolicyVerdict::RequireApproval { .. }
+        ));
         // Same-folder single move (rename-like) is allowed.
         let mut r2 = req(Move, vec![src]);
         r2.destination = Some(dir.path().join("in/b.txt"));
@@ -291,7 +314,10 @@ mod tests {
         ));
         let mut r = req(Delete, vec![f]);
         r.permanent = true;
-        assert!(matches!(e.evaluate(&r).unwrap(), PolicyVerdict::Deny { .. }));
+        assert!(matches!(
+            e.evaluate(&r).unwrap(),
+            PolicyVerdict::Deny { .. }
+        ));
     }
 
     #[test]
@@ -311,7 +337,10 @@ mod tests {
     #[test]
     fn secrets_denied_send_publish_upload_gated() {
         let e = engine_for(tempfile::tempdir().unwrap().path());
-        assert!(matches!(e.evaluate(&req(Secret, vec![])).unwrap(), PolicyVerdict::Deny { .. }));
+        assert!(matches!(
+            e.evaluate(&req(Secret, vec![])).unwrap(),
+            PolicyVerdict::Deny { .. }
+        ));
         for class in [Send, Publish, Upload] {
             assert!(matches!(
                 e.evaluate(&req(class, vec![])).unwrap(),
@@ -324,7 +353,9 @@ mod tests {
     fn protected_location_denied_for_read() {
         let home = dirs::home_dir().unwrap();
         let e = engine_for(&home); // even with home itself authorized
-        let v = e.evaluate(&req(Read, vec![home.join(".ssh/id_ed25519")])).unwrap();
+        let v = e
+            .evaluate(&req(Read, vec![home.join(".ssh/id_ed25519")]))
+            .unwrap();
         assert!(matches!(v, PolicyVerdict::Deny { .. }));
     }
 
@@ -334,7 +365,9 @@ mod tests {
         let ok = dir.path().join("a.txt");
         std::fs::write(&ok, "x").unwrap();
         let secret = dirs::home_dir().unwrap().join(".ssh/id_ed25519");
-        let v = engine_for(dir.path()).evaluate(&req(Delete, vec![ok, secret])).unwrap();
+        let v = engine_for(dir.path())
+            .evaluate(&req(Delete, vec![ok, secret]))
+            .unwrap();
         assert!(matches!(v, PolicyVerdict::Deny { .. }));
     }
 }

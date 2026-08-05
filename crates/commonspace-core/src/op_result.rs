@@ -62,7 +62,9 @@ impl OperationResult {
             modified: Vec::new(),
             backups: Vec::new(),
             warnings: Vec::new(),
-            validation: ValidationOutcome::Failed { detail: detail.into() },
+            validation: ValidationOutcome::Failed {
+                detail: detail.into(),
+            },
             user_summary: user_summary.into(),
             diagnostics: None,
         }

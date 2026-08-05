@@ -24,7 +24,7 @@ pub mod task;
 
 pub use artifact::{Artifact, ArtifactKind};
 pub use error::CoreError;
-pub use events::{AgentEvent, AgentErrorInfo, MessageRole, ToolStatus, UsageInfo};
+pub use events::{AgentErrorInfo, AgentEvent, MessageRole, ToolStatus, UsageInfo};
 pub use ids::*;
 pub use op_result::{OperationResult, ValidationOutcome};
 pub use permission::{
