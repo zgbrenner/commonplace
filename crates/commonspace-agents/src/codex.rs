@@ -41,35 +41,21 @@ impl AgentAdapter for CodexCliAdapter {
         };
         let args = vec!["login".to_string(), "status".to_string()];
         let cwd = std::env::temp_dir();
-        let Ok(mut cli) = spawn_cli(&path, &args, &cwd, &[]) else {
-            return AuthStatus::Error {
-                detail: "could not run `codex login status`".into(),
-            };
-        };
-        let mut output = String::new();
-        let collect = async {
-            while let Some(line) = cli.stdout_lines.recv().await {
-                output.push_str(&line);
-                output.push('\n');
+        let (code, output) = match crate::process::probe_output(
+            &path,
+            &args,
+            &cwd,
+            std::time::Duration::from_secs(20),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return AuthStatus::Error {
+                    detail: format!("could not run `codex login status`: {error}"),
+                }
             }
         };
-        if tokio::time::timeout(std::time::Duration::from_secs(20), collect)
-            .await
-            .is_err()
-        {
-            cli.kill.kill().await;
-            return AuthStatus::Error {
-                detail: "`codex login status` timed out".into(),
-            };
-        }
-        let code = cli.wait().await.ok().flatten();
-        {
-            let tail = cli.stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
-            for line in tail.iter() {
-                output.push_str(line);
-                output.push('\n');
-            }
-        }
         let lower = output.to_lowercase();
         if code == Some(0) {
             if lower.contains("chatgpt") {

@@ -81,6 +81,49 @@ impl SpawnedCli {
     }
 }
 
+/// Spawn a short-lived probe (`--version`, `auth status`) and collect its
+/// stdout.
+///
+/// Deliberately does *not* use a job object. Probes spawn no process tree, so
+/// there is nothing to tree-kill, and staying off that path means nothing can
+/// overwrite `CREATE_NO_WINDOW` — these four startup spawns are exactly the
+/// ones a user sees as console windows if suppression fails.
+pub async fn probe_output(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+    timeout: std::time::Duration,
+) -> std::io::Result<(Option<i32>, String)> {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        // 0x08000000 = CREATE_NO_WINDOW. Applied directly, with no wrapper
+        // in the way that could replace it.
+        command.creation_flags(0x0800_0000);
+    }
+
+    let child = command.spawn()?;
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => {
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            Ok((output.status.code(), text))
+        }
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{} did not respond in time", program.display()),
+        )),
+    }
+}
+
 /// Spawn a CLI with tree-kill support and line-streamed stdout.
 ///
 /// `program` must be an absolute, pre-resolved path (see `detect`); callers

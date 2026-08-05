@@ -63,33 +63,19 @@ pub async fn probe_version(name: &str) -> InstallStatus {
     };
     let cwd = std::env::temp_dir();
     let args = vec!["--version".to_string()];
-    match crate::process::spawn_cli(&path, &args, &cwd, &[]) {
-        Ok(mut cli) => {
-            let collect = async {
-                let mut first = String::new();
-                while let Some(line) = cli.stdout_lines.recv().await {
-                    if !line.trim().is_empty() {
-                        first = line.trim().to_string();
-                        break;
-                    }
-                }
-                first
-            };
-            match tokio::time::timeout(std::time::Duration::from_secs(20), collect).await {
-                Ok(version) if !version.is_empty() => InstallStatus::Installed { version, path },
-                Ok(_) => InstallStatus::Broken {
-                    detail: format!("{} produced no version output", path.display()),
-                },
-                Err(_) => {
-                    cli.kill.kill().await;
-                    InstallStatus::Broken {
-                        detail: format!("{} timed out responding to --version", path.display()),
-                    }
-                }
-            }
-        }
-        Err(e) => InstallStatus::Broken {
-            detail: format!("failed to run {}: {e}", path.display()),
+    match crate::process::probe_output(&path, &args, &cwd, std::time::Duration::from_secs(20)).await
+    {
+        Ok((_, output)) => match output.lines().find(|l| !l.trim().is_empty()) {
+            Some(version) => InstallStatus::Installed {
+                version: version.trim().to_string(),
+                path,
+            },
+            None => InstallStatus::Broken {
+                detail: format!("{} produced no version output", path.display()),
+            },
+        },
+        Err(error) => InstallStatus::Broken {
+            detail: format!("could not run {}: {error}", path.display()),
         },
     }
 }

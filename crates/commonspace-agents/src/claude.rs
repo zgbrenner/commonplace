@@ -62,20 +62,11 @@ impl AgentAdapter for ClaudeCodeAdapter {
         // Primary probe: the CLI's own non-destructive status command.
         let args = vec!["auth".to_string(), "status".to_string()];
         let cwd = std::env::temp_dir();
-        if let Ok(mut cli) = spawn_cli(&path, &args, &cwd, &[]) {
-            let mut output = String::new();
-            let collect = async {
-                while let Some(line) = cli.stdout_lines.recv().await {
-                    output.push_str(&line);
-                    output.push('\n');
-                }
-            };
-            if tokio::time::timeout(std::time::Duration::from_secs(20), collect)
+        if let Ok((code, output)) =
+            crate::process::probe_output(&path, &args, &cwd, std::time::Duration::from_secs(20))
                 .await
-                .is_err()
-            {
-                cli.kill.kill().await;
-            } else if cli.wait().await.ok().flatten() == Some(0) {
+        {
+            if code == Some(0) {
                 // `claude auth status` emits JSON:
                 // {"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max",…}
                 if let Ok(status) = serde_json::from_str::<Value>(&output) {
