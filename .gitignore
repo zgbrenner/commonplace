@@ -1,0 +1,24 @@
+# Rust
+target/
+
+# Node
+node_modules/
+dist/
+
+# Tauri
+apps/desktop/src-tauri/gen/
+
+# Local env / editor
+.env
+.env.local
+*.local.json
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test/build scratch
+tests/fixtures/generated/
+*.log

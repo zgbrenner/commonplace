@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/commonspace-core",
+    "crates/commonspace-permissions",
+    "crates/commonspace-documents",
+    "crates/commonspace-storage",
+    "crates/commonspace-agents",
+    # "apps/desktop/src-tauri",  # joined once the Tauri shell is scaffolded
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/zgbrenner/commonplace"
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = "0.1"
+
+commonspace-core = { path = "crates/commonspace-core" }
+commonspace-permissions = { path = "crates/commonspace-permissions" }
+commonspace-documents = { path = "crates/commonspace-documents" }
+commonspace-storage = { path = "crates/commonspace-storage" }
+commonspace-agents = { path = "crates/commonspace-agents" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

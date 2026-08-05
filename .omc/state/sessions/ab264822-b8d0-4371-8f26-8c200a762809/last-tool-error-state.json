@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"gh api repos/tauri-apps/create-tauri-app/contents/templates/template-react-ts/template/package.json --jq '.content' | base64 -d 2>&1\",\"description\":\"Fetch package.json content from react-t...",
+  "error": "Exit code 1\ngh: Not Found (HTTP 404)\nbase64: invalid input",
+  "timestamp": "2026-08-05T03:33:59.050Z",
+  "retry_count": 1
+}
