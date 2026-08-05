@@ -8,11 +8,17 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+chrono.workspace = true
 commonspace-core.workspace = true
+process-wrap = { version = "9.1.0", features = ["tokio1"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
 tracing.workspace = true
+uuid.workspace = true
+which = "8.0.5"
 
 [lints]
 workspace = true

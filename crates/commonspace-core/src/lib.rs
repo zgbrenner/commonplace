@@ -32,6 +32,7 @@ pub use permission::{
 };
 pub use plan::{PlanStep, TaskPlan};
 pub use provider::{
-    AdapterCapabilities, AuthMethod, AuthStatus, HealthReport, InstallStatus, ProviderId,
+    AdapterCapabilities, AuthMethod, AuthStatus, HealthCheck, HealthReport, InstallStatus,
+    ProviderId,
 };
 pub use task::{TaskState, TransitionError};
