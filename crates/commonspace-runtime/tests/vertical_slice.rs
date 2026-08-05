@@ -292,9 +292,17 @@ async fn declining_an_approval_changes_nothing() {
                 conversation_id: conversation.id,
                 workspace_id: workspace.id,
                 provider: ProviderId::ClaudeCode,
+                // The content is spelled out in full and the edit is
+                // mundane. Earlier phrasings ("replace it with REPLACED")
+                // made the agent stop and ask what to write, which left no
+                // tool call for the gate to intercept and made this test
+                // flaky. What is under test is Commonspace's approval gate,
+                // not the model's willingness.
                 prompt: format!(
-                    "Use only the tools from the `commonspace` MCP server. Call overwrite_file \
-                     on {} with the contents REPLACED. Do not ask me questions.",
+                    "Call the `overwrite_file` tool from the `commonspace` MCP server exactly \
+                     once. Use path={} and content=\"# Notes\\n\\n- Call the supplier back.\\n- \
+                     Send the invoice.\\n\". Every argument you need is in this message, so make \
+                     the call immediately without asking me anything.",
                     target.display()
                 ),
                 model: Some("sonnet".into()),
