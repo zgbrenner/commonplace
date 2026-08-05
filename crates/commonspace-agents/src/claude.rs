@@ -198,20 +198,34 @@ impl AgentAdapter for ClaudeCodeAdapter {
             args.push("--resume".into());
             args.push(resume.clone());
         }
-        if let Some(mcp) = &request.mcp {
-            let config = json!({
-                "mcpServers": {
-                    "commonspace": {
-                        "type": "http",
-                        "url": mcp.url,
-                        "headers": { "Authorization": format!("Bearer {}", mcp.token) }
+        // The MCP configuration goes in a file rather than on the command
+        // line: JSON does not survive Windows `.cmd` argument quoting, and a
+        // file keeps the session token out of the process list. The file is
+        // removed as soon as the session ends.
+        let mcp_config_file = match &request.mcp {
+            Some(mcp) => {
+                let config = json!({
+                    "mcpServers": {
+                        "commonspace": {
+                            "type": "http",
+                            "url": mcp.url,
+                            "headers": { "Authorization": format!("Bearer {}", mcp.token) }
+                        }
                     }
-                }
-            });
-            args.push("--mcp-config".into());
-            args.push(config.to_string());
-            args.push("--strict-mcp-config".into());
-        }
+                });
+                let path = std::env::temp_dir().join(format!(
+                    "commonspace-mcp-{}.json",
+                    uuid::Uuid::new_v4().simple()
+                ));
+                std::fs::write(&path, config.to_string())?;
+                restrict_to_owner(&path);
+                args.push("--mcp-config".into());
+                args.push(path.to_string_lossy().into_owned());
+                args.push("--strict-mcp-config".into());
+                Some(path)
+            }
+            None => None,
+        };
 
         let mut cli =
             spawn_cli(&path, &args, &request.cwd, &[]).map_err(|source| AdapterError::Spawn {
@@ -253,6 +267,9 @@ impl AgentAdapter for ClaudeCodeAdapter {
                 saw_result |= normalizer.handle(&value);
             }
             let code = cli.wait().await.ok().flatten();
+            if let Some(path) = &mcp_config_file {
+                let _ = std::fs::remove_file(path);
+            }
             if !saw_result {
                 let tail: Vec<String> = {
                     let t = stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
@@ -307,6 +324,21 @@ impl AgentAdapter for ClaudeCodeAdapter {
             healthy: checks.iter().all(|c| c.passed),
             checks,
         }
+    }
+}
+
+/// Best-effort tightening of a temporary credential file's permissions. On
+/// Unix this is owner-only; on Windows the file inherits the user profile's
+/// ACL, which is the closest equivalent without shelling out to `icacls`.
+fn restrict_to_owner(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
     }
 }
 

@@ -22,7 +22,7 @@ use commonspace_core::{
     AgentEvent, Artifact, ArtifactId, ArtifactKind, OperationClass, PolicyVerdict, RiskLevel,
     TaskId, ToolCallId, ToolStatus,
 };
-use commonspace_documents::{inspect, textio, FileOperation, SafeFs};
+use commonspace_documents::{inspect, office, textio, FileOperation, SafeFs};
 use commonspace_permissions::{PolicyEngine, PolicyRequest};
 use serde_json::{json, Value};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -246,6 +246,30 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "read_document",
+            "description": "Extract the text of a PDF or Word document, including its paragraphs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "path": path_prop("Absolute path of the .pdf or .docx file.") },
+                "required": ["path"]
+            }
+        }),
+        json!({
+            "name": "create_document",
+            "description": "Create a Word document (.docx) from Markdown-style content. Headings use '#', bullets use '-'. Commonspace builds and validates the file; never write .docx bytes yourself.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": path_prop("Absolute path of the .docx file to create."),
+                    "content": {
+                        "type": "string",
+                        "description": "Markdown-style content: '# Heading', '- bullet', or plain paragraphs."
+                    }
+                },
+                "required": ["path", "content"]
+            }
+        }),
+        json!({
             "name": "rename_move",
             "description": "Rename a file or move it to another folder.",
             "inputSchema": {
@@ -402,6 +426,72 @@ async fn dispatch(
                 .map(|(hash, paths)| json!({ "content_hash": hash, "paths": paths }))
                 .collect();
             serde_json::to_string_pretty(&described).map_err(|e| ToolFailure::Failed(e.to_string()))
+        }
+        "read_document" => {
+            let path = arg_path(args, "path")?;
+            gate(
+                context,
+                OperationClass::Read,
+                std::slice::from_ref(&path),
+                None,
+                &format!("Read {}", display_name(&path)),
+            )
+            .await?;
+            started(
+                context,
+                call_id,
+                &format!("Reading {}", display_name(&path)),
+                None,
+            );
+            let extension = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let extracted = match extension.as_str() {
+                "pdf" => office::read_pdf(&path, MAX_READ_BYTES),
+                "docx" => office::read_docx(&path, MAX_READ_BYTES),
+                other => {
+                    return Err(ToolFailure::Failed(format!(
+                        "Commonspace can't read .{other} documents yet. \
+                         Supported here: .pdf and .docx."
+                    )))
+                }
+            }
+            .map_err(|e| ToolFailure::Failed(e.to_string()))?;
+            serde_json::to_string_pretty(&extracted).map_err(|e| ToolFailure::Failed(e.to_string()))
+        }
+        "create_document" => {
+            let path = arg_path(args, "path")?;
+            let content = arg_str(args, "content")?;
+            gate(
+                context,
+                OperationClass::Create,
+                std::slice::from_ref(&path),
+                None,
+                &format!("Create {}", display_name(&path)),
+            )
+            .await?;
+            started(
+                context,
+                call_id,
+                &format!("Writing {}", display_name(&path)),
+                None,
+            );
+            if path.exists() {
+                return Err(ToolFailure::Failed(format!(
+                    "{} already exists; ask before replacing it.",
+                    display_name(&path)
+                )));
+            }
+            let blocks = office::blocks_from_markdown(&content);
+            let result = office::create_docx(&path, &blocks)
+                .map_err(|e| ToolFailure::Failed(e.to_string()))?;
+            // Journaled as a create so the artifact card can offer undo.
+            let mut op =
+                FileOperation::new(commonspace_documents::FileOpKind::Create, path.clone());
+            op.hash_after = inspect::hash_file(&path).ok();
+            record(context, &op, &path, false, None);
+            Ok(result.user_summary)
         }
         "create_file" => {
             let path = arg_path(args, "path")?;
