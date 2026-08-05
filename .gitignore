@@ -25,3 +25,6 @@ tests/fixtures/generated/
 
 # oh-my-claudecode local session state
 .omc/
+
+# Crux plugin local session state
+.crux/
