@@ -58,8 +58,11 @@ scripts/release-check  # every quality gate, required before tagging
 ```
 
 Requires Rust (stable), Node 20+, and the platform's Tauri prerequisites.
-There is no hosted CI; all gates run locally (see
-[docs/releasing.md](docs/releasing.md)).
+
+The same scripts run in GitHub Actions on every push and pull request, across
+Linux, macOS and Windows, so local and CI results cannot drift apart. Tagging
+`v*` builds installers for all three systems and attaches them to a draft
+release (see [docs/releasing.md](docs/releasing.md)).
 
 ## Documentation
 

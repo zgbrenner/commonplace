@@ -1,0 +1,42 @@
+name: Scheduled audit
+
+# A new advisory can land against an unchanged dependency tree, so the
+# security check also runs on a schedule rather than only on push.
+
+on:
+  schedule:
+    # Mondays, 07:00 UTC.
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: Dependency advisories and licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: audit
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Audit dependencies and licenses
+        shell: bash
+        run: scripts/security

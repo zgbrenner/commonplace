@@ -1,4 +1,8 @@
 [toolchain]
 # Minimum for libsqlite3-sys 0.38 (cfg_select!) is 1.95; pin a known-good
-# stable so local builds are reproducible without touching the global default.
+# stable so local builds and CI are reproducible without touching the
+# developer's global default.
 channel = "1.97.1"
+# Declared here rather than installed ad hoc, so a fresh clone and a CI runner
+# both get the components `scripts/lint` needs without extra setup.
+components = ["rustfmt", "clippy"]

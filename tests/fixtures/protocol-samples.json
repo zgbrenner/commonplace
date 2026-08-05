@@ -1,0 +1,343 @@
+{
+  "artifact": {
+    "change_summary": "Created from 12 contracts",
+    "created_at": "2026-08-05T12:00:00Z",
+    "file_operation_id": "fop_0000000000000000000000000000fixt",
+    "id": "art_0000000000000000000000000000fixt",
+    "kind": "docx",
+    "modified_existing": false,
+    "name": "summary.docx",
+    "path": "C:/ws/summary.docx",
+    "task_id": "task_0000000000000000000000000000fixt"
+  },
+  "artifact_kinds": [
+    "docx",
+    "xlsx",
+    "pptx",
+    "pdf",
+    "markdown",
+    "text",
+    "image",
+    "code_diff",
+    "other"
+  ],
+  "auth_status": [
+    {
+      "status": "not_installed"
+    },
+    {
+      "status": "signed_out"
+    },
+    {
+      "plan_hint": "Claude Max",
+      "status": "subscription"
+    },
+    {
+      "status": "subscription"
+    },
+    {
+      "status": "api_key"
+    },
+    {
+      "status": "local_model"
+    },
+    {
+      "detail": "could not run the CLI",
+      "status": "error"
+    }
+  ],
+  "capabilities": {
+    "attachment_types": [],
+    "models": [
+      "default",
+      "sonnet"
+    ],
+    "supports_permission_bridge": true,
+    "supports_resume": true
+  },
+  "conversation_id": "conv_0000000000000000000000000000fixt",
+  "events": [
+    {
+      "message_id": "msg_0000000000000000000000000000fixt",
+      "role": "assistant",
+      "type": "message.started"
+    },
+    {
+      "message_id": "msg_0000000000000000000000000000fixt",
+      "text": "Hello",
+      "type": "message.delta"
+    },
+    {
+      "text": "Considering the folder",
+      "type": "reasoning.summary"
+    },
+    {
+      "plan": {
+        "consequential_actions": [
+          "Create summary.docx"
+        ],
+        "deliverables": [
+          "A summary document"
+        ],
+        "external_services": [],
+        "paths_accessed": [
+          "C:/ws/contracts"
+        ],
+        "paths_likely_modified": [
+          "C:/ws/summary.docx"
+        ],
+        "requires_approval": true,
+        "steps": [
+          {
+            "detail": "Contracts folder",
+            "title": "Read 12 documents"
+          }
+        ]
+      },
+      "type": "plan.created"
+    },
+    {
+      "plan": {
+        "consequential_actions": [
+          "Create summary.docx"
+        ],
+        "deliverables": [
+          "A summary document"
+        ],
+        "external_services": [],
+        "paths_accessed": [
+          "C:/ws/contracts"
+        ],
+        "paths_likely_modified": [
+          "C:/ws/summary.docx"
+        ],
+        "requires_approval": true,
+        "steps": [
+          {
+            "detail": "Contracts folder",
+            "title": "Read 12 documents"
+          }
+        ]
+      },
+      "type": "plan.updated"
+    },
+    {
+      "call_id": "tool_000000000000000000000000000fixt",
+      "paths": [
+        "C:/ws/report.docx"
+      ],
+      "title": "Reading report.docx",
+      "tool": "Read",
+      "type": "tool.requested"
+    },
+    {
+      "call_id": "tool_000000000000000000000000000fixt",
+      "title": "Reading 12 documents",
+      "type": "tool.started"
+    },
+    {
+      "call_id": "tool_000000000000000000000000000fixt",
+      "detail": "8 of 12",
+      "type": "tool.progress"
+    },
+    {
+      "call_id": "tool_000000000000000000000000000fixt",
+      "status": "succeeded",
+      "summary": "Read 12 documents",
+      "type": "tool.completed"
+    },
+    {
+      "request": {
+        "id": "perm_000000000000000000000000000fixt",
+        "irreversible": false,
+        "items": [
+          "copy of a.txt"
+        ],
+        "operation": "delete",
+        "paths": [
+          "C:/ws/copy of a.txt"
+        ],
+        "requested_at": "2026-08-05T12:00:00Z",
+        "risk": "high",
+        "summary": "Move 3 duplicate files to the trash",
+        "task_id": "task_0000000000000000000000000000fixt"
+      },
+      "type": "permission.requested"
+    },
+    {
+      "artifact": {
+        "change_summary": "Created from 12 contracts",
+        "created_at": "2026-08-05T12:00:00Z",
+        "file_operation_id": "fop_0000000000000000000000000000fixt",
+        "id": "art_0000000000000000000000000000fixt",
+        "kind": "docx",
+        "modified_existing": false,
+        "name": "summary.docx",
+        "path": "C:/ws/summary.docx",
+        "task_id": "task_0000000000000000000000000000fixt"
+      },
+      "type": "artifact.created"
+    },
+    {
+      "artifact": {
+        "change_summary": "Created from 12 contracts",
+        "created_at": "2026-08-05T12:00:00Z",
+        "file_operation_id": "fop_0000000000000000000000000000fixt",
+        "id": "art_0000000000000000000000000000fixt",
+        "kind": "docx",
+        "modified_existing": false,
+        "name": "summary.docx",
+        "path": "C:/ws/summary.docx",
+        "task_id": "task_0000000000000000000000000000fixt"
+      },
+      "type": "artifact.modified"
+    },
+    {
+      "message": "One file could not be read",
+      "type": "warning"
+    },
+    {
+      "error": {
+        "code": "provider_exited",
+        "message": "Claude Code ended unexpectedly.",
+        "recovery": "Check the developer details, then try again.",
+        "transient": true
+      },
+      "type": "error"
+    },
+    {
+      "summary": "Created summary.docx from 12 contracts.",
+      "type": "task.completed",
+      "usage": {
+        "input_tokens": 1200,
+        "output_tokens": 340
+      }
+    }
+  ],
+  "health_report": {
+    "checks": [
+      {
+        "detail": "2.1.222",
+        "name": "Installed",
+        "passed": true
+      },
+      {
+        "name": "Signed in",
+        "passed": false
+      }
+    ],
+    "healthy": false
+  },
+  "install_status": [
+    {
+      "path": "C:/npm/claude.cmd",
+      "status": "installed",
+      "version": "2.1.222"
+    },
+    {
+      "status": "not_installed"
+    },
+    {
+      "detail": "timed out",
+      "status": "broken"
+    }
+  ],
+  "operation_classes": [
+    "read",
+    "create",
+    "modify",
+    "rename",
+    "move",
+    "delete",
+    "execute",
+    "install",
+    "network_fetch",
+    "upload",
+    "send",
+    "publish",
+    "secret"
+  ],
+  "operation_results": [
+    {
+      "created": [
+        "C:/ws/summary.docx"
+      ],
+      "success": true,
+      "user_summary": "Created summary.docx",
+      "validation": {
+        "outcome": "passed"
+      }
+    },
+    {
+      "success": false,
+      "user_summary": "This change could not be undone.",
+      "validation": {
+        "detail": "the file changed since",
+        "outcome": "failed"
+      }
+    },
+    {
+      "success": true,
+      "user_summary": "Looked through the folder",
+      "validation": {
+        "outcome": "not_applicable"
+      }
+    }
+  ],
+  "permission_request": {
+    "id": "perm_000000000000000000000000000fixt",
+    "irreversible": false,
+    "items": [
+      "copy of a.txt"
+    ],
+    "operation": "delete",
+    "paths": [
+      "C:/ws/copy of a.txt"
+    ],
+    "requested_at": "2026-08-05T12:00:00Z",
+    "risk": "high",
+    "summary": "Move 3 duplicate files to the trash",
+    "task_id": "task_0000000000000000000000000000fixt"
+  },
+  "plan": {
+    "consequential_actions": [
+      "Create summary.docx"
+    ],
+    "deliverables": [
+      "A summary document"
+    ],
+    "external_services": [],
+    "paths_accessed": [
+      "C:/ws/contracts"
+    ],
+    "paths_likely_modified": [
+      "C:/ws/summary.docx"
+    ],
+    "requires_approval": true,
+    "steps": [
+      {
+        "detail": "Contracts folder",
+        "title": "Read 12 documents"
+      }
+    ]
+  },
+  "provider_ids": [
+    "claude_code",
+    "codex_cli",
+    "gemini_cli",
+    "open_code",
+    "api_compatible",
+    "local_model"
+  ],
+  "task_states": [
+    "draft",
+    "planning",
+    "awaiting_approval",
+    "running",
+    "paused",
+    "completed",
+    "failed",
+    "cancelled",
+    "rolled_back"
+  ]
+}

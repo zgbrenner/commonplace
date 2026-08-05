@@ -47,7 +47,8 @@ commonplace/                     # repo name; product name is Commonspace
 │   └── protocol/                # TypeScript types + Zod schemas mirroring
 │                                #   the Rust serde models at the IPC boundary
 ├── docs/
-├── scripts/                     # local quality gates; no hosted CI
+├── .github/workflows/           # CI and release; invokes scripts/ directly
+├── scripts/                     # the quality gates, run locally and in CI
 └── tests/
     └── fixtures/                # documents, malformed files, tricky filesystems
 ```

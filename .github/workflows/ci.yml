@@ -1,0 +1,134 @@
+name: CI
+
+# CI runs the same `scripts/*` a developer runs locally. That is deliberate:
+# the scripts stay the single definition of what "passing" means, so CI and a
+# developer's machine cannot drift apart.
+#
+# Never run the real-provider smoke tests here. They spawn the user's own
+# authenticated CLIs and consume subscription usage; `cargo test` skips them
+# because they are `#[ignore]`d, and `scripts/smoke-providers` is manual.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push supersedes an in-flight run of the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Backtraces make a CI-only failure diagnosable without a re-run.
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # All three matter: the path guard, process tree-kill, trash, and
+        # protected-location logic each have per-OS branches with per-OS tests.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the version and components; rustup honours it
+      # automatically on first cargo invocation.
+      - name: Show toolchain
+        shell: bash
+        run: rustc --version && cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: Install Linux build dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf
+
+      # The desktop crate is part of the cargo workspace, so `cargo test
+      # --workspace` compiles Tauri and therefore needs Node and the installed
+      # frontend dependencies present.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      - name: Lint (fmt + clippy)
+        shell: bash
+        run: scripts/lint
+
+      - name: Test
+        shell: bash
+        run: scripts/test
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      - name: Typecheck
+        shell: bash
+        run: scripts/typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+  security:
+    name: Security and licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: security
+
+      # Prebuilt binaries rather than `cargo install`, which would rebuild
+      # both tools from source on every run.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      - name: Audit dependencies and licenses
+        shell: bash
+        run: scripts/security

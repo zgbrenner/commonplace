@@ -1,0 +1,141 @@
+name: Release
+
+# Builds installers for every supported operating system and attaches them to
+# a draft GitHub Release.
+#
+# Each installer must be built on the operating system it targets — macOS in
+# particular cannot be cross-compiled — which is the one job a local-only
+# workflow genuinely cannot do from a single machine.
+#
+# The release is created as a *draft*: nothing is published until a human
+# opens it, checks the artifacts, and presses publish.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must already exist)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Refuse to build a release that would not pass the normal gates.
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-verify
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint
+        shell: bash
+        run: scripts/lint
+
+      - name: Test
+        shell: bash
+        run: scripts/test
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS (universal)
+            args: "--target universal-apple-darwin"
+            rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          - os: ubuntu-latest
+            name: Linux
+            args: ""
+            rust-targets: ""
+          - os: windows-latest
+            name: Windows
+            args: ""
+            rust-targets: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Add Rust targets
+        if: matrix.rust-targets != ''
+        shell: bash
+        run: rustup target add ${{ matrix.rust-targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.os }}
+
+      - name: Install Linux build dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional. Set these repository secrets to have the updater's `.sig`
+          # files generated; without them the installers still build fine, the
+          # release simply carries no update signatures.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: Commonspace ${{ inputs.tag || github.ref_name }}
+          releaseBody: |
+            Installers are attached below.
+
+            Commonspace is pre-release software. Read `docs/status.md` in this
+            tag for exactly what is verified working and what is not.
+
+            These builds are **not code-signed**. Windows SmartScreen will warn
+            on first run, and macOS Gatekeeper will require opening the app
+            through System Settings → Privacy & Security.
+          releaseDraft: true
+          prerelease: true
+          args: ${{ matrix.args }}

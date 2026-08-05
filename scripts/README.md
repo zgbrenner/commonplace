@@ -1,10 +1,12 @@
 # Developer / release scripts
 
-Everything here runs **locally**. Commonspace has no hosted CI, no GitHub
-Actions, no `.github/workflows` -- these scripts *are* the CI, run on your
-own machine before you commit, push, or tag a release. That is a deliberate
-project policy, not a temporary gap: see the root `README.md` and
-[`docs/releasing.md`](../docs/releasing.md) if present.
+These scripts are the single definition of what "passing" means. You run them
+on your own machine before you commit, push, or tag; GitHub Actions runs the
+very same scripts in `.github/workflows/`, on Linux, macOS and Windows.
+
+That is the point of the arrangement: CI has no separate list of commands it
+runs, so it cannot quietly diverge from what you ran locally. Change a gate
+here and CI changes with it. See [`docs/releasing.md`](../docs/releasing.md).
 
 Each script is POSIX-ish `bash` with no file extension, works from any
 directory (they `cd` to the repo root themselves), and is safe to re-run
@@ -54,5 +56,8 @@ scripts/release-check      # every required gate; stops on first failure
 scripts/smoke-providers    # manual -- real subscription usage, run deliberately
 ```
 
-Then build installers on each OS you ship for -- there is no cross-compiling
-and no hosted CI to do it for you.
+Then either push the tag and let `.github/workflows/release.yml` build the
+installers for all three operating systems, or build them yourself on each OS
+you ship for. There is no cross-compiling: macOS in particular can only be
+built on macOS, which is the one job a single developer machine cannot do
+alone.

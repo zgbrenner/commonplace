@@ -29,9 +29,15 @@ scripts/test       # full test suite including fixtures
 scripts/release-check  # everything; must pass before any tag
 ```
 
-There is no hosted CI. `scripts/check` is the bar for every PR; run it before
-pushing. Optional git hooks (`scripts/install-hooks`) run the fast subset on
-commit.
+`scripts/check` is the bar for every PR. GitHub Actions runs those same
+scripts on Linux, macOS and Windows, so a green local run should mean a green
+CI run — please still run it before pushing rather than using CI as your
+first check. Optional git hooks (`scripts/install-hooks`) run the fast subset
+on commit.
+
+CI never runs `scripts/smoke-providers`: those tests drive real, authenticated
+provider CLIs and consume subscription usage. Run them yourself when you touch
+an adapter, and say so in the PR.
 
 ## Standards
 

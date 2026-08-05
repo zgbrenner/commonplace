@@ -241,11 +241,13 @@ crate — a git dependency, not published on crates.io as of this survey.
 `persisted-scope` (register after `fs`; needs the `protocol-asset`
 feature for local file previews).
 
-**Updater.** Works without any hosted CI: generate a signing keypair, set
+**Updater.** Does not require hosted CI: generate a signing keypair, set
 `createUpdaterArtifacts`, export the signing environment variables, build
-locally per OS, hand-write `latest.json`, and upload it anywhere over
-HTTPS. This matches Commonspace's "no hosted CI" posture in
-README.md/CONTRIBUTING.md.
+locally per OS, hand-write `latest.json`, and upload it anywhere over HTTPS.
+Commonspace now also builds releases in GitHub Actions
+(`.github/workflows/release.yml`), where the same signing variables are
+supplied as repository secrets; the local path remains fully supported and is
+what `scripts/build` does.
 
 **Sandboxing reality, per OS** (see also THREAT_MODEL.md's sandboxing
 table):
