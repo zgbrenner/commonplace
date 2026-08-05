@@ -8,9 +8,29 @@ use std::path::{Path, PathBuf};
 
 /// True when the resolved path lies inside a protected location.
 pub fn is_protected_location(resolved: &Path) -> bool {
+    // The per-user temporary directory is scratch space the user owns, not a
+    // system directory, and it is never a credential store. It needs an
+    // explicit exception because macOS sites it under `/private/var`, which
+    // *is* protected: without this, every workspace under the macOS temp
+    // directory would be denied outright.
+    if let Some(temp) = user_temp_dir() {
+        if path_starts_with(resolved, &temp) {
+            return false;
+        }
+    }
+
     protected_roots()
         .iter()
         .any(|p| path_starts_with(resolved, p))
+}
+
+/// The process temp directory, resolved. macOS reports it through the `/var`
+/// symlink while resolved paths come back as `/private/var`, so it has to be
+/// canonicalized before it can be compared against one.
+fn user_temp_dir() -> Option<PathBuf> {
+    let temp = std::env::temp_dir();
+    let resolved = std::fs::canonicalize(&temp).unwrap_or(temp);
+    Some(dunce::simplified(&resolved).to_path_buf())
 }
 
 /// Compute the protected roots for this machine.
@@ -132,6 +152,31 @@ mod tests {
         )));
         #[cfg(not(windows))]
         assert!(is_protected_location(Path::new("/etc/passwd")));
+    }
+
+    /// Regression test for a real failure found by CI on macOS: the per-user
+    /// temp directory lives under `/private/var` there, so the blanket `/var`
+    /// protection made every workspace inside it unusable.
+    #[test]
+    fn the_user_temp_directory_is_not_protected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("workspace").join("notes.md");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("create");
+        std::fs::write(&file, "x").expect("write");
+        let resolved = std::fs::canonicalize(&file).expect("canonicalize");
+        assert!(
+            !is_protected_location(&resolved),
+            "{} should be usable as a workspace",
+            resolved.display()
+        );
+    }
+
+    /// The exception above must stay narrow: system areas of `/var` that are
+    /// not the temp directory are still protected.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_var_outside_temp_is_still_protected() {
+        assert!(is_protected_location(Path::new("/private/var/db/dslocal")));
     }
 
     #[test]
