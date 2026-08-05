@@ -46,11 +46,19 @@ default and run with `scripts/smoke-providers`.
 The Rust side of each of these is covered by unit tests and compiles into the
 shipped binary, but no one has yet clicked through them:
 
-- Interactive use of the assembled application: authorizing a folder through
-  the native picker, sending a prompt, answering an approval dialog, and
-  undoing from the artifact card. Every one of those paths is verified in
-  tests against the real CLI; what is unverified is the click-through.
-  **This is the first thing to do next.**
+- Interactive use of the assembled application: sending a prompt, answering
+  an approval dialog, and undoing from the artifact card. Every one of those
+  paths is verified in tests against the real CLI; what is unverified is the
+  click-through. **This is the first thing to do next.**
+
+  The first real install did surface a packaged-build-only bug: every
+  provider CLI probe opened a visible console window, because the
+  `CREATE_NO_WINDOW` flag was being overwritten by process-wrap's job-object
+  wrapper. It is invisible in development, where the app already owns a
+  console that children inherit. Fixed and verified against a packaged
+  build; `crates/commonspace-agents/examples/console_probe.rs` reproduces
+  both paths. The lesson generalises: a dev build is not evidence about a
+  packaged one.
 - Codex CLI task execution. The adapter's detection, auth probe, event
   normalization, and error path are verified live; a full task run was not,
   because the test account hit its usage limit during the verification pass.
