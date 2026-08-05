@@ -40,6 +40,8 @@ commonplace/                     # repo name; product name is Commonspace
 │   │                            #   (pure evaluation; no fs mutation)
 │   ├── commonspace-documents/   # document formats (Markdown/text/PDF/DOCX)
 │   │                            #   + safe file operations, backups, undo
+│   ├── commonspace-runtime/     # MCP tool server, permission broker,
+│   │                            #   task orchestrator
 │   └── commonspace-storage/     # SQLite (rusqlite) + migrations + repositories
 ├── packages/
 │   └── protocol/                # TypeScript types + Zod schemas mirroring
@@ -53,7 +55,10 @@ commonplace/                     # repo name; product name is Commonspace
 Deliberately omitted: a separate `packages/ui` and `packages/shared`
 (components live in the app until a second consumer exists) and a
 `commonspace-workflows` crate (skills/workflows are post-MVP; the format is
-documented so the crate can be added without redesign).
+documented so the crate can be added without redesign). `commonspace-runtime`
+was added because the tool server, the permission broker, and the orchestrator
+are one cohesive layer: they are exactly the place where an agent's intent
+becomes an effect on disk.
 
 ## Process model
 
@@ -191,10 +196,30 @@ Mechanics:
 - Every decision — automatic or user-made — is journaled to `permission_decisions`
   with the evaluated input, for the audit history view.
 
-Provider CLIs also have their own permission systems; adapters configure them
-to route permission prompts into Commonspace (see docs/provider-adapters.md)
-so the user answers one coherent dialog, and Commonspace's engine remains the
-final authority for operations executed through its own tools.
+Provider CLIs also have their own permission systems. In v1 the adapters do
+not try to bridge them: they **disable the CLI's own mutating tools** and
+expose only Commonspace's tools, so every effect passes through this engine
+and one coherent dialog. This is a deliberate consequence of what the CLIs
+actually support — Claude Code 2.1.222 has no `--permission-prompt-tool`
+flag, and `codex exec` never prompts at all (docs/research.md §A). Reading is
+still allowed through the provider's own scoped read tools.
+
+The bridge in practice:
+
+```
+agent CLI ──MCP over loopback──► Commonspace tool server
+                                        │  classify + evaluate
+                                        ▼
+                                 policy engine ──► approval dialog (if needed)
+                                        │
+                                        ▼
+                                 SafeFs: back up, act, verify, journal
+```
+
+The tool server binds an ephemeral loopback port per task and requires a
+per-session bearer token, delivered to the CLI through a short-lived config
+file rather than the command line (JSON does not survive Windows `.cmd`
+argument quoting, and argv is visible to other processes).
 
 ## Filesystem safety and undo
 

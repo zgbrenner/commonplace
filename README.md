@@ -71,6 +71,7 @@ There is no hosted CI; all gates run locally (see
 - [docs/subscription-authentication.md](docs/subscription-authentication.md) —
   what each provider officially supports
 - [docs/document-tools.md](docs/document-tools.md) — deterministic document layer
+- [docs/status.md](docs/status.md) — what works, what is partial, what is not started
 - [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md)
 
 ## Trademarks
