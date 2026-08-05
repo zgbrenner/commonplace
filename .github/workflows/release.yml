@@ -77,7 +77,10 @@ jobs:
           - os: macos-latest
             name: macOS (universal)
             args: "--target universal-apple-darwin"
-            rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+            # Space-separated: `rustup target add` takes each target as its
+            # own argument, and a comma-separated string is read as one
+            # (nonexistent) target name.
+            rust-targets: "aarch64-apple-darwin x86_64-apple-darwin"
           - os: ubuntu-latest
             name: Linux
             args: ""
