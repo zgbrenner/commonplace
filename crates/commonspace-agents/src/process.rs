@@ -114,7 +114,6 @@ pub fn spawn_cli(
             #[cfg(windows)]
             {
                 c.raw_arg(full);
-                c.creation_flags(0x08000000); // CREATE_NO_WINDOW
             }
             #[cfg(not(windows))]
             {
@@ -128,17 +127,17 @@ pub fn spawn_cli(
         #[cfg(windows)]
         let mut w = w;
         #[cfg(windows)]
+        no_console(&mut w);
+        #[cfg(windows)]
         w.wrap(JobObject);
         w
     } else {
         let mut w = CommandWrap::with_new(program, |c| {
             c.args(args);
-            #[cfg(windows)]
-            {
-                c.creation_flags(0x08000000); // CREATE_NO_WINDOW
-            }
             configure(c, cwd, envs);
         });
+        #[cfg(windows)]
+        no_console(&mut w);
         #[cfg(windows)]
         w.wrap(JobObject);
         #[cfg(unix)]
@@ -191,6 +190,24 @@ pub fn spawn_cli(
         stdin,
         child,
     })
+}
+
+/// Suppress the console window Windows would otherwise create for each child.
+///
+/// This *must* go through process-wrap's `CreationFlags` wrapper rather than
+/// `Command::creation_flags`. `JobObject::pre_spawn` calls `creation_flags`
+/// itself, which replaces rather than merges, so a flag set directly on the
+/// command is silently discarded — and only the wrapper's value is OR-ed back
+/// in. Applied before `JobObject` so the wrappers run in the documented order.
+///
+/// Getting this wrong is invisible in development, where the app already owns
+/// a console that children inherit. In a packaged build there is no console,
+/// so every child allocates a visible one: exactly the terminal windows
+/// Commonspace exists to keep out of sight.
+#[cfg(windows)]
+fn no_console(w: &mut CommandWrap) {
+    use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+    w.wrap(CreationFlags(CREATE_NO_WINDOW));
 }
 
 fn configure(c: &mut tokio::process::Command, cwd: &Path, envs: &[(String, String)]) {
