@@ -1,6 +1,6 @@
 [package]
 name = "commonspace-storage"
-description = "Commonspace storage"
+description = "SQLite persistence with migrations for Commonspace"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,10 +9,16 @@ rust-version.workspace = true
 
 [dependencies]
 commonspace-core.workspace = true
+commonspace-documents.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

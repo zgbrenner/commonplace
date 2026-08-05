@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/zgbrenner/commonplace"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +27,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 commonspace-core = { path = "crates/commonspace-core" }
 commonspace-permissions = { path = "crates/commonspace-permissions" }

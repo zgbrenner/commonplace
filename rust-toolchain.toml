@@ -1,0 +1,4 @@
+[toolchain]
+# Minimum for libsqlite3-sys 0.38 (cfg_select!) is 1.95; pin a known-good
+# stable so local builds are reproducible without touching the global default.
+channel = "1.97.1"
