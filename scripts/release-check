@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# scripts/release-check -- THE single pre-release gate. Runs every required
+# quality check in order and stops at the first failure. Does NOT run
+# scripts/smoke-providers (needs live auth, costs real usage) -- see the
+# reminder printed at the end.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+step_header "Commonspace release-check"
+info "Every required quality gate, run in order. Stops at the first failure."
+
+# --- Gate: clean working tree -------------------------------------------------
+step_header "Gate: clean working tree"
+if ! have git; then
+  fail "git not found on PATH."
+fi
+dirty="$(git status --porcelain)"
+if [ -n "${dirty}" ]; then
+  printf '%s\n' "${dirty}"
+  fail "Working tree is not clean. Commit, stash, or discard changes before release-check."
+fi
+info "Working tree is clean."
+
+# --- Gate: toolchain verification ---------------------------------------------
+run_step "Gate: toolchain verification (scripts/setup)" "${SCRIPT_DIR}/setup"
+
+# --- Gate: formatting ----------------------------------------------------------
+run_step "Gate: cargo fmt --all --check" cargo fmt --all --check
+
+# --- Gate: clippy ----------------------------------------------------------------
+run_step "Gate: cargo clippy --workspace --all-targets -- -D warnings" \
+  cargo clippy --workspace --all-targets -- -D warnings
+
+# --- Gate: typecheck ----------------------------------------------------------------
+run_step "Gate: typecheck (scripts/typecheck)" "${SCRIPT_DIR}/typecheck"
+
+# --- Gate: tests ----------------------------------------------------------------------
+run_step "Gate: cargo test --workspace" cargo test --workspace
+
+# --- Gate: security ---------------------------------------------------------------------
+run_step "Gate: security (scripts/security)" "${SCRIPT_DIR}/security"
+
+# --- Gate: production build ---------------------------------------------------------------
+run_step "Gate: production build (scripts/build)" "${SCRIPT_DIR}/build"
+
+step_header "ALL GATES PASSED -- safe to tag"
+cat <<'EOF'
+Before tagging a release, also:
+
+  1. Run scripts/smoke-providers manually. It is NOT run automatically here
+     because it requires live, authenticated provider CLIs and consumes a
+     small amount of real subscription usage.
+  2. Installers for other operating systems must be built on those
+     operating systems -- this run only produced/verified artifacts for the
+     OS it ran on. Cross-compiling is not supported.
+EOF

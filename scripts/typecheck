@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# scripts/typecheck -- run the frontend's `tsc --noEmit` (via its
+# 'typecheck' npm script). A no-op that exits 0 until apps/desktop exists.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+if ! has_frontend; then
+  step_header "Typecheck"
+  info "No frontend at apps/desktop yet -- nothing to typecheck."
+  exit 0
+fi
+
+if owner="$(npm_script_owner typecheck)"; then
+  dir="$(npm_script_dir "${owner}")"
+  run_step "npm run typecheck (${owner}: ${dir})" bash -c "cd \"${dir}\" && npm run typecheck"
+else
+  step_header "Typecheck"
+  info "apps/desktop/package.json exists but defines no 'typecheck' script yet -- nothing to run."
+fi
+
+step_header "typecheck complete"

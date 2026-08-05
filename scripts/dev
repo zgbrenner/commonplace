@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# scripts/dev -- run the app in development mode.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+step_header "Commonspace dev"
+
+if ! has_tauri; then
+  info "apps/desktop/src-tauri is not scaffolded yet -- there is no desktop shell to run."
+  info "In the meantime, scripts/check is what to run against your changes."
+  exit 0
+fi
+
+if owner="$(npm_script_owner tauri)"; then
+  dir="$(npm_script_dir "${owner}")"
+  info "Launching Tauri dev (script owner: ${owner}, dir: ${dir})"
+  cd "${dir}"
+  exec npm run tauri dev
+else
+  fail "apps/desktop/src-tauri exists but no 'tauri' script was found in the root or apps/desktop package.json. Add one (e.g. \"tauri\": \"tauri\") and re-run scripts/dev."
+fi

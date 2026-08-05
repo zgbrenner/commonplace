@@ -6,6 +6,7 @@ members = [
     "crates/commonspace-documents",
     "crates/commonspace-storage",
     "crates/commonspace-agents",
+    "crates/commonspace-runtime",
     # "apps/desktop/src-tauri",  # joined once the Tauri shell is scaffolded
 ]
 
@@ -34,6 +35,7 @@ commonspace-permissions = { path = "crates/commonspace-permissions" }
 commonspace-documents = { path = "crates/commonspace-documents" }
 commonspace-storage = { path = "crates/commonspace-storage" }
 commonspace-agents = { path = "crates/commonspace-agents" }
+commonspace-runtime = { path = "crates/commonspace-runtime" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

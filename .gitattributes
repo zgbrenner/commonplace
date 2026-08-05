@@ -7,3 +7,4 @@
 *.json text eol=lf
 *.sql text eol=lf
 *.sh text eol=lf
+scripts/* text eol=lf

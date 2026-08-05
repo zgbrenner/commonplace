@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# scripts/fmt -- auto-format the Rust workspace and (once scaffolded) the
+# frontend. Mutates files in place; run scripts/lint if you just want to
+# check formatting without changing anything.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+run_step "cargo fmt --all" cargo fmt --all
+
+if has_frontend; then
+  step_header "Frontend formatting"
+  if owner="$(npm_script_owner format)"; then
+    dir="$(npm_script_dir "${owner}")"
+    run_step "npm run format (${owner}: ${dir})" bash -c "cd \"${dir}\" && npm run format"
+  else
+    info "No 'format' script defined yet in root or apps/desktop package.json -- skipping."
+  fi
+else
+  info "No frontend at apps/desktop yet -- skipping frontend formatting."
+fi
+
+step_header "fmt complete"

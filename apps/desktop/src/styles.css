@@ -1,0 +1,158 @@
+@import "tailwindcss";
+
+/*
+ * Commonspace visual system.
+ *
+ * The metaphor is a shared worktable: warm neutral surfaces, one restrained
+ * accent (a deep slate-teal, distinct from any provider's brand colour),
+ * generous but efficient spacing, and typography doing most of the work.
+ * No gradients, no glows, no novelty animation.
+ */
+
+@theme {
+  --font-sans:
+    "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
+
+  /* Warm paper neutrals rather than pure grey — the worktable, not a screen. */
+  --color-surface: oklch(99% 0.004 90);
+  --color-surface-raised: oklch(100% 0 0);
+  --color-surface-sunken: oklch(96.5% 0.006 90);
+  --color-line: oklch(90% 0.006 90);
+  --color-line-strong: oklch(83% 0.008 90);
+  --color-ink: oklch(24% 0.012 260);
+  --color-ink-muted: oklch(48% 0.012 260);
+  --color-ink-faint: oklch(62% 0.01 260);
+
+  /* One accent, used sparingly: primary actions and focus. */
+  --color-accent: oklch(48% 0.075 205);
+  --color-accent-hover: oklch(42% 0.08 205);
+  --color-accent-soft: oklch(95% 0.02 205);
+
+  /* Status colours are always paired with an icon and text label — never
+     the sole carrier of meaning (WCAG 1.4.1). */
+  --color-ok: oklch(52% 0.11 155);
+  --color-ok-soft: oklch(95% 0.03 155);
+  --color-warn: oklch(60% 0.12 75);
+  --color-warn-soft: oklch(96% 0.04 75);
+  --color-danger: oklch(52% 0.16 25);
+  --color-danger-soft: oklch(96% 0.03 25);
+
+  --radius-card: 0.625rem;
+}
+
+@layer theme {
+  :root {
+    color-scheme: light;
+  }
+
+  /* Dark mode: same structure, deeper table. Both themes are first-class. */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --color-surface: oklch(20% 0.012 260);
+      --color-surface-raised: oklch(24% 0.014 260);
+      --color-surface-sunken: oklch(17% 0.012 260);
+      --color-line: oklch(31% 0.014 260);
+      --color-line-strong: oklch(40% 0.016 260);
+      --color-ink: oklch(94% 0.006 90);
+      --color-ink-muted: oklch(74% 0.01 260);
+      --color-ink-faint: oklch(60% 0.012 260);
+      --color-accent: oklch(72% 0.09 205);
+      --color-accent-hover: oklch(79% 0.09 205);
+      --color-accent-soft: oklch(30% 0.035 205);
+      --color-ok: oklch(72% 0.12 155);
+      --color-ok-soft: oklch(29% 0.04 155);
+      --color-warn: oklch(78% 0.12 75);
+      --color-warn-soft: oklch(31% 0.045 75);
+      --color-danger: oklch(70% 0.14 25);
+      --color-danger-soft: oklch(30% 0.05 25);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --color-surface: oklch(20% 0.012 260);
+    --color-surface-raised: oklch(24% 0.014 260);
+    --color-surface-sunken: oklch(17% 0.012 260);
+    --color-line: oklch(31% 0.014 260);
+    --color-line-strong: oklch(40% 0.016 260);
+    --color-ink: oklch(94% 0.006 90);
+    --color-ink-muted: oklch(74% 0.01 260);
+    --color-ink-faint: oklch(60% 0.012 260);
+    --color-accent: oklch(72% 0.09 205);
+    --color-accent-hover: oklch(79% 0.09 205);
+    --color-accent-soft: oklch(30% 0.035 205);
+    --color-ok: oklch(72% 0.12 155);
+    --color-ok-soft: oklch(29% 0.04 155);
+    --color-warn: oklch(78% 0.12 75);
+    --color-warn-soft: oklch(31% 0.045 75);
+    --color-danger: oklch(70% 0.14 25);
+    --color-danger-soft: oklch(30% 0.05 25);
+  }
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 0.9375rem;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  /* Desktop chrome: text is selectable in content, not in the frame. */
+  user-select: none;
+}
+
+/* Content regions opt back into selection. */
+.selectable {
+  user-select: text;
+}
+
+/* Focus is always visible and never removed — keyboard users must be able to
+   see where they are (WCAG 2.4.7). */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Respect the user's motion preference everywhere. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Screen-reader-only text for labels that would be visual noise. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Restrained scrollbars that follow the theme. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}

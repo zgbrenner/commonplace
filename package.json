@@ -1,0 +1,26 @@
+{
+  "name": "commonspace-monorepo",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @commonspace/desktop",
+    "build": "npm run build --workspace @commonspace/desktop",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "format": "prettier --write \"apps/**/src/**/*.{ts,tsx,css}\" \"packages/**/src/**/*.ts\"",
+    "test": "npm run test --workspaces --if-present",
+    "tauri": "npm run tauri --workspace @commonspace/desktop"
+  },
+  "devDependencies": {
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# scripts/build -- production build. Cross-compiling is not supported:
+# installers for a given OS must be built on that OS.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+step_header "Commonspace build (release)"
+
+run_step "cargo build --workspace --release" cargo build --workspace --release
+
+if ! has_tauri; then
+  info "apps/desktop/src-tauri is not scaffolded yet -- release build stops at the Rust workspace."
+  step_header "build complete"
+  exit 0
+fi
+
+step_header "Tauri production build"
+info "Cross-compiling is not supported here -- installers for each OS must be built on that OS."
+
+if owner="$(npm_script_owner build)"; then
+  dir="$(npm_script_dir "${owner}")"
+  run_step "npm run build -- frontend production build (${owner}: ${dir})" \
+    bash -c "cd \"${dir}\" && npm run build"
+else
+  info "No frontend 'build' script found yet; relying on Tauri's own beforeBuildCommand (if configured) to build the frontend."
+fi
+
+if owner="$(npm_script_owner tauri)"; then
+  dir="$(npm_script_dir "${owner}")"
+  run_step "npm run tauri build (${owner}: ${dir})" bash -c "cd \"${dir}\" && npm run tauri build"
+else
+  fail "apps/desktop/src-tauri exists but no 'tauri' script was found in the root or apps/desktop package.json."
+fi
+
+step_header "Installers"
+os="$(os_name)"
+case "${os}" in
+  windows)
+    info "Windows installers: apps/desktop/src-tauri/target/release/bundle/nsis and .../bundle/msi"
+    ;;
+  macos)
+    info "macOS installers: apps/desktop/src-tauri/target/release/bundle/dmg and .../bundle/macos"
+    ;;
+  linux)
+    info "Linux installers: apps/desktop/src-tauri/target/release/bundle/deb, .../bundle/rpm, and .../bundle/appimage"
+    ;;
+  *)
+    warn "Unrecognized OS; check apps/desktop/src-tauri/target/release/bundle/ for the produced artifacts."
+    ;;
+esac
+info "Cross-compiling is not supported -- build each OS's installers on that OS."
+
+step_header "build complete"

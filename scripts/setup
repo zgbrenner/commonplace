@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# scripts/setup -- verify the toolchain and install dependencies.
+#
+# Idempotent: safe to run repeatedly. Does not require anything beyond what
+# a fresh clone needs (network only for rustup component installs and
+# `npm ci`, both of which are obviously necessary).
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+step_header "Commonspace setup"
+info "Repo root: ${REPO_ROOT}"
+
+# --- Rust toolchain ----------------------------------------------------------
+step_header "Rust toolchain"
+
+if ! have rustc || ! have cargo; then
+  fail "rustc/cargo not found on PATH. Install Rust via https://rustup.rs, then re-run scripts/setup."
+fi
+
+rustc_version="$(rustc --version)"
+cargo_version="$(cargo --version)"
+info "Found: ${rustc_version}"
+info "Found: ${cargo_version}"
+
+pinned_channel=""
+if [ -f "${REPO_ROOT}/rust-toolchain.toml" ]; then
+  pinned_channel="$(grep -E '^[[:space:]]*channel[[:space:]]*=' "${REPO_ROOT}/rust-toolchain.toml" \
+    | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+fi
+
+if [ -n "${pinned_channel}" ]; then
+  case "${rustc_version}" in
+    "rustc ${pinned_channel}"*)
+      info "rustc matches the pinned toolchain (${pinned_channel})."
+      ;;
+    *)
+      warn "rustc does not look like the pinned toolchain (${pinned_channel})."
+      warn "If rustc/cargo were invoked through the rustup shims, rust-toolchain.toml should have selected it automatically."
+      warn "If this persists: rustup toolchain install ${pinned_channel}"
+      ;;
+  esac
+else
+  warn "Could not read a pinned channel from rust-toolchain.toml; skipping that check."
+fi
+
+if have rustup; then
+  installed_components="$(rustup component list --installed 2>/dev/null || true)"
+  if printf '%s\n' "${installed_components}" | grep -q '^rustfmt'; then
+    info "rustfmt component already installed."
+  else
+    run_step "Installing rustfmt component" rustup component add rustfmt
+  fi
+  if printf '%s\n' "${installed_components}" | grep -q '^clippy'; then
+    info "clippy component already installed."
+  else
+    run_step "Installing clippy component" rustup component add clippy
+  fi
+else
+  warn "rustup not found; cannot verify/install the rustfmt and clippy components automatically."
+  warn "Ensure both are available for the active toolchain."
+fi
+
+# --- Node toolchain ------------------------------------------------------------
+step_header "Node toolchain"
+
+if ! have node; then
+  fail "node not found on PATH. Install Node.js 20+ from https://nodejs.org, then re-run scripts/setup."
+fi
+if ! have npm; then
+  fail "npm not found on PATH. It ships with Node.js -- reinstall Node.js and re-run scripts/setup."
+fi
+
+node_version_raw="$(node --version)" # e.g. v24.11.0
+node_major="$(printf '%s' "${node_version_raw}" | sed -E 's/^v?([0-9]+).*/\1/')"
+npm_version="$(npm --version)"
+info "Found: node ${node_version_raw}"
+info "Found: npm ${npm_version}"
+
+if ! printf '%s' "${node_major}" | grep -Eq '^[0-9]+$'; then
+  warn "Could not parse a major version out of '${node_version_raw}'; skipping the Node 20+ check."
+elif [ "${node_major}" -lt 20 ]; then
+  fail "node ${node_version_raw} is too old -- Commonspace requires Node 20+."
+else
+  info "node ${node_version_raw} satisfies the Node 20+ requirement."
+fi
+
+# --- Frontend dependencies -----------------------------------------------------
+step_header "Frontend dependencies"
+
+if [ -f "${REPO_ROOT}/package.json" ]; then
+  if [ -f "${REPO_ROOT}/package-lock.json" ]; then
+    run_step "npm ci" npm ci
+  else
+    warn "No package-lock.json at the repo root; falling back to npm install."
+    run_step "npm install" npm install
+  fi
+else
+  info "No root package.json yet -- apps/desktop is not scaffolded, nothing to install."
+fi
+
+# --- Tauri platform prerequisites (advisory only -- never fails setup) --------
+step_header "Tauri platform prerequisites (advisory only)"
+
+os="$(os_name)"
+case "${os}" in
+  linux)
+    if have pkg-config; then
+      if pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
+        info "webkit2gtk-4.1 found via pkg-config."
+      else
+        warn "webkit2gtk-4.1 not found via pkg-config."
+        warn "Tauri builds on Linux need webkit2gtk-4.1 and related GTK/WebKit dev packages."
+        warn "See: https://tauri.app/start/prerequisites/"
+      fi
+    else
+      warn "pkg-config not found; cannot verify webkit2gtk-4.1."
+      warn "Tauri builds on Linux need pkg-config plus webkit2gtk-4.1 and related dev packages installed."
+    fi
+    ;;
+  macos)
+    if have xcode-select && xcode-select -p >/dev/null 2>&1; then
+      info "Xcode command line tools found."
+    else
+      warn "Xcode command line tools not found. Run: xcode-select --install"
+    fi
+    ;;
+  windows)
+    info "WebView2 runtime ships with Windows 10 1803+ and Windows 11 -- usually no action needed."
+    info "MSVC build tools are required: Visual Studio Build Tools with the 'Desktop development with C++' workload."
+    ;;
+  *)
+    warn "Unrecognized OS (uname -s: $(uname -s)); skipping the Tauri prerequisite check."
+    ;;
+esac
+
+step_header "Setup complete"
+info "Next steps:"
+info "  scripts/check          fast pre-commit-grade gate (fmt, clippy, typecheck, tests)"
+info "  scripts/dev            run the app in development mode"
+info "  scripts/install-hooks  install local git hooks (recommended)"

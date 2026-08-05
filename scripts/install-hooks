@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# scripts/install-hooks -- install local git hooks: a fast pre-commit and a
+# more thorough pre-push. Idempotent (overwrites any previously-installed
+# copies of these two hooks).
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+step_header "Installing local git hooks"
+
+if ! have git; then
+  fail "git not found on PATH."
+fi
+
+git_dir="$(git rev-parse --git-dir)"
+hooks_dir="${git_dir}/hooks"
+mkdir -p "${hooks_dir}"
+
+pre_commit_path="${hooks_dir}/pre-commit"
+pre_push_path="${hooks_dir}/pre-push"
+
+# pre-commit: fast. Auto-formats (scripts/fmt), re-stages what it touched,
+# then does a final cargo fmt --all --check as a safety net. Deliberately
+# skips clippy/typecheck/tests here to stay fast and reliable -- those run
+# on push instead (see pre-push, below).
+cat >"${pre_commit_path}" <<'HOOK'
+#!/usr/bin/env bash
+# Installed by scripts/install-hooks -- do not edit directly.
+# Edit scripts/install-hooks and re-run it instead.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "${repo_root}"
+
+echo "==> pre-commit: scripts/fmt"
+if ! "${repo_root}/scripts/fmt"; then
+  echo "FAILED: scripts/fmt (pre-commit)" >&2
+  echo "Bypass with: git commit --no-verify" >&2
+  exit 1
+fi
+
+# Re-stage any files scripts/fmt just reformatted so the commit captures them.
+git add -u
+
+echo "==> pre-commit: cargo fmt --all --check"
+if ! cargo fmt --all --check; then
+  echo "FAILED: cargo fmt --all --check (pre-commit)" >&2
+  echo "Bypass with: git commit --no-verify" >&2
+  exit 1
+fi
+
+echo "pre-commit checks passed."
+HOOK
+
+# pre-push: thorough. Runs the same gate every change is held to.
+cat >"${pre_push_path}" <<'HOOK'
+#!/usr/bin/env bash
+# Installed by scripts/install-hooks -- do not edit directly.
+# Edit scripts/install-hooks and re-run it instead.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "${repo_root}"
+
+echo "==> pre-push: scripts/check"
+if ! "${repo_root}/scripts/check"; then
+  echo "FAILED: scripts/check (pre-push)" >&2
+  echo "Bypass with: git push --no-verify" >&2
+  exit 1
+fi
+
+echo "pre-push checks passed."
+HOOK
+
+chmod +x "${pre_commit_path}" "${pre_push_path}"
+
+step_header "Installed"
+info "pre-commit -> ${pre_commit_path}"
+info "  runs: scripts/fmt, then cargo fmt --all --check"
+info "  bypass: git commit --no-verify"
+info "pre-push -> ${pre_push_path}"
+info "  runs: scripts/check (fmt --check, clippy, typecheck, cargo test)"
+info "  bypass: git push --no-verify"

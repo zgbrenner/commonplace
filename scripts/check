@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# scripts/check -- the fast pre-commit-grade gate: fmt --check, clippy,
+# typecheck, cargo test. This is the bar for every change. No release
+# builds, no provider smoke tests -- see scripts/release-check for those.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+step_header "Commonspace check -- fast pre-commit-grade gate"
+info "fmt --check, clippy, typecheck, cargo test. No release builds, no provider smoke tests."
+
+run_step "cargo fmt --all --check" cargo fmt --all --check
+run_step "cargo clippy --workspace --all-targets -- -D warnings" \
+  cargo clippy --workspace --all-targets -- -D warnings
+run_step "typecheck" "${SCRIPT_DIR}/typecheck"
+run_step "cargo test --workspace" cargo test --workspace
+
+step_header "check complete -- all gates passed"

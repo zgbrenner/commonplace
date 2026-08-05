@@ -1,0 +1,71 @@
+# cargo-deny configuration for Commonspace.
+#
+# Commonspace is MIT-licensed, so dependencies that get compiled and linked
+# into the Commonspace binary must not carry copyleft terms that conflict
+# with that license (Rust static-links its whole dependency graph, so even
+# "weak" copyleft licenses are legally relevant here in a way they might not
+# be for a dynamically-linked C program).
+#
+# This policy is about *linked dependencies* (things listed in Cargo.toml),
+# not about external tools Commonspace merely spawns as optional,
+# user-installed subprocesses -- e.g. the user's own Claude Code or Codex
+# CLI. Invoking a program across a process boundary is not linking, so
+# GPL/AGPL-licensed CLIs the user chooses to install are entirely unaffected
+# by this file and are not something cargo-deny can or should see (it only
+# inspects the Cargo dependency graph).
+#
+# On "warn" for LGPL: cargo-deny's schema-2 `[licenses]` check is a binary
+# allow/deny model with no built-in per-license "warn" severity. LGPL-2.1
+# and LGPL-3.0 are placed in `allow` below (so an LGPL dependency doesn't
+# cause an opaque, unreviewable hard failure here), but that is not a
+# blanket endorsement: scripts/security separately scans `cargo metadata`
+# for any LGPL-licensed dependency and prints an explicit WARNING banner
+# (without failing the script) if one is found, so LGPL usage is never
+# silent even though cargo-deny itself has no way to express "warn, don't
+# fail" for a single license.
+#
+# Run directly with: cargo deny check licenses
+# (wrapped, with the informational LGPL scan, by scripts/security)
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "Zlib",
+    "Unlicense",
+    # Allowed here only so cargo-deny doesn't hard-fail on them; see the
+    # "On warn for LGPL" note above -- scripts/security flags these
+    # separately rather than passing them through silently.
+    "LGPL-2.1",
+    "LGPL-2.1-only",
+    "LGPL-2.1-or-later",
+    "LGPL-3.0",
+    "LGPL-3.0-only",
+    "LGPL-3.0-or-later",
+]
+
+# Explicitly denied: strong copyleft that is incompatible with linking into
+# an MIT-licensed binary.
+deny = [
+    "GPL-2.0",
+    "GPL-2.0-only",
+    "GPL-2.0-or-later",
+    "GPL-3.0",
+    "GPL-3.0-only",
+    "GPL-3.0-or-later",
+    "AGPL-3.0",
+    "AGPL-3.0-only",
+    "AGPL-3.0-or-later",
+    "SSPL-1.0",
+]

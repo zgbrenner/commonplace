@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# scripts/security -- dependency vulnerability and license checks.
+#
+# Missing optional tools (cargo-audit, cargo-deny) print an actionable
+# install hint and are skipped rather than failing the whole script. Real
+# findings (vulnerabilities, denied licenses, high/critical npm advisories)
+# do fail the script.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+overall_status=0
+
+# --- cargo-audit: known-vulnerability advisories ------------------------------
+step_header "cargo audit (RustSec advisory database)"
+if have cargo-audit; then
+  if cargo audit; then
+    info "No known vulnerabilities reported."
+  else
+    warn "cargo audit reported vulnerabilities (see above)."
+    overall_status=1
+  fi
+else
+  warn "cargo-audit is not installed. Install it with: cargo install cargo-audit"
+  info "Skipping the vulnerability advisory scan (this alone does not fail scripts/security)."
+fi
+
+# --- cargo-deny: dependency license policy ------------------------------------
+step_header "cargo deny check licenses (dependency license policy)"
+if have cargo-deny; then
+  if [ -f "${REPO_ROOT}/deny.toml" ]; then
+    if cargo deny check licenses; then
+      info "No license policy violations."
+    else
+      warn "cargo deny reported a license policy violation (see above)."
+      overall_status=1
+    fi
+  else
+    warn "No deny.toml found at the repo root; skipping the cargo-deny license check."
+  fi
+else
+  warn "cargo-deny is not installed. Install it with: cargo install cargo-deny"
+  info "Skipping the license policy scan (this alone does not fail scripts/security)."
+fi
+
+# --- Informational LGPL scan (see deny.toml for the rationale) ----------------
+step_header "LGPL dependency scan (informational -- warns, never fails)"
+if have cargo && have node; then
+  lgpl_hits="$(cargo metadata --format-version 1 2>/dev/null | node -e '
+    var data = "";
+    process.stdin.on("data", function (c) { data += c; });
+    process.stdin.on("end", function () {
+      var meta;
+      try {
+        meta = JSON.parse(data);
+      } catch (e) {
+        process.exit(0);
+      }
+      var hits = (meta.packages || [])
+        .filter(function (p) { return p.license && /LGPL/i.test(p.license); })
+        .map(function (p) { return p.name + " " + p.version + ": " + p.license; });
+      process.stdout.write(hits.join("\n"));
+    });
+  ' 2>/dev/null || true)"
+  if [ -n "${lgpl_hits}" ]; then
+    warn "LGPL-licensed dependencies found -- review before release (Rust static linking can trigger LGPL relinking obligations):"
+    printf '%s\n' "${lgpl_hits}" | while IFS= read -r line; do
+      [ -n "${line}" ] && info "${line}"
+    done
+  else
+    info "No LGPL-licensed dependencies detected."
+  fi
+else
+  info "cargo and node are not both available; skipping the informational LGPL scan."
+fi
+
+# --- npm audit (frontend) ------------------------------------------------------
+if has_frontend; then
+  step_header "npm audit --omit=dev (fails only on high/critical)"
+  audit_dir="${REPO_ROOT}"
+  if [ ! -f "${REPO_ROOT}/package.json" ]; then
+    audit_dir="${REPO_ROOT}/apps/desktop"
+  fi
+  if (cd "${audit_dir}" && npm audit --omit=dev --audit-level=high); then
+    info "No high/critical vulnerabilities in production dependencies."
+  else
+    warn "npm audit found high/critical vulnerabilities in production dependencies (see above)."
+    warn "Low/moderate findings are reported by npm audit but do not fail this script."
+    overall_status=1
+  fi
+else
+  step_header "npm audit"
+  info "No frontend at apps/desktop yet -- skipping npm audit."
+fi
+
+step_header "security summary"
+if [ "${overall_status}" -eq 0 ]; then
+  info "No blocking findings."
+else
+  fail "One or more security checks failed (see above)."
+fi

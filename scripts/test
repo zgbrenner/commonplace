@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# scripts/test -- unit + integration tests. `cargo test --workspace` never
+# runs #[ignore]d tests (that's what scripts/smoke-providers is for), so the
+# real-provider smoke tests are excluded automatically here.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+run_step "cargo test --workspace" cargo test --workspace
+
+if has_frontend; then
+  if owner="$(npm_script_owner test)"; then
+    dir="$(npm_script_dir "${owner}")"
+    run_step "npm run test (${owner}: ${dir})" bash -c "cd \"${dir}\" && npm run test"
+  else
+    step_header "Frontend tests"
+    info "No 'test' script defined yet in root or apps/desktop package.json -- skipping."
+  fi
+fi
+
+step_header "test complete"

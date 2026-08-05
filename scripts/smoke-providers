@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# scripts/smoke-providers -- REAL provider CLI smoke tests.
+#
+# These spawn your actually-installed and authenticated Claude Code / Codex
+# CLIs and therefore consume a small amount of real subscription usage.
+# They are never run automatically by scripts/check or scripts/release-check.
+#
+# This script is non-interactive: it prints the notice below and runs
+# immediately, it does not prompt for confirmation.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+step_header "Real provider smoke tests"
+cat <<'EOF'
+NOTICE
+  This spawns your actually-installed and authenticated Claude Code and/or
+  Codex CLIs and therefore consumes a small amount of REAL subscription
+  usage. It is not part of scripts/check or scripts/release-check -- you
+  must run it deliberately.
+
+  If a CLI is not installed, or not signed in, the corresponding test will
+  simply fail. That is expected and does not necessarily mean the adapter
+  is broken -- check the printed reason before assuming a real bug.
+
+  Running now (non-interactive, no confirmation prompt)...
+EOF
+
+run_step \
+  "cargo test -p commonspace-agents --test provider_smoke -- --ignored --nocapture" \
+  cargo test -p commonspace-agents --test provider_smoke -- --ignored --nocapture
+
+step_header "smoke-providers complete"
