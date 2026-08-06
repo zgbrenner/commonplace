@@ -14,9 +14,13 @@ use tauri::Manager;
 const AUTH_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// Shared application state, managed by Tauri.
+///
+/// Adapters live behind `Arc` because the orchestrator's two-phase flow
+/// holds one across a task's whole life (plan pump, execution, revision),
+/// which outlives any single command invocation.
 pub struct AppState {
     orchestrator: Arc<Orchestrator>,
-    adapters: Vec<Box<dyn AgentAdapter>>,
+    adapters: Vec<Arc<dyn AgentAdapter>>,
     running: Mutex<HashMap<TaskId, TaskHandle>>,
     auth_cache: Mutex<HashMap<ProviderId, (AuthStatus, Instant)>>,
 }
@@ -34,7 +38,7 @@ impl AppState {
 
         Ok(Self {
             orchestrator,
-            adapters: vec![Box::new(ClaudeCodeAdapter), Box::new(CodexCliAdapter)],
+            adapters: vec![Arc::new(ClaudeCodeAdapter), Arc::new(CodexCliAdapter)],
             running: Mutex::new(HashMap::new()),
             auth_cache: Mutex::new(HashMap::new()),
         })
@@ -75,15 +79,12 @@ impl AppState {
         self.orchestrator.storage()
     }
 
-    pub fn adapters(&self) -> &[Box<dyn AgentAdapter>] {
+    pub fn adapters(&self) -> &[Arc<dyn AgentAdapter>] {
         &self.adapters
     }
 
-    pub fn adapter(&self, provider: ProviderId) -> Option<&dyn AgentAdapter> {
-        self.adapters
-            .iter()
-            .find(|a| a.id() == provider)
-            .map(|a| a.as_ref())
+    pub fn adapter(&self, provider: ProviderId) -> Option<Arc<dyn AgentAdapter>> {
+        self.adapters.iter().find(|a| a.id() == provider).cloned()
     }
 
     pub fn track(&self, handle: TaskHandle) {
