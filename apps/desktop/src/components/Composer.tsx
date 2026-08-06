@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState, type KeyboardEvent } from "react";
 import type { Connection, Workspace } from "@commonspace/protocol";
-import { mergePaths } from "../lib/attachments";
+import { attachmentDisclosure, mergePaths } from "../lib/attachments";
 import { useFileDrop } from "../lib/useFileDrop";
 import { Button } from "./primitives";
 
@@ -37,6 +37,7 @@ export function Composer({
   disabledReason,
 }: ComposerProps) {
   const [text, setText] = useState("");
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Dropped files arrive through Tauri's native drag-drop event with real
@@ -53,14 +54,15 @@ export function Composer({
   const submit = useCallback(() => {
     const prompt = text.trim();
     if (!prompt || disabled) return;
-    const withAttachments =
-      attachments.length > 0
-        ? `${prompt}\n\nFiles and folders I've attached:\n${attachments.map((p) => `- ${p}`).join("\n")}`
-        : prompt;
-    onSubmit(withAttachments);
+    // Paths are no longer embedded in the prompt text — App passes the
+    // attachment list to the backend as structured data, and the backend
+    // handles disclosure to the provider.
+    onSubmit(prompt);
     setText("");
+    // Clear attachments only after onSubmit: App captures the attachment
+    // state during the send, so clearing first would lose it.
     onAttachmentsChange([]);
-  }, [text, disabled, attachments, onSubmit, onAttachmentsChange]);
+  }, [text, disabled, onSubmit, onAttachmentsChange]);
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     // Enter sends, Shift+Enter makes a new line — the familiar desktop chat
@@ -82,6 +84,53 @@ export function Composer({
           <p className="mb-2 rounded-md border border-dashed border-[var(--color-accent)] px-3 py-2 text-center text-sm text-[var(--color-accent)]">
             Drop files to attach
           </p>
+        ) : null}
+
+        {attachments.length > 0 ? (
+          // A quiet disclosure, not a modal: says plainly what will leave the
+          // machine before anything is sent. We count "attached items" rather
+          // than files vs folders — the frontend can't reliably tell them
+          // apart from a path string alone (see attachmentDisclosure).
+          // Deliberately no token estimates; those are deferred to a future
+          // Details-level view.
+          <div className="mb-2 rounded-md border border-[var(--color-line)] bg-[var(--color-surface-sunken)] px-3 py-2 text-xs text-[var(--color-ink-muted)]">
+            <p>{attachmentDisclosure(attachments.length, activeConnection?.display_name)}</p>
+            <button
+              type="button"
+              aria-expanded={detailsOpen}
+              onClick={() => setDetailsOpen((open) => !open)}
+              className="mt-1 text-[var(--color-ink-faint)] hover:text-[var(--color-ink)]"
+            >
+              <span
+                aria-hidden="true"
+                className={`mr-1 inline-block ${detailsOpen ? "rotate-90" : ""}`}
+              >
+                ›
+              </span>
+              Details
+            </button>
+            {detailsOpen ? (
+              // The chips below show basenames; this list shows the full
+              // paths, with the same removal affordance.
+              <ul className="mt-1.5 space-y-1">
+                {attachments.map((path) => (
+                  <li key={path} className="flex items-center gap-2">
+                    <span className="selectable min-w-0 flex-1 truncate font-mono" title={path}>
+                      {path}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => onAttachmentsChange(attachments.filter((p) => p !== path))}
+                      className="shrink-0 text-[var(--color-ink-faint)] hover:text-[var(--color-ink)]"
+                      aria-label={`Remove ${path}`}
+                    >
+                      Remove
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
         ) : null}
 
         {attachments.length > 0 ? (
