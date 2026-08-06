@@ -141,4 +141,10 @@ jobs:
             through System Settings → Privacy & Security.
           releaseDraft: true
           prerelease: true
+          # Attach `latest.json` so the in-app "Check for updates" button can
+          # install releases in place. Meaningful only when the signing
+          # secrets above are set; without them there are no updater
+          # artifacts to describe and the app falls back to a GitHub API
+          # version check plus a download-page link.
+          includeUpdaterJson: true
           args: ${{ matrix.args }}

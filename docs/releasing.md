@@ -70,10 +70,34 @@ Releases are unsigned by default, and the release notes say so:
   Developer account.
 - **Linux** — no OS-level signing gate.
 
-To enable updater signatures, generate a keypair with
-`npm run tauri signer generate` and set two repository secrets:
-`TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Without
-them the installers still build; the release simply carries no `.sig` files.
+## In-app updates
+
+Settings has a "Check for updates" button. It asks the GitHub releases API
+for the newest published release (drafts never count; pre-releases do) and
+compares versions. What happens next depends on how the release was built:
+
+- **Signed release** — the release carries a `latest.json` updater manifest
+  and `.sig` files. The app downloads the matching installer, verifies its
+  signature against the public key in `tauri.conf.json`, installs, and
+  restarts itself.
+- **Unsigned release** (the default today) — there is nothing to verify a
+  download against, so the button offers the release's download page
+  instead. Honest and manual rather than silently broken.
+
+To enable the signed, in-place path:
+
+1. Generate a keypair once: `npm run tauri signer generate`. Keep the
+   private key out of the repository.
+2. Set two repository secrets: `TAURI_SIGNING_PRIVATE_KEY` and
+   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+3. Paste the *public* key into `plugins.updater.pubkey` in
+   `apps/desktop/src-tauri/tauri.conf.json` and commit it.
+4. Cut the next release normally. `release.yml` attaches `latest.json`
+   automatically; every install of that release can then update itself in
+   place from the release after it.
+
+Without the secrets the installers still build; the release simply carries
+no `.sig` files or manifest, and the app keeps using the download-page path.
 
 ## Building locally instead
 

@@ -7,6 +7,7 @@
 
 mod commands;
 mod state;
+mod updates;
 
 pub use state::AppState;
 
@@ -33,7 +34,8 @@ pub fn run() {
                     let _ = window.unminimize();
                 }
             }))
-            .plugin(tauri_plugin_window_state::Builder::default().build());
+            .plugin(tauri_plugin_window_state::Builder::default().build())
+            .plugin(tauri_plugin_updater::Builder::new().build());
     }
 
     builder
@@ -74,6 +76,9 @@ pub fn run() {
             commands::reveal_artifact,
             commands::get_setting,
             commands::set_setting,
+            updates::check_for_update,
+            updates::install_update,
+            updates::open_release_page,
         ])
         .run(tauri::generate_context!())
         // Nothing has a window yet at this point, so there is no UI to show an

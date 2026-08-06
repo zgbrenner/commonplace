@@ -177,6 +177,51 @@ export const openArtifact = (taskId: string, artifactId: string) =>
 export const revealArtifact = (taskId: string, artifactId: string) =>
   call("reveal_artifact", { taskId, artifactId }, z.void().or(z.null()));
 
+/* ---------------------------------------------------------------- updates */
+
+const updateCheckSchema = z.object({
+  current_version: z.string(),
+  latest_version: z.string().nullish(),
+  available: z.boolean(),
+  notes: z.string().nullish(),
+  in_place: z.boolean(),
+  release_url: z.string(),
+});
+export type UpdateCheck = z.infer<typeof updateCheckSchema>;
+
+export const checkForUpdate = (): Promise<UpdateCheck> =>
+  call("check_for_update", {}, updateCheckSchema);
+
+const installProgressSchema = z.discriminatedUnion("phase", [
+  z.object({
+    phase: z.literal("downloading"),
+    received: z.number(),
+    total: z.number().nullish(),
+  }),
+  z.object({ phase: z.literal("installing") }),
+]);
+export type InstallProgress = z.infer<typeof installProgressSchema>;
+
+/**
+ * Download and install an update in place. On success the app restarts
+ * itself, so this promise only ever settles with an error.
+ */
+export async function installUpdate(
+  onProgress: (progress: InstallProgress) => void,
+): Promise<void> {
+  const channel = new Channel<unknown>();
+  channel.onmessage = (raw) => {
+    const parsed = installProgressSchema.safeParse(raw);
+    if (parsed.success) {
+      onProgress(parsed.data);
+    }
+  };
+  await call("install_update", { onProgress: channel }, z.void().or(z.null()));
+}
+
+export const openReleasePage = (url?: string) =>
+  call("open_release_page", { url: url ?? null }, z.void().or(z.null()));
+
 /* --------------------------------------------------------------- settings */
 
 export const getSetting = <T>(key: string, schema: z.ZodType<T, z.ZodTypeDef, unknown>) =>
