@@ -202,6 +202,65 @@ function assertHandled(_event: never, state: ConversationState): ConversationSta
   return state;
 }
 
+/** What a person needs to know while a task is running, in plain words. */
+export interface CalmProgress {
+  /** One sentence for what is happening right now. */
+  headline: string;
+  /** "3 of 7 steps done", or undefined when there is nothing to count. */
+  progress?: string | undefined;
+  /**
+   * Steps that failed or were refused. These stay visible: a person must not
+   * have to open Details to learn something was not allowed.
+   */
+  notices: string[];
+}
+
+/**
+ * Enough notices to show a pattern, few enough to stay a glance. Older ones
+ * fall off the top; the timeline under Details keeps the full record.
+ */
+const MAX_NOTICES = 3;
+
+/** A refused step is not a failure, and the wording says so. */
+function noticeText(item: ActivityItem): string {
+  return item.status === "denied" ? `Skipped, not allowed: ${item.title}` : item.title;
+}
+
+/**
+ * The calm view of a running task: one sentence, a count, and anything that
+ * went wrong. Everything machine-facing stays in `activity` for the Details
+ * disclosure to render.
+ */
+export function calmProgress(state: ConversationState, running: boolean): CalmProgress {
+  const inFlight = [...state.activity].reverse().find((item) => item.status === "running");
+  const headline = inFlight
+    ? inFlight.title
+    : running
+      ? "Working…"
+      : state.finished
+        ? "Finished."
+        : "Stopped.";
+
+  const total = state.activity.length;
+  const done = state.activity.filter((item) => item.status !== "running").length;
+
+  const notices: string[] = [];
+  for (const item of state.activity) {
+    if (item.status !== "failed" && item.status !== "denied") continue;
+    const text = noticeText(item);
+    // The same step can fail more than once (a retry, a repeated refusal);
+    // saying so twice adds noise, not information.
+    if (!notices.includes(text)) notices.push(text);
+  }
+
+  return {
+    headline,
+    progress:
+      total === 0 ? undefined : `${done} of ${total} ${total === 1 ? "step" : "steps"} done`,
+    notices: notices.slice(-MAX_NOTICES),
+  };
+}
+
 /** Plain-language sentence describing a permission request's operation. */
 export function permissionHeadline(request: PermissionRequest): string {
   const count = request.paths.length;
@@ -218,7 +277,7 @@ export function permissionHeadline(request: PermissionRequest): string {
     case "create":
       return `Create ${noun}?`;
     case "read":
-      return `Read ${noun} outside this workspace?`;
+      return `Read ${noun} outside this project?`;
     case "execute":
       return "Run a program?";
     case "install":
