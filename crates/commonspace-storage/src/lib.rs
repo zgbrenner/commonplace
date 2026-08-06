@@ -12,5 +12,5 @@ mod migrations;
 mod store;
 
 pub use store::{
-    ConversationRecord, MessageRecord, SessionRecord, Storage, StorageError, TaskRecord,
+    ConversationRecord, MessageRecord, SearchHit, SessionRecord, Storage, StorageError, TaskRecord,
 };

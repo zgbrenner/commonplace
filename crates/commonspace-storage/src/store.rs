@@ -22,6 +22,10 @@ pub enum StorageError {
     NotFound(String),
     #[error("illegal task transition: {0}")]
     Transition(#[from] commonspace_core::TransitionError),
+    #[error("the database failed its integrity check: {0}")]
+    Corrupt(String),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 type Result<T> = std::result::Result<T, StorageError>;
@@ -50,6 +54,18 @@ pub struct MessageRecord {
     pub conversation_id: ConversationId,
     pub role: MessageRole,
     pub content: String,
+    pub created_at: String,
+}
+
+/// One full-text search result. `kind` is `"conversation"` for a title match
+/// (one row per conversation) or `"message"` for a content match (one row per
+/// matching message, carrying its parent conversation's title).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SearchHit {
+    pub kind: String,
+    pub conversation_id: String,
+    pub title: String,
+    pub snippet: String,
     pub created_at: String,
 }
 
@@ -83,6 +99,20 @@ pub struct Storage {
 
 fn now() -> String {
     Utc::now().to_rfc3339()
+}
+
+/// Turn raw user input into an FTS5 MATCH expression that can never be a
+/// syntax error. Every whitespace-separated term becomes a quoted phrase
+/// (embedded quotes doubled, per FTS5 string rules), so operator syntax like
+/// `NEAR(`, `*`, or an unbalanced quote reaches the index as literal text to
+/// tokenize rather than as query grammar. Quoted phrases joined by spaces are
+/// an implicit AND. Returns an empty string for whitespace-only input.
+fn fts_match_expression(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn provider_str(p: ProviderId) -> Result<String> {
@@ -127,9 +157,23 @@ impl Storage {
     }
 
     fn init(mut conn: Connection) -> Result<Self> {
+        // WAL keeps readers unblocked while task-event writes stream in, and
+        // its append-only journal survives crashes better than rollback mode.
+        // synchronous=NORMAL is the documented safe pairing with WAL: it can
+        // never corrupt the database, only lose the last few commits after an
+        // OS-level crash, and it avoids an fsync on every transaction.
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Surface on-disk corruption at open, where a descriptive error is
+        // possible, instead of proceeding and failing confusingly mid-write.
+        // quick_check returns the single row "ok" on a healthy database and
+        // one description per problem otherwise; the first row is enough to
+        // tell the difference and name the fault.
+        let verdict: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        if verdict != "ok" {
+            return Err(StorageError::Corrupt(verdict));
+        }
         migrate_to_latest(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -310,6 +354,75 @@ impl Storage {
                     },
                     content: r.get(2)?,
                     created_at: r.get(3)?,
+                })
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Rename a conversation. The title is trimmed, must be non-empty, and is
+    /// capped with a visible ellipsis (the same convention `title_from_prompt`
+    /// uses for auto-generated titles) rather than silently losing text. The
+    /// v2 FTS triggers keep the search index in step with the update.
+    pub fn rename_conversation(&self, id: &ConversationId, title: &str) -> Result<()> {
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "a conversation title cannot be empty".into(),
+            ));
+        }
+        let mut capped: String = trimmed.chars().take(120).collect();
+        if trimmed.chars().count() > 120 {
+            capped.push('…');
+        }
+        self.with(|c| {
+            let changed = c.execute(
+                "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                params![capped, now(), id.0],
+            )?;
+            if changed == 0 {
+                return Err(StorageError::NotFound(format!("conversation {}", id.0)));
+            }
+            Ok(())
+        })
+    }
+
+    /// Full-text search over conversation titles and message contents.
+    /// Results are ranked by FTS5 relevance; snippets are plain text (the UI
+    /// renders them as text, so no highlight markers are embedded).
+    pub fn search_history(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let expression = fts_match_expression(query);
+        if expression.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with(|c| {
+            // Message hits join their parent conversation for its title; the
+            // join key works for conversation hits too, since their
+            // conversation_id is their own id. The snippet is taken from the
+            // column the row kind actually indexes (title for conversations,
+            // body for messages) — the other column is always empty.
+            let mut stmt = c.prepare(
+                "SELECT f.kind,
+                        f.conversation_id,
+                        COALESCE(conv.title, ''),
+                        CASE WHEN f.kind = 'conversation'
+                             THEN snippet(history_fts, 0, '', '', '…', 12)
+                             ELSE snippet(history_fts, 1, '', '', '…', 12)
+                        END,
+                        f.created_at
+                 FROM history_fts AS f
+                 LEFT JOIN conversations AS conv ON conv.id = f.conversation_id
+                 WHERE history_fts MATCH ?1
+                 ORDER BY rank
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![expression, limit as i64], |r| {
+                Ok(SearchHit {
+                    kind: r.get(0)?,
+                    conversation_id: r.get(1)?,
+                    title: r.get(2)?,
+                    snippet: r.get(3)?,
+                    created_at: r.get(4)?,
                 })
             })?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -925,5 +1038,175 @@ mod tests {
         assert!(s.get_setting::<String>("missing").unwrap().is_none());
         s.set_setting("theme", &"light".to_string()).unwrap();
         assert_eq!(s.get_setting::<String>("theme").unwrap().unwrap(), "light");
+    }
+
+    // ---- full-text search ----
+
+    #[test]
+    fn fts5_is_available_in_bundled_sqlite() {
+        // The v2 migration depends on the bundled build shipping FTS5
+        // (libsqlite3-sys compiles with -DSQLITE_ENABLE_FTS5); prove it.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE VIRTUAL TABLE t USING fts5(x)")
+            .unwrap();
+    }
+
+    #[test]
+    fn search_finds_message_content() {
+        let s = storage();
+        let conv = s.create_conversation(None, "Trip planning").unwrap();
+        let other = s.create_conversation(None, "Groceries").unwrap();
+        s.append_message(
+            &conv.id,
+            MessageRole::User,
+            "book the flamingo hotel near the beach",
+        )
+        .unwrap();
+        s.append_message(&other.id, MessageRole::User, "buy oat milk")
+            .unwrap();
+
+        let hits = s.search_history("flamingo", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, "message");
+        assert_eq!(hits[0].conversation_id, conv.id.0);
+        assert_eq!(hits[0].title, "Trip planning");
+        assert!(hits[0].snippet.contains("flamingo"));
+    }
+
+    #[test]
+    fn search_finds_conversation_by_title() {
+        let s = storage();
+        let conv = s
+            .create_conversation(None, "Quarterly budget review")
+            .unwrap();
+        s.append_message(&conv.id, MessageRole::User, "let's get started")
+            .unwrap();
+
+        let hits = s.search_history("quarterly", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, "conversation");
+        assert_eq!(hits[0].conversation_id, conv.id.0);
+        assert_eq!(hits[0].title, "Quarterly budget review");
+    }
+
+    #[test]
+    fn rename_updates_title_and_search_index() {
+        let s = storage();
+        let conv = s
+            .create_conversation(None, "Zebra migration notes")
+            .unwrap();
+        s.rename_conversation(&conv.id, "  Aardvark habitat notes  ")
+            .unwrap();
+
+        // The stored title is trimmed.
+        let listed = s.list_conversations(10).unwrap();
+        assert_eq!(listed[0].title, "Aardvark habitat notes");
+
+        // The FTS triggers replaced the old index row: the new title is
+        // findable and the old one is gone.
+        let hits = s.search_history("aardvark", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, "conversation");
+        assert_eq!(hits[0].conversation_id, conv.id.0);
+        assert!(s.search_history("zebra", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rename_rejects_empty_caps_length_and_reports_missing() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+
+        assert!(matches!(
+            s.rename_conversation(&conv.id, "   "),
+            Err(StorageError::InvalidInput(_))
+        ));
+
+        let long = "x".repeat(200);
+        s.rename_conversation(&conv.id, &long).unwrap();
+        let title = s.list_conversations(1).unwrap()[0].title.clone();
+        assert_eq!(title.chars().count(), 121);
+        assert!(title.ends_with('…'));
+
+        assert!(matches!(
+            s.rename_conversation(&ConversationId("conv_missing".into()), "x"),
+            Err(StorageError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn hostile_search_queries_return_ok() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        s.append_message(&conv.id, MessageRole::User, "hello world")
+            .unwrap();
+        for hostile in [
+            "unbalanced ( NEAR",
+            "\"",
+            "((((",
+            "NEAR(hello, world)",
+            "hello* -world",
+            "term\" OR \"",
+            "col:value ^caret",
+        ] {
+            assert!(
+                s.search_history(hostile, 10).is_ok(),
+                "query {hostile:?} must not be an FTS/SQL syntax error"
+            );
+        }
+        // Whitespace-only queries do not even reach the index.
+        assert!(s.search_history("", 10).unwrap().is_empty());
+        assert!(s.search_history("   \t  ", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_respects_limit() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        for i in 0..10 {
+            s.append_message(&conv.id, MessageRole::User, &format!("cactus number {i}"))
+                .unwrap();
+        }
+        assert_eq!(s.search_history("cactus", 3).unwrap().len(), 3);
+        assert_eq!(s.search_history("cactus", 100).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn v1_database_upgrades_to_v2_with_backfill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("commonspace.db");
+        {
+            // Build a database frozen at schema v1 and populate it directly —
+            // this is the state real pre-FTS installs are in.
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            crate::migrations::migrate_to(&mut conn, 1).unwrap();
+            conn.execute_batch(
+                "INSERT INTO conversations (id, title, created_at, updated_at)
+                 VALUES ('conv_1', 'Legacy penguin notes',
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                 INSERT INTO messages (id, conversation_id, role, content, created_at)
+                 VALUES ('msg_1', 'conv_1', 'user', 'remember the walrus password',
+                         '2026-01-01T00:00:01Z');",
+            )
+            .unwrap();
+            let v: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, 1);
+        }
+
+        // Reopening runs the v2 migration; its backfill must index the
+        // pre-existing rows without any writes having gone through triggers.
+        let s = Storage::open(&db).unwrap();
+        let title_hits = s.search_history("penguin", 10).unwrap();
+        assert_eq!(title_hits.len(), 1);
+        assert_eq!(title_hits[0].kind, "conversation");
+        assert_eq!(title_hits[0].conversation_id, "conv_1");
+
+        let message_hits = s.search_history("walrus", 10).unwrap();
+        assert_eq!(message_hits.len(), 1);
+        assert_eq!(message_hits[0].kind, "message");
+        assert_eq!(message_hits[0].conversation_id, "conv_1");
+        assert_eq!(message_hits[0].title, "Legacy penguin notes");
+        assert!(message_hits[0].snippet.contains("walrus"));
     }
 }
