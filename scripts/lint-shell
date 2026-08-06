@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# scripts/lint-shell -- shellcheck over the bash scripts in scripts/, then
+# actionlint over the GitHub Actions workflow files.
+#
+# Both tools are optional locally: if one is missing we say so and skip that
+# check rather than failing. CI installs both, so the checks really run
+# there -- a local skip is a convenience, not a hole in the gate.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The source= directive lets `shellcheck -x` follow lib.sh; the SC1091
+# disable silences the "not following" info note a plain (no -x) run emits.
+# shellcheck source=./lib.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib.sh"
+
+# --- shellcheck: the scripts in this directory --------------------------------
+# Scripts are identified by shebang, not extension: everything here except
+# lib.sh is extensionless on purpose (they are commands, not modules), and
+# not every file in scripts/ is a shell script (README.md lives here too).
+step_header "shellcheck (scripts/)"
+if have shellcheck; then
+  shell_scripts=()
+  for f in "${SCRIPT_DIR}"/*; do
+    [ -f "$f" ] || continue
+    if head -n 1 "$f" | grep -qE '^#!.*\bbash\b'; then
+      shell_scripts+=("$f")
+    fi
+  done
+  # An empty list would mean the shebang detection broke, not that the repo
+  # has no shell scripts -- this file alone guarantees at least one match.
+  if [ "${#shell_scripts[@]}" -eq 0 ]; then
+    fail "shebang detection found no bash scripts in scripts/ -- that cannot be right"
+  fi
+  info "Checking ${#shell_scripts[@]} bash scripts (found by shebang)."
+  # -x follows `source`d files (the scripts' `# shellcheck source=` directives
+  # exist for exactly this), and -P SCRIPTDIR resolves those directives
+  # relative to each script rather than to wherever shellcheck was invoked.
+  if shellcheck -x -P SCRIPTDIR "${shell_scripts[@]}"; then
+    info "No shellcheck findings."
+  else
+    fail "shellcheck reported issues (see above)"
+  fi
+else
+  info "shellcheck is not installed -- skipping locally (install: apt/brew install shellcheck)."
+  info "CI installs shellcheck, so this check really runs there."
+fi
+
+# --- actionlint: GitHub Actions workflow files --------------------------------
+# lib.sh already cd'd to the repo root, and actionlint discovers
+# .github/workflows/*.yml from there on its own.
+step_header "actionlint (.github/workflows)"
+if have actionlint; then
+  if actionlint; then
+    info "No actionlint findings."
+  else
+    fail "actionlint reported issues (see above)"
+  fi
+else
+  info "actionlint is not installed -- skipping locally."
+  info "CI installs actionlint, so the workflow files are still checked there."
+fi
+
+step_header "lint-shell complete"

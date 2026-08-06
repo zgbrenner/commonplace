@@ -7,6 +7,12 @@ name: CI
 # Never run the real-provider smoke tests here. They spawn the user's own
 # authenticated CLIs and consume subscription usage; `cargo test` skips them
 # because they are `#[ignore]`d, and `scripts/smoke-providers` is manual.
+#
+# Besides lint/test/security, two supporting jobs run the same way:
+# scripts-hygiene lints the scripts and workflow files themselves
+# (scripts/lint-shell), and coverage produces an informational coverage
+# report (scripts/coverage) -- it uploads lcov and prints a summary but
+# deliberately enforces no threshold yet.
 
 on:
   push:
@@ -31,6 +37,7 @@ jobs:
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -84,6 +91,7 @@ jobs:
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
 
@@ -108,6 +116,7 @@ jobs:
   security:
     name: Security and licenses
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
 
@@ -132,3 +141,84 @@ jobs:
       - name: Audit dependencies and licenses
         shell: bash
         run: scripts/security
+
+  scripts-hygiene:
+    name: Scripts and workflow hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+
+      # Both the helper script ref and the version argument are pinned to the
+      # same release, so a new actionlint version cannot change what "passing"
+      # means without a deliberate bump here.
+      - name: Install actionlint
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash \
+            | sudo bash -s -- 1.7.7 /usr/local/bin
+
+      - name: Lint shell scripts and workflows
+        shell: bash
+        run: scripts/lint-shell
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+
+      # Same Linux build dependencies as the rust job: coverage compiles the
+      # whole workspace, Tauri included. No Node here, though -- the cargo
+      # build itself never touches npm; the rust job only needs it because
+      # scripts/lint and scripts/test also run the frontend checks.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf
+
+      - name: Install llvm-tools
+        run: rustup component add llvm-tools-preview
+
+      # Prebuilt binary, same as the security job's audit tooling.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Coverage
+        shell: bash
+        run: scripts/coverage
+
+      # The same summary the script already printed, surfaced on the run's
+      # summary page. `report` reuses the profile data from scripts/coverage,
+      # so nothing is re-run.
+      - name: Publish coverage summary
+        shell: bash
+        run: |
+          {
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload lcov report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: target/llvm-cov/lcov.info
+          retention-days: 14

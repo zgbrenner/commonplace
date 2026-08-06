@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# scripts/coverage -- Rust workspace test coverage via cargo-llvm-cov.
+#
+# Coverage is informational: this script writes an lcov report (CI uploads
+# it as an artifact) and prints the summary table. It deliberately does NOT
+# enforce a minimum threshold yet -- a threshold chosen before anyone has
+# looked at the real numbers would be theater, not a quality bar. Once the
+# numbers have been seen and discussed, a threshold can be added on purpose.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The source= directive lets `shellcheck -x` follow lib.sh; the SC1091
+# disable silences the "not following" info note a plain (no -x) run emits.
+# shellcheck source=./lib.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib.sh"
+
+if ! have cargo-llvm-cov; then
+  step_header "coverage"
+  info "cargo-llvm-cov is not installed -- skipping locally."
+  info "Install it with: cargo install cargo-llvm-cov"
+  info "CI installs it, so coverage really runs there."
+  exit 0
+fi
+
+lcov_path="${REPO_ROOT}/target/llvm-cov/lcov.info"
+mkdir -p "$(dirname "${lcov_path}")"
+
+# Two steps on purpose: the first run instruments the workspace, runs the
+# tests, and writes the lcov file; `report` then reuses the profile data
+# already on disk to print the human-readable summary without re-running
+# anything. CI re-invokes the same `report` command to fill its job summary.
+run_step "cargo llvm-cov --workspace --lcov" \
+  cargo llvm-cov --workspace --lcov --output-path "${lcov_path}"
+
+run_step "cargo llvm-cov report --summary-only" \
+  cargo llvm-cov report --summary-only
+
+step_header "coverage complete"
+info "lcov report written to ${lcov_path}"
