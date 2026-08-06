@@ -7,6 +7,7 @@ use commonspace_core::{
     PermissionDecision, PermissionRequestId, ProviderId, TaskId, WorkspaceId,
 };
 use commonspace_runtime::StartTask;
+use commonspace_storage::{SearchHit, StorageError};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::ipc::Channel;
@@ -275,6 +276,48 @@ pub fn list_messages(
         .collect())
 }
 
+#[tauri::command]
+pub fn rename_conversation(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    title: String,
+) -> Result<()> {
+    if title.trim().is_empty() {
+        return Err(CommandError::with_recovery(
+            "A conversation needs a name.",
+            "Type a title and try again.",
+        ));
+    }
+    match state
+        .storage()
+        .rename_conversation(&ConversationId(conversation_id), &title)
+    {
+        Ok(()) => Ok(()),
+        Err(StorageError::NotFound(_)) => {
+            Err(CommandError::new("That conversation no longer exists."))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/* --------------------------------------------------------------- search */
+
+#[tauri::command]
+pub fn search_history(
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<u32>,
+) -> Result<Vec<SearchHit>> {
+    // An empty box means "no search", not an error — and answering without
+    // touching the database keeps search-as-you-type cheap when the user
+    // clears the field.
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let limit = limit.unwrap_or(30).min(100) as usize;
+    Ok(state.storage().search_history(&query, limit)?)
+}
+
 /* --------------------------------------------------------------- tasks */
 
 #[derive(Debug, Deserialize)]
@@ -497,6 +540,23 @@ pub fn reveal_artifact(
         .map_err(|e| CommandError::new(format!("Commonspace couldn't show that file: {e}")))
 }
 
+/// Open a link from the conversation in the user's default browser.
+///
+/// Assistant replies contain web links, and the webview must never navigate
+/// itself away from the app — so link clicks route through this command. The
+/// parse-then-check-scheme step is what makes `file://`, `javascript:`, and
+/// custom-scheme launches impossible: only absolute http/https URLs survive.
+#[tauri::command]
+pub fn open_external_url(url: String) -> Result<()> {
+    let parsed = tauri::Url::parse(&url)
+        .map_err(|_| CommandError::new("Commonspace only opens web links."))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(CommandError::new("Commonspace only opens web links."));
+    }
+    tauri_plugin_opener::open_url(url, None::<&str>)
+        .map_err(|e| CommandError::new(format!("Commonspace couldn't open that link: {e}")))
+}
+
 fn find_artifact(
     state: &State<'_, AppState>,
     task_id: &str,
@@ -562,5 +622,26 @@ mod tests {
         // Never claims a subscription where there isn't one.
         let out = billing_note(&AuthStatus::SignedOut);
         assert!(!out.to_lowercase().contains("subscription usage"));
+    }
+
+    #[test]
+    fn open_external_url_rejects_everything_but_web_links() {
+        // Each of these must fail the scheme gate before any opener call.
+        for bad in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "ftp://example.com/file",
+            "smb://server/share",
+            "not a url at all",
+            "/relative/path",
+            "example.com/no-scheme",
+            "",
+        ] {
+            let err = open_external_url(bad.to_string()).unwrap_err();
+            assert_eq!(
+                err.message, "Commonspace only opens web links.",
+                "input {bad:?} must be rejected with the plain-language error"
+            );
+        }
     }
 }

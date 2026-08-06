@@ -1,7 +1,10 @@
 import { useEffect, useRef } from "react";
+import Markdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { Message } from "@commonspace/protocol";
 import type { ActivityItem, ConversationState } from "../lib/activity";
 import { permissionHeadline } from "../lib/activity";
+import { openExternalUrl } from "../lib/ipc";
 import { Button, Card, ErrorNotice, StatusPill, TechnicalDetails } from "./primitives";
 
 interface ConversationProps {
@@ -88,19 +91,66 @@ export function Conversation({
   );
 }
 
-function MessageBubble({ role, content }: { role: "user" | "assistant"; content: string }) {
-  const isUser = role === "user";
-  return (
-    <div className={isUser ? "flex justify-end" : ""}>
-      <div
-        className={
-          isUser
-            ? "selectable max-w-[85%] rounded-[var(--radius-card)] bg-[var(--color-accent-soft)] px-4 py-2.5 text-sm whitespace-pre-wrap text-[var(--color-ink)]"
-            : "selectable max-w-full text-sm whitespace-pre-wrap text-[var(--color-ink)]"
+/**
+ * Overrides for the Markdown renderer, defined once at module level so the
+ * object identity is stable across renders.
+ */
+const markdownComponents: Components = {
+  // Links never navigate the webview — that would replace the whole app with
+  // the destination page. They open in the user's default browser via the
+  // backend instead, and the title attribute shows where a link goes on
+  // hover, since the webview has no status bar.
+  a: ({ href, children }) => (
+    <a
+      href={href}
+      title={href}
+      onClick={(event) => {
+        event.preventDefault();
+        if (href) {
+          void openExternalUrl(href).catch(() => {
+            // A link that fails to open is not worth an error banner.
+          });
         }
-      >
-        <span className="sr-only">{isUser ? "You said:" : "Commonspace replied:"}</span>
-        {content}
+      }}
+    >
+      {children}
+    </a>
+  ),
+  // Wide tables scroll inside their own wrapper rather than stretching the
+  // conversation column.
+  table: ({ children }) => (
+    <div className="markdown-table-scroll">
+      <table>{children}</table>
+    </div>
+  ),
+};
+
+function MessageBubble({ role, content }: { role: "user" | "assistant"; content: string }) {
+  if (role === "user") {
+    // User text stays plain: the person typed it literally, and rendering
+    // their asterisks or brackets as markup would be surprising.
+    return (
+      <div className="flex justify-end">
+        <div className="selectable max-w-[85%] rounded-[var(--radius-card)] bg-[var(--color-accent-soft)] px-4 py-2.5 text-sm whitespace-pre-wrap text-[var(--color-ink)]">
+          <span className="sr-only">You said:</span>
+          {content}
+        </div>
+      </div>
+    );
+  }
+
+  // Assistant replies render as Markdown. Raw HTML stays disabled
+  // (react-markdown's default; no rehype-raw) — deliberately, because model
+  // output is untrusted. During streaming this component re-parses the whole
+  // text on every delta; at chat-message sizes that is cheap, so it is kept
+  // intentionally simple rather than incrementally parsed.
+  return (
+    <div>
+      <div className="selectable markdown max-w-full text-sm text-[var(--color-ink)]">
+        <span className="sr-only">Commonspace replied:</span>
+        <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+          {content}
+        </Markdown>
       </div>
     </div>
   );

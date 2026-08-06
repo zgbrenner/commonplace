@@ -8,12 +8,19 @@
 use rusqlite::Connection;
 
 /// Ordered migrations. Index 0 brings the schema to version 1, and so on.
-const MIGRATIONS: &[&str] = &[V1_INITIAL];
+const MIGRATIONS: &[&str] = &[V1_INITIAL, V2_HISTORY_FTS];
 
 /// Apply all pending migrations inside transactions.
 pub fn migrate_to_latest(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    migrate_to(conn, MIGRATIONS.len())
+}
+
+/// Apply migrations up to `target` (a 1-based schema version). Crate-visible
+/// so tests can freeze a database at an older version, fill it with data, and
+/// prove the upgrade path — including backfills — against real rows.
+pub(crate) fn migrate_to(conn: &mut Connection, target: usize) -> Result<(), rusqlite::Error> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    let target = MIGRATIONS.len() as i64;
+    let target = target as i64;
     if current > target {
         // A newer app version created this database; refuse to touch it.
         return Err(rusqlite::Error::SqliteFailure(
@@ -23,7 +30,12 @@ pub fn migrate_to_latest(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             )),
         ));
     }
-    for (index, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
+    for (index, sql) in MIGRATIONS
+        .iter()
+        .enumerate()
+        .take(target as usize)
+        .skip(current as usize)
+    {
         let version = index as i64 + 1;
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
@@ -187,6 +199,64 @@ CREATE TABLE settings (
 ) STRICT;
 "#;
 
+/// V2: full-text search over conversation history.
+///
+/// `history_fts` is a standalone FTS5 table with one row per conversation
+/// (kind 'conversation', title indexed) and one row per message (kind
+/// 'message', body indexed). A title match therefore surfaces exactly one
+/// conversation hit while each matching message is its own hit — the
+/// deduplication the search UI wants falls out of the schema.
+///
+/// The index is kept in sync by SQL triggers rather than application code:
+/// triggers run inside the same transaction as the write they mirror, so the
+/// index can never drift from the tables the way a forgotten call site in app
+/// code could. The final INSERTs backfill databases upgrading from v1, which
+/// already contain history.
+const V2_HISTORY_FTS: &str = r#"
+CREATE VIRTUAL TABLE history_fts USING fts5(
+    title,
+    body,
+    kind            UNINDEXED,
+    ref_id          UNINDEXED,
+    conversation_id UNINDEXED,
+    created_at      UNINDEXED,
+    tokenize='unicode61'
+);
+
+CREATE TRIGGER conversations_fts_insert AFTER INSERT ON conversations BEGIN
+    INSERT INTO history_fts (title, body, kind, ref_id, conversation_id, created_at)
+    VALUES (new.title, '', 'conversation', new.id, new.id, new.created_at);
+END;
+
+CREATE TRIGGER conversations_fts_update AFTER UPDATE OF title ON conversations BEGIN
+    DELETE FROM history_fts WHERE kind = 'conversation' AND ref_id = old.id;
+    INSERT INTO history_fts (title, body, kind, ref_id, conversation_id, created_at)
+    VALUES (new.title, '', 'conversation', new.id, new.id, new.created_at);
+END;
+
+-- One sweep by conversation_id removes the conversation's own row and every
+-- message row under it, so the index stays correct whether or not the FK
+-- cascade delete of messages also fires the message trigger below.
+CREATE TRIGGER conversations_fts_delete AFTER DELETE ON conversations BEGIN
+    DELETE FROM history_fts WHERE conversation_id = old.id;
+END;
+
+CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO history_fts (title, body, kind, ref_id, conversation_id, created_at)
+    VALUES ('', new.content, 'message', new.id, new.conversation_id, new.created_at);
+END;
+
+CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+    DELETE FROM history_fts WHERE kind = 'message' AND ref_id = old.id;
+END;
+
+INSERT INTO history_fts (title, body, kind, ref_id, conversation_id, created_at)
+SELECT title, '', 'conversation', id, id, created_at FROM conversations;
+
+INSERT INTO history_fts (title, body, kind, ref_id, conversation_id, created_at)
+SELECT '', content, 'message', id, conversation_id, created_at FROM messages;
+"#;
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -209,5 +279,65 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "user_version", 999).unwrap();
         assert!(migrate_to_latest(&mut conn).is_err());
+    }
+
+    #[test]
+    fn migrations_can_stop_at_an_older_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate_to(&mut conn, 1).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 1);
+        // v2's FTS table must not exist yet.
+        let fts: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'history_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts, 0);
+    }
+
+    #[test]
+    fn fts_triggers_track_inserts_updates_and_cascade_deletes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        migrate_to_latest(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO conversations (id, title, created_at, updated_at)
+             VALUES ('conv_1', 'Trip planning', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO messages (id, conversation_id, role, content, created_at)
+             VALUES ('msg_1', 'conv_1', 'user', 'book the hotel', '2026-01-01T00:00:01Z');",
+        )
+        .unwrap();
+        let count = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT count(*) FROM history_fts", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(&conn), 2);
+
+        // A title edit replaces the conversation's index row in place.
+        conn.execute(
+            "UPDATE conversations SET title = 'Beach holiday' WHERE id = 'conv_1'",
+            [],
+        )
+        .unwrap();
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM history_fts WHERE kind = 'conversation'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "Beach holiday");
+        assert_eq!(count(&conn), 2);
+
+        // Deleting the conversation clears its row and, via FK cascade on
+        // messages, every message row too.
+        conn.execute("DELETE FROM conversations WHERE id = 'conv_1'", [])
+            .unwrap();
+        assert_eq!(count(&conn), 0);
     }
 }

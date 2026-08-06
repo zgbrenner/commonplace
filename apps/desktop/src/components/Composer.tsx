@@ -1,5 +1,7 @@
-import { useCallback, useRef, useState, type DragEvent, type KeyboardEvent } from "react";
+import { useCallback, useRef, useState, type KeyboardEvent } from "react";
 import type { Connection, Workspace } from "@commonspace/protocol";
+import { mergePaths } from "../lib/attachments";
+import { useFileDrop } from "../lib/useFileDrop";
 import { Button } from "./primitives";
 
 interface ComposerProps {
@@ -35,8 +37,12 @@ export function Composer({
   disabledReason,
 }: ComposerProps) {
   const [text, setText] = useState("");
-  const [dragging, setDragging] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Dropped files arrive through Tauri's native drag-drop event with real
+  // absolute paths, and merge into the attachment list exactly like the
+  // file picker does.
+  const dragging = useFileDrop((paths) => onAttachmentsChange(mergePaths(attachments, paths)));
 
   const usable = connections.filter(
     (c) => c.auth.status === "subscription" || c.auth.status === "api_key" || c.auth.status === "local_model",
@@ -65,30 +71,19 @@ export function Composer({
     }
   };
 
-  const onDrop = (event: DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    setDragging(false);
-    // The webview only exposes names for dropped files; Tauri's own drag-drop
-    // event carries real paths and is wired in App. This handler keeps the
-    // affordance visible and guides the user to the picker.
-    if (event.dataTransfer.files.length > 0) {
-      onAttachFiles();
-    }
-  };
-
   return (
     <div
       className={`border-t border-[var(--color-line)] bg-[var(--color-surface)] px-6 py-4 ${
         dragging ? "bg-[var(--color-accent-soft)]" : ""
       }`}
-      onDragOver={(event) => {
-        event.preventDefault();
-        setDragging(true);
-      }}
-      onDragLeave={() => setDragging(false)}
-      onDrop={onDrop}
     >
       <div className="mx-auto max-w-3xl">
+        {dragging ? (
+          <p className="mb-2 rounded-md border border-dashed border-[var(--color-accent)] px-3 py-2 text-center text-sm text-[var(--color-accent)]">
+            Drop files to attach
+          </p>
+        ) : null}
+
         {attachments.length > 0 ? (
           <ul className="mb-2 flex flex-wrap gap-1.5">
             {attachments.map((path) => (
