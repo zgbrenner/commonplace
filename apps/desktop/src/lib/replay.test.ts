@@ -12,14 +12,17 @@ import {
   type Artifact,
   type Message,
   type OperationResult,
+  type TaskPlan,
   type TaskState,
 } from "@commonspace/protocol";
 import {
   aggregateArtifacts,
   deriveOutcome,
   foldEvents,
+  isAwaitingPlanDecision,
   isInterruptedTask,
   newestTask,
+  planGates,
   replayConversationState,
   summarizeUndo,
   type ReplayTask,
@@ -60,6 +63,27 @@ function opResult(success: boolean): OperationResult {
     user_summary: success ? "Restored the file." : "Couldn't restore the file.",
   };
 }
+
+function makePlan(overrides: Partial<TaskPlan> = {}): TaskPlan {
+  return {
+    steps: [{ title: "Read the contracts", detail: null }],
+    paths_accessed: ["C:/ws/contracts"],
+    paths_likely_modified: [],
+    external_services: [],
+    consequential_actions: [],
+    deliverables: [],
+    requires_approval: false,
+    ...overrides,
+  };
+}
+
+/** A plan that gates: it needs approval and would write a file. */
+const gatingPlan = makePlan({
+  requires_approval: true,
+  paths_likely_modified: ["C:/ws/summary.docx"],
+  consequential_actions: ["Create summary.docx"],
+  deliverables: ["A summary document"],
+});
 
 const summaryArtifact = artifact({
   id: "art_1",
@@ -183,6 +207,81 @@ describe("replayConversationState", () => {
   });
 });
 
+/* ---------------------------------------------------------- plan approval */
+
+describe("planGates", () => {
+  it("a harmless plan (no approval flag, nothing to touch) does not gate", () => {
+    expect(planGates(makePlan())).toBe(false);
+  });
+
+  it("gates on the approval flag or on anything the plan would touch", () => {
+    expect(planGates(makePlan({ requires_approval: true }))).toBe(true);
+    expect(planGates(makePlan({ paths_likely_modified: ["C:/ws/a.docx"] }))).toBe(true);
+    expect(planGates(makePlan({ consequential_actions: ["Send an email"] }))).toBe(true);
+    expect(planGates(makePlan({ external_services: ["gmail"] }))).toBe(true);
+  });
+});
+
+describe("isAwaitingPlanDecision", () => {
+  const planCreated: AgentEvent = { type: "plan.created", plan: gatingPlan };
+
+  it("uses shapes the real event schema accepts", () => {
+    expect(agentEventSchema.safeParse(planCreated).success).toBe(true);
+  });
+
+  it("gating plan + quiet stream → awaiting", () => {
+    const state = foldEvents([planCreated]);
+    expect(isAwaitingPlanDecision("awaiting_approval", state.plan, state)).toBe(true);
+  });
+
+  it("plan followed by execution (tool.started) → not awaiting", () => {
+    const state = foldEvents([
+      planCreated,
+      { type: "tool.started", call_id: "tool_1", title: "Reading contracts" },
+    ]);
+    expect(state.executionAfterPlan).toBe(true);
+    expect(isAwaitingPlanDecision("running", state.plan, state)).toBe(false);
+  });
+
+  it("harmless plan (requires_approval=false, empty lists) → not awaiting", () => {
+    const state = foldEvents([{ type: "plan.created", plan: makePlan() }]);
+    expect(isAwaitingPlanDecision("awaiting_approval", state.plan, state)).toBe(false);
+  });
+
+  it("terminal task states → not awaiting, even with a quiet gating plan", () => {
+    const state = foldEvents([planCreated]);
+    for (const terminal of ["completed", "failed", "cancelled", "rolled_back"] as const) {
+      expect(isAwaitingPlanDecision(terminal, state.plan, state)).toBe(false);
+    }
+  });
+
+  it("awaiting from the stored TaskInfo plan on replay, even with no plan event in the fold", () => {
+    // A reopened conversation prefers the durable plan stored on the task
+    // row; the derivation must not depend on the fold having carried it.
+    const state = foldEvents([]);
+    expect(state.plan).toBeUndefined();
+    expect(isAwaitingPlanDecision("awaiting_approval", gatingPlan, state)).toBe(true);
+  });
+
+  it("a revision resets the evidence: plan → tool → plan.updated is awaiting again", () => {
+    const revised = makePlan({ requires_approval: true, steps: [{ title: "New approach" }] });
+    const state = foldEvents([
+      planCreated,
+      { type: "tool.started", call_id: "tool_1", title: "Reading contracts" },
+      { type: "plan.updated", plan: revised },
+    ]);
+    expect(state.executionAfterPlan).toBe(false);
+    expect(isAwaitingPlanDecision("awaiting_approval", state.plan, state)).toBe(true);
+  });
+
+  it("plan.updated replaces the plan in the fold", () => {
+    const revised = makePlan({ requires_approval: true, steps: [{ title: "New approach" }] });
+    const state = foldEvents([planCreated, { type: "plan.updated", plan: revised }]);
+    expect(state.plan?.steps[0]?.title).toBe("New approach");
+    expect(state.plan?.paths_likely_modified).toEqual([]);
+  });
+});
+
 /* ------------------------------------------------------------ aggregation */
 
 describe("aggregateArtifacts", () => {
@@ -282,6 +381,18 @@ describe("deriveOutcome", () => {
     const outcome = deriveOutcome(task("completed"), foldEvents(events), []);
     expect(outcome.kind).toBe("completed");
     expect(outcome.deniedNote).toBe("You declined a change, so Commonspace stopped there.");
+  });
+
+  it("awaiting_approval: waiting on the plan decision, not interrupted", () => {
+    // Within one app run a stored awaiting_approval task is a live question
+    // (the plan card renders and App suppresses this outcome); across a
+    // restart crash recovery force-fails it, so it never replays this way.
+    const state = foldEvents([{ type: "plan.created", plan: gatingPlan }]);
+    expect(isInterruptedTask(task("awaiting_approval"))).toBe(false);
+    const outcome = deriveOutcome(task("awaiting_approval"), state, []);
+    expect(outcome.kind).toBe("awaiting_plan");
+    expect(outcome.headline).toBe("This task is waiting on your decision.");
+    expect(outcome.note).toBe("Nothing runs until you answer its plan.");
   });
 
   it("interrupted: a task still marked running renders honestly", () => {

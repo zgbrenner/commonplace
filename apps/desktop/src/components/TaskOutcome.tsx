@@ -147,6 +147,12 @@ function OutcomePill({ kind }: { kind: TaskOutcomeModel["kind"] }) {
           Interrupted
         </StatusPill>
       );
+    case "awaiting_plan":
+      return (
+        <StatusPill tone="accent" glyph="…">
+          Waiting on you
+        </StatusPill>
+      );
     default:
       return null;
   }
