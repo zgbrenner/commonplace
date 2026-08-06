@@ -37,6 +37,9 @@ sha2.workspace = true
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
+# A task can run for minutes, so the desktop notification is how a finished
+# task reaches someone who has switched to another window.
+tauri-plugin-notification = "2"
 # The update check compares release versions properly (so "0.1.10" is newer
 # than "0.1.9") and the fallback path asks the GitHub API which release is
 # current. `reqwest` matches the TLS stack the updater plugin already uses.

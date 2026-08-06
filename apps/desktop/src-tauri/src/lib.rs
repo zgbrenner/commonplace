@@ -41,6 +41,7 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             use tauri::Manager;
             let state = AppState::initialize(app.handle())?;
