@@ -32,7 +32,7 @@ impl AgentAdapter for CodexCliAdapter {
     }
 
     async fn detect(&self) -> InstallStatus {
-        probe_version(CLI).await
+        probe_version(CLI, &[]).await
     }
 
     async fn auth_status(&self) -> AuthStatus {
@@ -45,6 +45,7 @@ impl AgentAdapter for CodexCliAdapter {
             &path,
             &args,
             &cwd,
+            &[],
             std::time::Duration::from_secs(20),
         )
         .await

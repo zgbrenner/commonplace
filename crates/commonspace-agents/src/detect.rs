@@ -56,14 +56,17 @@ fn dirs_home() -> Option<PathBuf> {
     }
 }
 
-/// Probe `<cli> --version` and classify the install.
-pub async fn probe_version(name: &str) -> InstallStatus {
+/// Probe `<cli> --version` and classify the install. `envs` lets an adapter
+/// quiet its CLI's nonessential behaviour (update checks, telemetry) during
+/// the probe.
+pub async fn probe_version(name: &str, envs: &[(String, String)]) -> InstallStatus {
     let Some(path) = find_cli(name) else {
         return InstallStatus::NotInstalled;
     };
     let cwd = std::env::temp_dir();
     let args = vec!["--version".to_string()];
-    match crate::process::probe_output(&path, &args, &cwd, std::time::Duration::from_secs(20)).await
+    match crate::process::probe_output(&path, &args, &cwd, envs, std::time::Duration::from_secs(20))
+        .await
     {
         Ok((_, output)) => match output.lines().find(|l| !l.trim().is_empty()) {
             Some(version) => InstallStatus::Installed {
