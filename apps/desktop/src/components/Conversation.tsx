@@ -1,18 +1,26 @@
 import { useEffect, useRef } from "react";
 import Markdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { Message } from "@commonspace/protocol";
+import type { Artifact, Message, OperationResult } from "@commonspace/protocol";
 import type { ActivityItem, ConversationState } from "../lib/activity";
 import { permissionHeadline } from "../lib/activity";
+import type { TaskOutcome as TaskOutcomeModel } from "../lib/replay";
 import { openExternalUrl } from "../lib/ipc";
+import { TaskOutcome } from "./TaskOutcome";
 import { Button, Card, ErrorNotice, StatusPill, TechnicalDetails } from "./primitives";
 
 interface ConversationProps {
   messages: Message[];
   live: ConversationState;
   running: boolean;
+  /** The newest task's outcome, once it is terminal (live or replayed). */
+  outcome: TaskOutcomeModel | undefined;
   onAnswerPermission: (approve: boolean, scope?: "once" | "task" | "workspace") => void;
   onCancel: () => void;
+  onOpenArtifact: (artifact: Artifact) => void;
+  onRevealArtifact: (artifact: Artifact) => void;
+  onUndoArtifact: (artifact: Artifact) => Promise<OperationResult>;
+  onUndoTask: () => Promise<OperationResult[]>;
 }
 
 /** The conversation column: messages, progress, approvals, result. */
@@ -20,14 +28,19 @@ export function Conversation({
   messages,
   live,
   running,
+  outcome,
   onAnswerPermission,
   onCancel,
+  onOpenArtifact,
+  onRevealArtifact,
+  onUndoArtifact,
+  onUndoTask,
 }: ConversationProps) {
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
-  }, [messages.length, live.assistantText, live.activity.length, live.pendingPermission]);
+  }, [messages.length, live.assistantText, live.activity.length, live.pendingPermission, outcome]);
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
@@ -66,8 +79,21 @@ export function Conversation({
           </p>
         ))}
 
-        {live.error ? (
+        {live.error && !outcome ? (
+          // Once the outcome card exists it owns the failure presentation,
+          // so the raw notice would show the same error twice.
           <ErrorNotice message={live.error.message} recovery={live.error.recovery} />
+        ) : null}
+
+        {outcome ? (
+          <TaskOutcome
+            key={outcome.taskId}
+            outcome={outcome}
+            onOpen={onOpenArtifact}
+            onReveal={onRevealArtifact}
+            onUndoArtifact={onUndoArtifact}
+            onUndoTask={onUndoTask}
+          />
         ) : null}
 
         {running ? (
