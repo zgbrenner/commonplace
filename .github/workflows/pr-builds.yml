@@ -117,10 +117,34 @@ jobs:
             Write-Error "Installer exited with code $($proc.ExitCode)."
             exit 1
           }
-          $exe = Get-ChildItem -Path $env:LOCALAPPDATA -Filter 'Commonspace.exe' -Recurse -File -ErrorAction SilentlyContinue |
-            Select-Object -First 1
+          # The installed binary may be Commonspace.exe or the crate's own
+          # commonspace-desktop.exe (Tauri only renames when mainBinaryName is
+          # set), the install root depends on the NSIS install mode, and NSIS
+          # can return a beat before files settle — so: match by prefix,
+          # search every realistic root, and poll briefly.
+          function Find-InstalledExe {
+            foreach ($root in @($env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+              if (-not $root) { continue }
+              $hit = Get-ChildItem -Path $root -Filter 'commonspace*.exe' -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notmatch 'setup|uninstall' } |
+                Select-Object -First 1
+              if ($hit) { return $hit }
+            }
+            return $null
+          }
+          $deadline = (Get-Date).AddSeconds(60)
+          do {
+            $exe = Find-InstalledExe
+            if ($exe) { break }
+            Start-Sleep -Seconds 3
+          } while ((Get-Date) -lt $deadline)
           if (-not $exe) {
-            Write-Error "Silent install finished but Commonspace.exe was not found anywhere under $env:LOCALAPPDATA."
+            Write-Host 'Registry uninstall entries mentioning Commonspace (for diagnosis):'
+            Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                             'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -like '*Commonspace*' } |
+              Select-Object DisplayName, InstallLocation, DisplayVersion | Format-List | Out-String | Write-Host
+            Write-Error 'Silent install finished but no Commonspace binary was found under LOCALAPPDATA or Program Files.'
             exit 1
           }
           Write-Host "Packaged binary installed at: $($exe.FullName)"

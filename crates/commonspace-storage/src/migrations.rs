@@ -8,7 +8,7 @@
 use rusqlite::Connection;
 
 /// Ordered migrations. Index 0 brings the schema to version 1, and so on.
-const MIGRATIONS: &[&str] = &[V1_INITIAL, V2_HISTORY_FTS];
+const MIGRATIONS: &[&str] = &[V1_INITIAL, V2_HISTORY_FTS, V3_ATTACHMENTS];
 
 /// Apply all pending migrations inside transactions.
 pub fn migrate_to_latest(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -255,6 +255,30 @@ SELECT title, '', 'conversation', id, id, created_at FROM conversations;
 
 INSERT INTO history_fts (title, body, kind, ref_id, conversation_id, created_at)
 SELECT '', content, 'message', id, conversation_id, created_at FROM messages;
+"#;
+
+/// V3: files and folders the user attached to a message.
+///
+/// Metadata only — never file contents. `task_id` is nullable and set null on
+/// task deletion because an attachment belongs to the conversation first: the
+/// user's "what did I hand this conversation?" record must outlive any one
+/// task. `content_hash` is null for folders and for files too large to hash
+/// at send time; `in_workspace` records whether the path was inside one of
+/// the workspace's authorized roots when it was attached.
+const V3_ATTACHMENTS: &str = r#"
+CREATE TABLE attachments (
+    id              TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    task_id         TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    path            TEXT NOT NULL,
+    kind            TEXT NOT NULL CHECK (kind IN ('file','folder')),
+    size_bytes      INTEGER,
+    modified_at     TEXT,
+    content_hash    TEXT,
+    in_workspace    INTEGER NOT NULL CHECK (in_workspace IN (0,1)),
+    created_at      TEXT NOT NULL
+) STRICT;
+CREATE INDEX idx_attachments_conversation ON attachments(conversation_id, created_at);
 "#;
 
 #[cfg(test)]

@@ -23,6 +23,15 @@ nine steps easier to trust. Later themes (workflows, additional file
 formats, a broader security posture) are real, but they build on top of the
 loop rather than compete with it for attention.
 
+The current sequencing, in order: conversation replay ("reopen later with
+everything intact"), a persisted attachment model with plain disclosure,
+and a task-outcome view (all in progress); then a real plan-approval stage
+(approve the overall plan once, instead of twenty individual writes); then
+a knowledge-worker UX pass (projects instead of workspaces in the
+interface, a recommended default agent, generated titles, calm plain
+progress by default with technical events under details); then the
+document features in the order theme 6 lists.
+
 ## 1. A "Changes" center
 
 Right now a task reports success or failure without a single place to
@@ -140,20 +149,28 @@ cost and complexity of an embedding pipeline.
 for the MVP (ARCHITECTURE.md, "Document tooling";
 [docs/document-tools.md](document-tools.md)); status.md lists
 formatting-preserving DOCX edits, XLSX, PPTX, OCR, and format conversion as
-not started. The roadmap for this layer:
+not started. The order below is deliberate — it serves knowledge workers
+before it serves integrations, and it comes before adding new providers,
+local-model configuration, browser automation, arbitrary MCP servers,
+vector RAG, or multi-agent controls:
 
-- OCR with confidence scores and page-level provenance, not a black-box
-  transcription.
-- XLSX reading and writing, including formulas and validation.
-- DOCX edits that preserve existing formatting instead of regenerating the
-  file.
-- PPTX support.
-- PDF page rendering and previews.
-- Format conversion between the above.
-- Tables, comments, tracked changes, headers, footers, and footnotes as
-  first-class structures, not lost on round-trip.
-- Streaming support for large documents, so a 300-page file doesn't require
-  holding the whole thing in memory.
+1. XLSX reading and polished spreadsheet creation, including formulas and
+   validation.
+2. OCR for scans and image-only PDFs, with confidence scores and
+   page-level provenance — not a black-box transcription.
+3. DOCX edits that preserve existing formatting instead of regenerating
+   the file.
+4. PDF page rendering, previews, and source citations that open the exact
+   page.
+5. PPTX creation and editing.
+6. OneDrive and SharePoint folder awareness.
+7. Email draft creation.
+8. Saved routines and skills (see theme 4).
+
+Cross-cutting, in support of the above: format conversion; tables,
+comments, tracked changes, headers, footers, and footnotes as first-class
+structures that survive round-trips; streaming for large documents so a
+300-page file doesn't require holding the whole thing in memory.
 
 All of it keeps the existing rule: success is reported only after
 Commonspace's own reader confirms the result on disk, never because the

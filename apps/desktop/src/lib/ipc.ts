@@ -135,6 +135,74 @@ export const openExternalUrl = (url: string) =>
 
 /* ------------------------------------------------------------------ tasks */
 
+/** A persisted task, as needed to replay a conversation's history. */
+export const taskInfoSchema = z.object({
+  id: z.string(),
+  conversation_id: z.string(),
+  provider: z.string(),
+  state: z.enum([
+    "draft",
+    "planning",
+    "awaiting_approval",
+    "running",
+    "paused",
+    "completed",
+    "failed",
+    "cancelled",
+    "rolled_back",
+  ]),
+  summary: z.string().nullish(),
+  error_message: z.string().nullish(),
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+export type TaskInfo = z.infer<typeof taskInfoSchema>;
+
+export const listTasks = (conversationId: string): Promise<TaskInfo[]> =>
+  call("list_tasks", { conversationId }, z.array(taskInfoSchema));
+
+/**
+ * The provider session a follow-up message can continue, when the
+ * conversation's most recent task left one behind and the provider supports
+ * resuming. Null when there is nothing to continue.
+ */
+export const resumableSessionSchema = z
+  .object({
+    provider: z.string(),
+    provider_session_id: z.string(),
+  })
+  .nullable();
+export type ResumableSession = z.infer<typeof resumableSessionSchema>;
+
+export const resumableSession = (conversationId: string): Promise<ResumableSession> =>
+  call("resumable_session", { conversationId }, resumableSessionSchema);
+
+/** Undo every file operation a task performed, newest first. */
+export const undoTask = (workspaceId: string, taskId: string): Promise<OperationResult[]> =>
+  call("undo_task", { workspaceId, taskId }, z.array(operationResultSchema));
+
+/* ------------------------------------------------------------ attachments */
+
+/** A persisted attachment: metadata only, never file contents. */
+export const attachmentInfoSchema = z.object({
+  id: z.string(),
+  conversation_id: z.string(),
+  task_id: z.string().nullish(),
+  path: z.string(),
+  kind: z.enum(["file", "folder"]),
+  size_bytes: z.number().nullish(),
+  modified_at: z.string().nullish(),
+  content_hash: z.string().nullish(),
+  in_workspace: z.boolean(),
+  created_at: z.string(),
+});
+export type AttachmentInfo = z.infer<typeof attachmentInfoSchema>;
+
+export const listConversationAttachments = (
+  conversationId: string,
+): Promise<AttachmentInfo[]> =>
+  call("list_conversation_attachments", { conversationId }, z.array(attachmentInfoSchema));
+
 export interface StartTaskArgs {
   conversationId?: string | undefined;
   workspaceId: string;
@@ -142,6 +210,11 @@ export interface StartTaskArgs {
   prompt: string;
   model?: string | undefined;
   resume?: string | undefined;
+  /**
+   * Attached file/folder paths. The backend canonicalizes, records, and
+   * discloses these — the prompt text itself no longer carries paths.
+   */
+  attachments?: string[] | undefined;
 }
 
 const startedTaskSchema = z.object({
@@ -179,6 +252,7 @@ export async function startTask(
         prompt: args.prompt,
         model: args.model ?? null,
         resume: args.resume ?? null,
+        attachments: args.attachments ?? [],
       },
       onEvent: channel,
     },

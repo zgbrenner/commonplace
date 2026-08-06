@@ -15,3 +15,22 @@
 export function mergePaths(current: readonly string[], added: readonly string[]): string[] {
   return [...new Set([...current, ...added])];
 }
+
+/**
+ * The one-line disclosure shown above the composer when attachments are
+ * present: what Commonspace will look at, and where what it reads may go.
+ *
+ * We say "attached item(s)" rather than "file(s) and folder(s)": the frontend
+ * only holds path strings and does no filesystem access, and a path string
+ * alone cannot reliably tell a file from a folder — honesty over precision.
+ * The backend, which does stat the paths, records the real kind.
+ *
+ * Deliberately no token or size estimates here; the roadmap defers those to
+ * a future Details-level view.
+ */
+export function attachmentDisclosure(count: number, providerName: string | undefined): string {
+  const items = count === 1 ? "1 attached item" : `${count} attached items`;
+  const destination =
+    providerName && providerName.trim().length > 0 ? providerName : "your connected agent";
+  return `Commonspace will look at ${items}. What it reads may be sent to ${destination}. Your files won't be changed without your approval.`;
+}

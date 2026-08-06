@@ -16,6 +16,8 @@ thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 rusqlite.workspace = true
+# Attachment ids are minted here (there is no core id type for them yet).
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

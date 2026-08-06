@@ -29,6 +29,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
 rusqlite = { version = "0.40", features = ["bundled"] }
+sha2 = "0.10"
 
 commonspace-core = { path = "crates/commonspace-core" }
 commonspace-permissions = { path = "crates/commonspace-permissions" }

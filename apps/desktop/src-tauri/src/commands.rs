@@ -7,9 +7,12 @@ use commonspace_core::{
     PermissionDecision, PermissionRequestId, ProviderId, TaskId, WorkspaceId,
 };
 use commonspace_runtime::StartTask;
-use commonspace_storage::{SearchHit, StorageError};
+use commonspace_storage::{
+    AttachmentKind, AttachmentRecord, NewAttachment, ResumableSession, SearchHit, StorageError,
+    TaskRow,
+};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::ipc::Channel;
 use tauri::State;
 
@@ -328,6 +331,10 @@ pub struct StartTaskArgs {
     prompt: String,
     model: Option<String>,
     resume: Option<String>,
+    /// Paths the user attached in the composer. Optional so older frontends
+    /// (and tests) that omit the field keep working.
+    #[serde(default)]
+    attachments: Vec<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -391,6 +398,26 @@ pub async fn start_task(
         }
     }
 
+    // Collect attachment metadata before the provider can touch anything, so
+    // the recorded hashes describe what the user handed over, not what the
+    // task later made of it. Every step degrades per-file: metadata trouble
+    // must never fail the send.
+    let workspace_roots = state
+        .storage()
+        .workspace_roots(&workspace_id)
+        .unwrap_or_default();
+    let attachments: Vec<NewAttachment> = args
+        .attachments
+        .iter()
+        .map(|path| collect_attachment_metadata(path, &workspace_roots))
+        .collect();
+
+    // The attachment list used to be pasted into the prompt by the frontend.
+    // The assembly moved here so the paths become data Commonspace can
+    // disclose and persist (the attachments table), not prose — while the
+    // provider still receives exactly the text it always did.
+    let prompt = prompt_with_attachments(&args.prompt, &attachments);
+
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
@@ -408,7 +435,7 @@ pub async fn start_task(
                 conversation_id: conversation.clone(),
                 workspace_id,
                 provider: args.provider,
-                prompt: args.prompt,
+                prompt,
                 model: args.model,
                 resume: args.resume,
             },
@@ -416,12 +443,109 @@ pub async fn start_task(
         )
         .await?;
 
+    // Recorded only after the orchestrator minted the task, so the rows can
+    // carry the task id. A recording failure is logged, not returned: the
+    // task is already running and must not look failed to the user.
+    if !attachments.is_empty() {
+        if let Err(error) =
+            state
+                .storage()
+                .record_attachments(&conversation, Some(&handle.task_id), &attachments)
+        {
+            tracing::warn!(%error, "failed to record attachment metadata");
+        }
+    }
+
     let task_id = handle.task_id.0.clone();
     state.track(handle);
     Ok(StartedTask {
         task_id,
         conversation_id: conversation.0,
     })
+}
+
+/// Files larger than this are not hashed at send time: hashing means reading
+/// the whole file synchronously in the send path, and a multi-gigabyte
+/// attachment would stall the message for seconds. Such files (and folders)
+/// simply record a null hash.
+const MAX_HASHED_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Inspect one attached path and produce its metadata record. Infallible by
+/// design: a path that cannot be resolved or read degrades to null fields
+/// (and `in_workspace: false` when it matches no root) instead of failing
+/// the send.
+fn collect_attachment_metadata(path: &Path, workspace_roots: &[PathBuf]) -> NewAttachment {
+    // Canonicalize so the recorded path names the real location (symlinks
+    // resolved) and the workspace check compares like with like. When
+    // canonicalization fails — the path vanished, or permissions — keep the
+    // path exactly as given.
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let metadata = std::fs::metadata(&resolved).ok();
+
+    let kind = match &metadata {
+        Some(m) if m.is_dir() => AttachmentKind::Folder,
+        // An unreadable path is recorded as a file: "file" is the neutral
+        // default and every other field is already null.
+        _ => AttachmentKind::File,
+    };
+    let size_bytes = metadata
+        .as_ref()
+        .filter(|m| m.is_file())
+        .map(|m| m.len() as i64);
+    let modified_at = metadata
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+
+    let content_hash = match (kind, size_bytes) {
+        (AttachmentKind::File, Some(len)) if (len as u64) <= MAX_HASHED_FILE_BYTES => {
+            std::fs::read(&resolved).ok().map(|bytes| {
+                use sha2::{Digest, Sha256};
+                use std::fmt::Write as _;
+                let digest = Sha256::digest(&bytes);
+                let mut hex = String::with_capacity(digest.len() * 2);
+                for byte in digest {
+                    let _ = write!(hex, "{byte:02x}");
+                }
+                hex
+            })
+        }
+        _ => None,
+    };
+
+    // The same containment rule the permission layer applies: canonicalized
+    // child against canonicalized root, compared component-wise (which
+    // `Path::starts_with` is) rather than as a string prefix, so
+    // "/ws-evil" never matches root "/ws".
+    let in_workspace = workspace_roots.iter().any(|root| {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        resolved.starts_with(&root)
+    });
+
+    NewAttachment {
+        path: resolved.to_string_lossy().into_owned(),
+        kind,
+        size_bytes,
+        modified_at,
+        content_hash,
+        in_workspace,
+    }
+}
+
+/// Append the attached paths to the prompt the provider sees, using exactly
+/// the wording the frontend used to embed — so provider behavior does not
+/// change now that the frontend sends paths as data instead of prose.
+fn prompt_with_attachments(prompt: &str, attachments: &[NewAttachment]) -> String {
+    if attachments.is_empty() {
+        return prompt.to_owned();
+    }
+    let mut out = String::from(prompt);
+    out.push_str("\n\nFiles and folders I've attached:");
+    for attachment in attachments {
+        out.push_str("\n- ");
+        out.push_str(&attachment.path);
+    }
+    out
 }
 
 fn title_from_prompt(prompt: &str) -> String {
@@ -493,6 +617,67 @@ pub fn list_task_events(
         .into_iter()
         .map(|(_, event)| event)
         .collect())
+}
+
+/// A conversation's tasks, oldest first, for replaying its history.
+#[tauri::command]
+pub fn list_tasks(state: State<'_, AppState>, conversation_id: String) -> Result<Vec<TaskRow>> {
+    Ok(state
+        .storage()
+        .list_tasks(&ConversationId(conversation_id))?)
+}
+
+/// The provider session a follow-up message can continue, if the
+/// conversation's most recent task left a resumable one behind.
+#[tauri::command]
+pub fn resumable_session(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<Option<ResumableSession>> {
+    Ok(state
+        .storage()
+        .resumable_session(&ConversationId(conversation_id))?)
+}
+
+/// Everything the user has attached in a conversation — metadata only.
+#[tauri::command]
+pub fn list_conversation_attachments(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<Vec<AttachmentRecord>> {
+    Ok(state
+        .storage()
+        .list_conversation_attachments(&ConversationId(conversation_id))?)
+}
+
+/// Undo every file operation a task performed, newest change first, and
+/// report one result per operation. Failures are collected, not thrown: the
+/// orchestrator already turns "cannot be undone" conditions (missing backup,
+/// file changed since, already undone) into failed `OperationResult`s, and
+/// any remaining error (say, an operation row that vanished mid-loop) is
+/// folded into a failed result too — one stubborn file must never stop the
+/// rest of the task from being rolled back.
+#[tauri::command]
+pub fn undo_task(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    task_id: String,
+) -> Result<Vec<OperationResult>> {
+    let workspace = WorkspaceId(workspace_id);
+    let operation_ids = state
+        .storage()
+        .task_file_operation_ids_newest_first(&TaskId(task_id))?;
+    let mut results = Vec::with_capacity(operation_ids.len());
+    for operation_id in operation_ids {
+        match state.orchestrator().undo(&workspace, &operation_id) {
+            Ok(result) => results.push(result),
+            Err(error) => results.push(OperationResult::failed(
+                "This change could not be undone.",
+                error.to_string(),
+            )),
+        }
+    }
+    Ok(results)
 }
 
 #[tauri::command]
@@ -622,6 +807,101 @@ mod tests {
         // Never claims a subscription where there isn't one.
         let out = billing_note(&AuthStatus::SignedOut);
         assert!(!out.to_lowercase().contains("subscription usage"));
+    }
+
+    #[test]
+    fn prompt_with_attachments_uses_the_frontend_wording_verbatim() {
+        let attachment = |path: &str| NewAttachment {
+            path: path.to_owned(),
+            kind: AttachmentKind::File,
+            size_bytes: None,
+            modified_at: None,
+            content_hash: None,
+            in_workspace: false,
+        };
+        assert_eq!(
+            prompt_with_attachments(
+                "Summarize these",
+                &[attachment("/home/u/a.pdf"), attachment("/home/u/b")],
+            ),
+            "Summarize these\n\nFiles and folders I've attached:\n- /home/u/a.pdf\n- /home/u/b"
+        );
+    }
+
+    #[test]
+    fn prompt_without_attachments_is_untouched() {
+        assert_eq!(prompt_with_attachments("Hello", &[]), "Hello");
+    }
+
+    #[test]
+    fn attachment_metadata_for_a_file_includes_size_hash_and_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let file = root.join("hello.txt");
+        std::fs::write(&file, "hello world").unwrap();
+
+        let meta = collect_attachment_metadata(&file, std::slice::from_ref(&root));
+        assert_eq!(meta.kind, AttachmentKind::File);
+        assert_eq!(meta.size_bytes, Some(11));
+        assert!(meta.modified_at.is_some());
+        // sha256("hello world") — the well-known digest.
+        assert_eq!(
+            meta.content_hash.as_deref(),
+            Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
+        );
+        assert!(meta.in_workspace);
+        // The recorded path is the canonicalized location of the real file.
+        assert!(Path::new(&meta.path).is_absolute());
+    }
+
+    #[test]
+    fn attachment_metadata_for_a_folder_has_kind_folder_and_no_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("photos");
+        std::fs::create_dir(&folder).unwrap();
+
+        // The workspace root is elsewhere, so the folder is out of scope.
+        let other_root = tmp.path().join("workspace");
+        std::fs::create_dir(&other_root).unwrap();
+
+        let meta = collect_attachment_metadata(&folder, &[other_root]);
+        assert_eq!(meta.kind, AttachmentKind::Folder);
+        assert_eq!(meta.size_bytes, None);
+        assert_eq!(meta.content_hash, None);
+        assert!(!meta.in_workspace);
+    }
+
+    #[test]
+    fn attachment_metadata_for_a_missing_path_degrades_to_nulls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = collect_attachment_metadata(
+            Path::new("/definitely/not/there.bin"),
+            &[tmp.path().to_path_buf()],
+        );
+        assert_eq!(meta.kind, AttachmentKind::File);
+        assert_eq!(meta.size_bytes, None);
+        assert_eq!(meta.modified_at, None);
+        assert_eq!(meta.content_hash, None);
+        assert!(!meta.in_workspace);
+        // The path is kept as given so the record still names what the user
+        // attached.
+        assert_eq!(meta.path, "/definitely/not/there.bin");
+    }
+
+    #[test]
+    fn oversized_files_are_not_hashed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = tmp.path().join("huge.bin");
+        // A sparse file over the hashing ceiling: cheap to create, and its
+        // reported length is what the cutoff checks.
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(MAX_HASHED_FILE_BYTES + 1).unwrap();
+        drop(f);
+
+        let meta = collect_attachment_metadata(&big, &[tmp.path().to_path_buf()]);
+        assert_eq!(meta.kind, AttachmentKind::File);
+        assert_eq!(meta.size_bytes, Some((MAX_HASHED_FILE_BYTES + 1) as i64));
+        assert_eq!(meta.content_hash, None, "large files must skip hashing");
     }
 
     #[test]

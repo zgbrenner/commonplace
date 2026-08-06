@@ -10,8 +10,17 @@ import type {
   Workspace,
 } from "@commonspace/protocol";
 import * as ipc from "./lib/ipc";
-import { CommonspaceError } from "./lib/ipc";
+import { CommonspaceError, type TaskInfo } from "./lib/ipc";
 import { applyEvent, emptyConversationState, type ConversationState } from "./lib/activity";
+import {
+  aggregateArtifacts,
+  deriveOutcome,
+  newestTask,
+  replayConversationState,
+  type ReplayTask,
+  type TaskArtifacts,
+  type TaskOutcome,
+} from "./lib/replay";
 import { mergePaths } from "./lib/attachments";
 import { Sidebar, type View } from "./components/Sidebar";
 import { Conversation as ConversationView } from "./components/Conversation";
@@ -34,6 +43,12 @@ export function App() {
   const [live, setLive] = useState<ConversationState>(emptyConversationState);
   const [taskId, setTaskId] = useState<string | undefined>();
   const [running, setRunning] = useState(false);
+  /** Set when `live` was rebuilt from a persisted task rather than a stream. */
+  const [replayTask, setReplayTask] = useState<TaskInfo | undefined>();
+  /** Artifacts per task, oldest task first — older outputs stay reachable. */
+  const [artifactGroups, setArtifactGroups] = useState<TaskArtifacts[]>([]);
+  /** True after the user pressed Stop on the current live task. */
+  const [stopped, setStopped] = useState(false);
   const [provider, setProvider] = useState("claude_code");
   const [model, setModel] = useState("default");
   const [attachments, setAttachments] = useState<string[]>([]);
@@ -133,8 +148,12 @@ export function App() {
         setView("workspaces");
         return;
       }
+      // Capture before the Composer clears its list on send.
+      const pendingAttachments = attachments;
       setError(undefined);
       setLive(emptyConversationState());
+      setReplayTask(undefined);
+      setStopped(false);
       setRunning(true);
       // Show the prompt immediately rather than waiting for the round trip.
       setMessages((current) => [
@@ -147,6 +166,28 @@ export function App() {
           created_at: new Date().toISOString(),
         },
       ]);
+
+      // Continue the provider's own session only when everything lines up:
+      // there is one, it belongs to the selected provider, and that provider
+      // supports resuming. Anything else — including a failed lookup —
+      // degrades silently to a fresh session.
+      let resume: string | undefined;
+      if (conversationId) {
+        try {
+          const session = await ipc.resumableSession(conversationId);
+          const connection = connections.find((c) => c.provider === provider);
+          if (
+            session &&
+            session.provider === provider &&
+            connection?.capabilities.supports_resume
+          ) {
+            resume = session.provider_session_id;
+          }
+        } catch {
+          // No resume — the follow-up still works, it just starts fresh.
+        }
+      }
+
       try {
         const started = await ipc.startTask(
           {
@@ -155,11 +196,16 @@ export function App() {
             provider: provider as Connection["provider"],
             prompt,
             model: model === "default" ? undefined : model,
+            resume,
+            // Structured attachment paths — the backend records and
+            // discloses them; the prompt text never embeds paths.
+            attachments: pendingAttachments,
           },
           onEvent,
         );
         setTaskId(started.taskId);
         setConversationId(started.conversationId);
+        setAttachments([]);
         void refreshConversations();
       } catch (cause) {
         setRunning(false);
@@ -168,6 +214,8 @@ export function App() {
     },
     [
       activeWorkspaceId,
+      attachments,
+      connections,
       conversationId,
       provider,
       model,
@@ -190,6 +238,7 @@ export function App() {
   const cancel = useCallback(() => {
     if (!taskId) return;
     setRunning(false);
+    setStopped(true);
     void ipc.cancelTask(taskId).catch(reportError);
   }, [taskId, reportError]);
 
@@ -200,8 +249,37 @@ export function App() {
       setLive(emptyConversationState());
       setTaskId(undefined);
       setRunning(false);
+      setStopped(false);
+      setReplayTask(undefined);
+      setArtifactGroups([]);
       try {
-        setMessages(await ipc.listMessages(id));
+        const [loadedMessages, tasks] = await Promise.all([
+          ipc.listMessages(id),
+          ipc.listTasks(id),
+        ]);
+        setMessages(loadedMessages);
+
+        // Artifacts from every task in the conversation, oldest first, so
+        // outputs of earlier tasks stay reachable from the panel while each
+        // stays grouped under the task that made it (undo scope).
+        const ordered = [...tasks].sort((a, b) => a.created_at.localeCompare(b.created_at));
+        const groups = await Promise.all(
+          ordered.map(async (task) => ({
+            taskId: task.id,
+            artifacts: await ipc.listTaskArtifacts(task.id),
+          })),
+        );
+        setArtifactGroups(groups);
+
+        // Replay the newest task's event stream through the same reducer
+        // the live path uses, so the reopened view matches what was shown.
+        const newest = newestTask(tasks);
+        if (newest) {
+          setTaskId(newest.id);
+          const events = await ipc.listTaskEvents(newest.id);
+          setLive(replayConversationState(events, loadedMessages));
+          setReplayTask(newest);
+        }
       } catch (cause) {
         reportError(cause);
       }
@@ -228,6 +306,9 @@ export function App() {
     setLive(emptyConversationState());
     setTaskId(undefined);
     setRunning(false);
+    setStopped(false);
+    setReplayTask(undefined);
+    setArtifactGroups([]);
     setAttachments([]);
   }, []);
 
@@ -284,6 +365,92 @@ export function App() {
     },
     [activeWorkspaceId],
   );
+
+  const openArtifact = useCallback(
+    (artifact: Artifact) => {
+      void ipc.openArtifact(artifact.task_id, artifact.id).catch(reportError);
+    },
+    [reportError],
+  );
+
+  const revealArtifact = useCallback(
+    (artifact: Artifact) => {
+      void ipc.revealArtifact(artifact.task_id, artifact.id).catch(reportError);
+    },
+    [reportError],
+  );
+
+  const undoWholeTask = useCallback(async (): Promise<OperationResult[]> => {
+    const target = replayTask?.id ?? taskId;
+    if (!activeWorkspaceId || !target) return [];
+    try {
+      const results = await ipc.undoTask(activeWorkspaceId, target);
+      try {
+        // Refresh what the panel and card show for this task.
+        const refreshed = await ipc.listTaskArtifacts(target);
+        setArtifactGroups((groups) =>
+          groups.some((group) => group.taskId === target)
+            ? groups.map((group) =>
+                group.taskId === target ? { taskId: target, artifacts: refreshed } : group,
+              )
+            : [...groups, { taskId: target, artifacts: refreshed }],
+        );
+        if (!replayTask) {
+          setLive((state) => ({ ...state, artifacts: refreshed }));
+        }
+      } catch {
+        // The undo itself succeeded; a stale panel is not worth an error.
+      }
+      return results;
+    } catch (cause) {
+      return [
+        {
+          success: false,
+          created: [],
+          modified: [],
+          backups: [],
+          warnings: [],
+          validation: {
+            outcome: "failed",
+            detail: cause instanceof Error ? cause.message : String(cause),
+          },
+          user_summary: "Commonspace couldn't undo this task.",
+        },
+      ];
+    }
+  }, [activeWorkspaceId, replayTask, taskId]);
+
+  /* ------------------------------------------------------- derived state */
+
+  const panelArtifacts = useMemo(() => {
+    const groups = [...artifactGroups];
+    // During a live task the stream is the source of truth; on replay the
+    // stored per-task lists already include the newest task.
+    if (!replayTask && taskId && live.artifacts.length > 0) {
+      groups.push({ taskId, artifacts: live.artifacts });
+    }
+    return aggregateArtifacts(groups);
+  }, [artifactGroups, replayTask, taskId, live.artifacts]);
+
+  const outcome = useMemo<TaskOutcome | undefined>(() => {
+    if (running) return undefined;
+    if (replayTask) {
+      const derived = deriveOutcome(replayTask, live, panelArtifacts);
+      return derived.kind === "none" ? undefined : derived;
+    }
+    if (!taskId) return undefined;
+    if (!live.finished && !stopped) return undefined;
+    // A task that just finished on screen has no stored row in hand, so the
+    // card derives from the stream instead — same component either way.
+    const finishedTask: ReplayTask = {
+      id: taskId,
+      state: !live.finished ? "cancelled" : live.error ? "failed" : "completed",
+      summary: live.summary ?? null,
+      error_message: live.error?.message ?? null,
+    };
+    const derived = deriveOutcome(finishedTask, live, panelArtifacts);
+    return derived.kind === "none" ? undefined : derived;
+  }, [running, replayTask, taskId, live, stopped, panelArtifacts]);
 
   /* ---------------------------------------------------------------- view */
 
@@ -399,8 +566,13 @@ export function App() {
               messages={messages}
               live={live}
               running={running}
+              outcome={outcome}
               onAnswerPermission={answerPermission}
               onCancel={cancel}
+              onOpenArtifact={openArtifact}
+              onRevealArtifact={revealArtifact}
+              onUndoArtifact={undoArtifact}
+              onUndoTask={undoWholeTask}
             />
             <Composer
               workspace={workspace}
@@ -421,15 +593,11 @@ export function App() {
         )}
       </main>
 
-      {view === "task" && live.artifacts.length > 0 ? (
+      {view === "task" && panelArtifacts.length > 0 ? (
         <ArtifactPanel
-          artifacts={live.artifacts}
-          onOpen={(artifact) => {
-            if (taskId) void ipc.openArtifact(taskId, artifact.id).catch(reportError);
-          }}
-          onReveal={(artifact) => {
-            if (taskId) void ipc.revealArtifact(taskId, artifact.id).catch(reportError);
-          }}
+          artifacts={panelArtifacts}
+          onOpen={openArtifact}
+          onReveal={revealArtifact}
           onUndo={undoArtifact}
         />
       ) : null}

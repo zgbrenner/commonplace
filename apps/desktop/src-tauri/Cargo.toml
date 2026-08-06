@@ -29,6 +29,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio.workspace = true
 chrono.workspace = true
+# Content hashes for attachment metadata (sha256 of small attached files).
+sha2.workspace = true
 # `protocol-asset` backs the artifact previews; its scope stays empty in
 # tauri.conf.json and is widened at runtime only for folders the user has
 # authorized.
@@ -40,6 +42,9 @@ tauri-plugin-opener = "2"
 # current. `reqwest` matches the TLS stack the updater plugin already uses.
 semver = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"
