@@ -1,8 +1,10 @@
 // Moved verbatim out of App.tsx as a mechanical step toward the planned feature-folder split — no logic changes.
 import { useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
+import { z } from "zod";
 import * as ipc from "../lib/ipc";
 import { CommonspaceError } from "../lib/ipc";
+import { enableNotifications, NOTIFICATIONS_SETTING } from "../lib/notify";
 import { Button, ErrorNotice } from "./primitives";
 
 type UpdateUiState =
@@ -136,6 +138,106 @@ function UpdatesSection() {
   );
 }
 
+type NotificationsNote =
+  | { kind: "info"; message: string }
+  | { kind: "error"; message: string; recovery?: string | undefined };
+
+function NotificationsSection() {
+  const [enabled, setEnabled] = useState(false);
+  const [note, setNote] = useState<NotificationsNote>();
+
+  useEffect(() => {
+    // Off until asked for: a stored value that is missing, false, or
+    // unreadable all mean the same thing, so Commonspace never asks the
+    // operating system for a permission nobody requested.
+    void ipc
+      .getSetting(NOTIFICATIONS_SETTING, z.boolean())
+      .then((stored) => setEnabled(stored === true))
+      .catch(() => {
+        setEnabled(false);
+      });
+  }, []);
+
+  const choose = async (next: boolean) => {
+    setNote(undefined);
+    if (next && !(await enableNotifications())) {
+      // The system said no, so nothing is stored: a `true` here would leave
+      // the toggle promising notifications that can never arrive.
+      setEnabled(false);
+      setNote({
+        kind: "info",
+        message:
+          "Your system declined notifications for Commonspace, so this stayed off. You can allow them in your system notification settings, then turn this on again.",
+      });
+      return;
+    }
+
+    setEnabled(next);
+    try {
+      await ipc.setSetting(NOTIFICATIONS_SETTING, next);
+    } catch (cause) {
+      // Unlike the theme, this preference has no effect until it is stored,
+      // so a failed write has to be said out loud.
+      setEnabled(!next);
+      if (cause instanceof CommonspaceError) {
+        setNote({
+          kind: "error",
+          message: cause.message,
+          ...(cause.recovery ? { recovery: cause.recovery } : {}),
+        });
+      } else {
+        setNote({
+          kind: "error",
+          message: cause instanceof Error ? cause.message : String(cause),
+        });
+      }
+    }
+  };
+
+  return (
+    <section className="mt-6">
+      <h2 className="text-sm font-semibold">Notifications</h2>
+      <p className="mt-1.5 text-sm text-[var(--color-ink-muted)]">
+        Commonspace can send one desktop notification when a task finishes, saying what happened
+        and how many files changed. It only sends when the Commonspace window is not in front —
+        never while you are watching the task run.
+      </p>
+
+      <fieldset className="mt-2">
+        <legend className="sr-only">Notify me when a task finishes</legend>
+        <div className="flex gap-2">
+          <Button
+            variant={enabled ? "primary" : "secondary"}
+            size="sm"
+            onClick={() => void choose(true)}
+            aria-pressed={enabled}
+          >
+            On
+          </Button>
+          <Button
+            variant={enabled ? "secondary" : "primary"}
+            size="sm"
+            onClick={() => void choose(false)}
+            aria-pressed={!enabled}
+          >
+            Off
+          </Button>
+        </div>
+      </fieldset>
+
+      {note?.kind === "info" ? (
+        <p role="status" className="mt-2 text-sm text-[var(--color-ink-muted)]">
+          {note.message}
+        </p>
+      ) : note?.kind === "error" ? (
+        <div className="mt-2">
+          <ErrorNotice message={note.message} recovery={note.recovery} />
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 export function SettingsView() {
   const [theme, setTheme] = useState<string>(
     () => document.documentElement.dataset["theme"] ?? "system",
@@ -178,6 +280,8 @@ export function SettingsView() {
             </div>
           </fieldset>
         </section>
+
+        <NotificationsSection />
 
         <UpdatesSection />
 
