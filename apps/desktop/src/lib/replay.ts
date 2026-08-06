@@ -11,6 +11,7 @@ import type {
   Artifact,
   Message,
   OperationResult,
+  TaskPlan,
   TaskState,
 } from "@commonspace/protocol";
 import { applyEvent, emptyConversationState, type ConversationState } from "./activity";
@@ -84,6 +85,51 @@ export function replayConversationState(
   };
 }
 
+/* --------------------------------------------------------- plan approval */
+
+/**
+ * Whether a plan gates execution: it either asks for approval outright or
+ * would touch something — files, external services, or consequential
+ * actions. A harmless plan (nothing to modify, nothing consequential)
+ * auto-proceeds on the backend and never waits.
+ */
+export function planGates(plan: TaskPlan): boolean {
+  return (
+    plan.requires_approval ||
+    plan.paths_likely_modified.length > 0 ||
+    plan.consequential_actions.length > 0 ||
+    plan.external_services.length > 0
+  );
+}
+
+const TERMINAL_STATES: readonly TaskState[] = [
+  "completed",
+  "failed",
+  "cancelled",
+  "rolled_back",
+];
+
+/**
+ * The one rule for "is this plan waiting on the user?", shared by the live
+ * stream and replay so a reopened conversation agrees with the one that was
+ * on screen: a plan exists, it gates, nothing has executed after the latest
+ * plan event, and the task has not already ended.
+ *
+ * `plan` is passed separately from the folded state so replay can prefer
+ * the durable copy stored on the task row (`TaskInfo.plan`) over the one
+ * the event fold reconstructed.
+ */
+export function isAwaitingPlanDecision(
+  taskState: TaskState,
+  plan: TaskPlan | null | undefined,
+  state: ConversationState,
+): boolean {
+  if (!plan || !planGates(plan)) return false;
+  if (TERMINAL_STATES.includes(taskState)) return false;
+  if (state.executionAfterPlan || state.finished) return false;
+  return true;
+}
+
 /* -------------------------------------------------- artifact aggregation */
 
 /** One task's artifacts, kept grouped so undo-task knows its scope. */
@@ -114,7 +160,13 @@ export function aggregateArtifacts(groups: TaskArtifacts[]): Artifact[] {
 
 /* --------------------------------------------------------- task outcomes */
 
-export type OutcomeKind = "completed" | "failed" | "cancelled" | "interrupted" | "none";
+export type OutcomeKind =
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted"
+  | "awaiting_plan"
+  | "none";
 
 export interface TaskOutcome {
   kind: OutcomeKind;
@@ -143,13 +195,14 @@ export interface TaskOutcome {
  */
 const CRASH_RECOVERY_PREFIX = "Commonspace closed while this task was running";
 
-/** States that mean the task was live when the app last stopped. */
-const LIVE_STATES: readonly TaskState[] = [
-  "planning",
-  "awaiting_approval",
-  "running",
-  "paused",
-];
+/**
+ * States that mean the task was executing when the app last stopped.
+ * `awaiting_approval` is deliberately not here: within one app run it is a
+ * plan genuinely waiting on the user (the decisional card handles it), and
+ * across a restart crash recovery force-fails it with the recovery message,
+ * so it arrives as `failed` and matches the prefix above instead.
+ */
+const LIVE_STATES: readonly TaskState[] = ["planning", "running", "paused"];
 
 export function isInterruptedTask(task: ReplayTask): boolean {
   if (LIVE_STATES.includes(task.state)) return true;
@@ -200,6 +253,17 @@ export function deriveOutcome(
   }
 
   switch (task.state) {
+    case "awaiting_approval":
+      // The decisional plan card owns the actions; when it is on screen the
+      // caller suppresses this card entirely so the question isn't asked
+      // twice. This outcome only renders in the defensive case where the
+      // task is waiting but no gating plan is available to show.
+      return {
+        ...base,
+        kind: "awaiting_plan",
+        headline: "This task is waiting on your decision.",
+        note: "Nothing runs until you answer its plan.",
+      };
     case "completed":
       return {
         ...base,

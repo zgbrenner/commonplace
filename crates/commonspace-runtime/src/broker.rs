@@ -11,6 +11,7 @@ use commonspace_core::{
     AgentEvent, DecisionScope, OperationClass, PermissionDecision, PermissionRequest,
     PermissionRequestId, RiskLevel, TaskId,
 };
+use commonspace_permissions::PathGuard;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -64,6 +65,20 @@ struct Grant {
     scope_key: String,
 }
 
+/// The blanket permission a user gives by approving a task's plan: the
+/// covered classes of work, on paths inside the workspace's authorized
+/// roots, proceed without re-asking. Delete is deliberately never part of an
+/// envelope — sending files to the trash is consequential enough to keep
+/// asking every time. The policy engine's hard denials (protected paths,
+/// secrets, permanent deletion) are evaluated before the broker is ever
+/// reached, so no envelope can cover them.
+#[derive(Debug, Clone)]
+struct PlanEnvelope {
+    classes: HashSet<OperationClass>,
+    /// Canonicalized workspace roots the envelope covers.
+    roots: Vec<PathBuf>,
+}
+
 #[derive(Default)]
 struct BrokerState {
     pending: HashMap<PermissionRequestId, oneshot::Sender<PermissionDecision>>,
@@ -72,6 +87,8 @@ struct BrokerState {
     /// Grants remembered for a workspace (in-memory; the storage layer
     /// persists the durable copy).
     workspace_grants: HashSet<Grant>,
+    /// Per-task blanket approvals seeded when a plan is approved.
+    plan_envelopes: HashMap<TaskId, PlanEnvelope>,
 }
 
 /// Shared broker handle.
@@ -104,6 +121,25 @@ impl PermissionBroker {
             irreversible,
         } = ask;
         let task_id = &task_id;
+
+        // The plan-approval envelope comes first: work the user already
+        // approved as a plan proceeds without another question. Containment
+        // is resolved through the same PathGuard rules the policy engine
+        // uses, so symlinks and `..` cannot stretch the envelope, and any
+        // path that fails to resolve simply falls through to a real ask.
+        let envelope = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.plan_envelopes.get(task_id).cloned()
+        };
+        if let Some(envelope) = envelope {
+            if envelope.classes.contains(&operation)
+                && !paths.is_empty()
+                && envelope_covers(&envelope, &paths)
+            {
+                return PermissionOutcome::Approved;
+            }
+        }
+
         let grant = Grant {
             operation,
             scope_key: scope_key(&paths),
@@ -171,10 +207,34 @@ impl PermissionBroker {
         }
     }
 
+    /// Seed the plan-approval envelope for a task: creating, modifying,
+    /// renaming, and moving files inside `roots` stop re-asking, because the
+    /// user just approved a plan that says exactly that work will happen.
+    /// Delete stays out on purpose — even under an approved plan, sending
+    /// files to the trash is consequential enough to keep asking.
+    pub fn grant_plan_envelope(&self, task_id: &TaskId, roots: Vec<PathBuf>) {
+        let envelope = PlanEnvelope {
+            classes: [
+                OperationClass::Create,
+                OperationClass::Modify,
+                OperationClass::Rename,
+                OperationClass::Move,
+            ]
+            .into_iter()
+            .collect(),
+            // Canonicalize through the guard so later containment checks
+            // compare like with like.
+            roots: PathGuard::new(&roots).roots().to_vec(),
+        };
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.plan_envelopes.insert(task_id.clone(), envelope);
+    }
+
     /// Abandon every pending request for a task (cancellation, failure).
     pub fn abandon_task(&self, task_id: &TaskId) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.task_grants.remove(task_id);
+        state.plan_envelopes.remove(task_id);
         // Dropping the senders resolves the waiters as `Abandoned`.
         state.pending.retain(|_, _| false);
     }
@@ -209,6 +269,16 @@ impl PermissionBroker {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.pending.remove(id);
     }
+}
+
+/// Whether every requested path resolves inside one of the envelope's roots.
+/// Unresolvable paths (relative, vanished ancestors, Windows hazards) are
+/// never covered — falling through to a real question is the safe direction.
+fn envelope_covers(envelope: &PlanEnvelope, paths: &[PathBuf]) -> bool {
+    let guard = PathGuard::new(&envelope.roots);
+    paths
+        .iter()
+        .all(|path| guard.resolve(path).map(|r| r.in_scope()).unwrap_or(false))
 }
 
 /// Grant key for a set of paths: the common parent folder, so approving
@@ -255,6 +325,16 @@ mod tests {
         paths: Vec<PathBuf>,
         answer: Option<PermissionDecision>,
     ) -> PermissionOutcome {
+        ask_class(broker, task, OperationClass::Delete, paths, answer).await
+    }
+
+    async fn ask_class(
+        broker: &PermissionBroker,
+        task: &TaskId,
+        operation: OperationClass,
+        paths: Vec<PathBuf>,
+        answer: Option<PermissionDecision>,
+    ) -> PermissionOutcome {
         let (tx, mut rx) = sink();
         let broker2 = broker.clone();
         let handle = tokio::spawn({
@@ -264,8 +344,8 @@ mod tests {
                     .request(
                         Ask {
                             task_id: task,
-                            operation: OperationClass::Delete,
-                            summary: "Delete files".into(),
+                            operation,
+                            summary: "Do something".into(),
                             paths,
                             items: vec![],
                             risk: RiskLevel::High,
@@ -461,6 +541,111 @@ mod tests {
         let _ = rx.recv().await;
         broker.abandon_task(&task);
         assert_eq!(waiter.await.expect("join"), PermissionOutcome::Abandoned);
+    }
+
+    /// An approved plan's envelope answers in-root create/modify/rename/move
+    /// silently — no `permission.requested` event ever reaches the UI.
+    #[tokio::test]
+    async fn envelope_approves_in_root_modify_without_asking() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(&root).expect("root");
+        let target = root.join("notes.md");
+        std::fs::write(&target, "x").expect("seed");
+
+        let broker = PermissionBroker::new();
+        let task = TaskId::generate();
+        broker.grant_plan_envelope(&task, vec![root]);
+
+        let (tx, mut rx) = sink();
+        let outcome = broker
+            .request(
+                Ask {
+                    task_id: task,
+                    operation: OperationClass::Modify,
+                    summary: "Update notes.md".into(),
+                    paths: vec![target],
+                    items: vec![],
+                    risk: RiskLevel::Medium,
+                    irreversible: false,
+                },
+                &tx,
+            )
+            .await;
+        assert_eq!(outcome, PermissionOutcome::Approved);
+        assert!(rx.try_recv().is_err(), "the envelope must not emit an ask");
+    }
+
+    #[tokio::test]
+    async fn envelope_never_covers_delete() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(&root).expect("root");
+        let target = root.join("old.txt");
+        std::fs::write(&target, "x").expect("seed");
+
+        let broker = PermissionBroker::new();
+        let task = TaskId::generate();
+        broker.grant_plan_envelope(&task, vec![root]);
+
+        let outcome = ask_class(
+            &broker,
+            &task,
+            OperationClass::Delete,
+            vec![target],
+            Some(PermissionDecision::Deny),
+        )
+        .await;
+        // The question was asked (the helper answered it) and the answer
+        // stood — the envelope did not swallow the delete.
+        assert_eq!(outcome, PermissionOutcome::Denied);
+    }
+
+    #[tokio::test]
+    async fn envelope_does_not_cover_paths_outside_its_roots() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(&root).expect("root");
+        let outside = tmp.path().join("elsewhere.txt");
+        std::fs::write(&outside, "x").expect("seed");
+
+        let broker = PermissionBroker::new();
+        let task = TaskId::generate();
+        broker.grant_plan_envelope(&task, vec![root]);
+
+        let outcome = ask_class(
+            &broker,
+            &task,
+            OperationClass::Modify,
+            vec![outside],
+            Some(PermissionDecision::Deny),
+        )
+        .await;
+        assert_eq!(outcome, PermissionOutcome::Denied);
+    }
+
+    #[tokio::test]
+    async fn abandoning_a_task_clears_its_envelope() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(&root).expect("root");
+        let target = root.join("notes.md");
+        std::fs::write(&target, "x").expect("seed");
+
+        let broker = PermissionBroker::new();
+        let task = TaskId::generate();
+        broker.grant_plan_envelope(&task, vec![root]);
+        broker.abandon_task(&task);
+
+        let outcome = ask_class(
+            &broker,
+            &task,
+            OperationClass::Modify,
+            vec![target],
+            Some(PermissionDecision::Deny),
+        )
+        .await;
+        assert_eq!(outcome, PermissionOutcome::Denied, "envelope must be gone");
     }
 
     #[test]

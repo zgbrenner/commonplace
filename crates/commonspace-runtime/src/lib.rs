@@ -21,5 +21,5 @@ pub mod orchestrator;
 pub mod tools;
 
 pub use broker::{Ask, PermissionBroker, PermissionOutcome};
-pub use orchestrator::{Orchestrator, OrchestratorError, StartTask, TaskHandle};
+pub use orchestrator::{Orchestrator, OrchestratorError, PlanDecision, StartTask, TaskHandle};
 pub use tools::{ToolServer, ToolServerHandle};

@@ -94,6 +94,10 @@ pub struct TaskRow {
     pub summary: Option<String>,
     /// The human `message` pulled out of the stored error, when one exists.
     pub error_message: Option<String>,
+    /// The stored plan, when the task produced one, so a reopened
+    /// conversation can re-render an unanswered plan card. Unparseable
+    /// stored JSON degrades to `None` rather than failing the listing.
+    pub plan: Option<TaskPlan>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -637,7 +641,7 @@ impl Storage {
         self.with(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, conversation_id, provider, state, summary, error_json,
-                        created_at, updated_at
+                        plan_json, created_at, updated_at
                  FROM tasks WHERE conversation_id = ?1 ORDER BY created_at, id",
             )?;
             let rows = stmt.query_map([&conversation.0], |r| {
@@ -650,8 +654,14 @@ impl Storage {
                     error_message: error_message_from_json(
                         r.get::<_, Option<String>>(5)?.as_deref(),
                     ),
-                    created_at: r.get(6)?,
-                    updated_at: r.get(7)?,
+                    // Lenient on purpose: a plan that no longer parses must
+                    // not make the whole conversation unloadable.
+                    plan: r
+                        .get::<_, Option<String>>(6)?
+                        .as_deref()
+                        .and_then(|json| serde_json::from_str(json).ok()),
+                    created_at: r.get(7)?,
+                    updated_at: r.get(8)?,
                 })
             })?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1449,6 +1459,16 @@ mod tests {
         s.set_task_summary(&ok_task.id, "Organized 4 files")
             .unwrap();
 
+        // A stored plan comes back on the row; garbage plan JSON degrades to
+        // None instead of failing the listing.
+        let mut plan = TaskPlan::empty();
+        plan.steps.push(PlanStep {
+            title: "Sort the files".into(),
+            detail: None,
+        });
+        plan.requires_approval = true;
+        s.set_task_plan(&ok_task.id, &plan).unwrap();
+
         // A real error_json fixture in the exact shape AgentErrorInfo
         // serializes to (fail_task_for_recovery writes the same shape).
         {
@@ -1467,6 +1487,11 @@ mod tests {
                 [&garbage_task.id.0],
             )
             .unwrap();
+            conn.execute(
+                "UPDATE tasks SET plan_json = 'not a plan' WHERE id = ?1",
+                [&garbage_task.id.0],
+            )
+            .unwrap();
         }
 
         let rows = s.list_tasks(&conv.id).unwrap();
@@ -1477,15 +1502,18 @@ mod tests {
         assert_eq!(rows[0].state, "draft");
         assert_eq!(rows[0].summary.as_deref(), Some("Organized 4 files"));
         assert_eq!(rows[0].error_message, None);
+        assert_eq!(rows[0].plan.as_ref(), Some(&plan));
 
         assert_eq!(rows[1].id, failed_task.id.0);
         assert_eq!(
             rows[1].error_message.as_deref(),
             Some("Claude Code stopped responding.")
         );
+        assert_eq!(rows[1].plan, None);
 
         assert_eq!(rows[2].id, garbage_task.id.0);
         assert_eq!(rows[2].error_message, None);
+        assert_eq!(rows[2].plan, None, "garbage plan JSON must degrade to null");
     }
 
     #[test]
@@ -1520,6 +1548,7 @@ mod tests {
         assert_eq!(json["provider"], "claude_code");
         assert!(json["summary"].is_null());
         assert!(json["error_message"].is_null());
+        assert!(json["plan"].is_null());
         assert!(json["created_at"].is_string());
     }
 

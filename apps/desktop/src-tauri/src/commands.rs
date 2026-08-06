@@ -373,7 +373,7 @@ pub async fn start_task(
 
     // Served from a short-lived cache: probing spawns the provider CLI, and
     // doing that for every message means seconds of extra latency per send.
-    match state.auth_status_cached(adapter).await {
+    match state.auth_status_cached(adapter.as_ref()).await {
         AuthStatus::Subscription { .. } | AuthStatus::ApiKey | AuthStatus::LocalModel => {}
         AuthStatus::NotInstalled => {
             return Err(CommandError::with_recovery(
@@ -573,6 +573,33 @@ pub async fn cancel_task(state: State<'_, AppState>, task_id: String) -> Result<
         .storage()
         .transition_task(&id, commonspace_core::TaskState::Cancelled);
     Ok(())
+}
+
+/// Answer a plan that is waiting in `awaiting_approval`. Returns the task's
+/// new state as its snake_case string (what `taskInfoSchema` uses). On
+/// `start`, execution streams into the channel the original `start_task`
+/// call opened, and the returned handle is re-tracked so `cancel_task`
+/// reaches the execution session.
+#[tauri::command]
+pub async fn resolve_plan_decision(
+    state: State<'_, AppState>,
+    task_id: String,
+    decision: commonspace_runtime::PlanDecision,
+) -> Result<String> {
+    let id = TaskId(task_id);
+    let (next, handle) = state
+        .orchestrator()
+        .resolve_plan_decision(&id, decision)
+        .await?;
+    if let Some(handle) = handle {
+        state.track(handle);
+    }
+    // TaskState serializes to exactly the snake_case strings the frontend's
+    // task-state enum expects.
+    serde_json::to_value(next)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .ok_or_else(|| CommandError::new("Commonspace couldn't report the task's new state."))
 }
 
 #[tauri::command]

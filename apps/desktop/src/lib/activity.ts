@@ -28,6 +28,13 @@ export interface ConversationState {
   activity: ActivityItem[];
   artifacts: Artifact[];
   plan: TaskPlan | undefined;
+  /**
+   * True once execution evidence (a tool, artifact, completion, or error
+   * event) has arrived after the most recent plan event. The plan-approval
+   * derivation in `lib/replay.ts` reads this: a gating plan with nothing
+   * executed after it is still waiting on the user's decision.
+   */
+  executionAfterPlan: boolean;
   pendingPermission: PermissionRequest | undefined;
   warnings: string[];
   error: { message: string; recovery?: string | undefined } | undefined;
@@ -42,6 +49,7 @@ export function emptyConversationState(): ConversationState {
     activity: [],
     artifacts: [],
     plan: undefined,
+    executionAfterPlan: false,
     pendingPermission: undefined,
     warnings: [],
     error: undefined,
@@ -51,10 +59,44 @@ export function emptyConversationState(): ConversationState {
 }
 
 /**
+ * Execution evidence: events that show the task moved past its plan — a
+ * tool ran (or was asked to), a file appeared, or the task ended. Message
+ * text and reasoning are not evidence; the agent narrates while planning.
+ */
+export function isExecutionEvent(event: AgentEvent): boolean {
+  switch (event.type) {
+    case "tool.requested":
+    case "tool.started":
+    case "tool.progress":
+    case "tool.completed":
+    case "artifact.created":
+    case "artifact.modified":
+    case "task.completed":
+    case "error":
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
  * Fold one event into the conversation state. Pure, so it can be replayed
  * over a task's persisted history to reconstruct exactly what the user saw.
  */
 export function applyEvent(state: ConversationState, event: AgentEvent): ConversationState {
+  const next = reduceEvent(state, event);
+  // Track whether anything executed after the newest plan: each plan event
+  // resets the marker, each piece of execution evidence sets it.
+  if (event.type === "plan.created" || event.type === "plan.updated") {
+    return { ...next, executionAfterPlan: false };
+  }
+  if (isExecutionEvent(event) && !next.executionAfterPlan) {
+    return { ...next, executionAfterPlan: true };
+  }
+  return next;
+}
+
+function reduceEvent(state: ConversationState, event: AgentEvent): ConversationState {
   switch (event.type) {
     case "message.started":
       return state;

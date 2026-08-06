@@ -1,11 +1,11 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import Markdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { Artifact, Message, OperationResult } from "@commonspace/protocol";
+import type { Artifact, Message, OperationResult, TaskPlan } from "@commonspace/protocol";
 import type { ActivityItem, ConversationState } from "../lib/activity";
 import { permissionHeadline } from "../lib/activity";
 import type { TaskOutcome as TaskOutcomeModel } from "../lib/replay";
-import { openExternalUrl } from "../lib/ipc";
+import { openExternalUrl, type PlanDecision } from "../lib/ipc";
 import { TaskOutcome } from "./TaskOutcome";
 import { Button, Card, ErrorNotice, StatusPill, TechnicalDetails } from "./primitives";
 
@@ -15,6 +15,10 @@ interface ConversationProps {
   running: boolean;
   /** The newest task's outcome, once it is terminal (live or replayed). */
   outcome: TaskOutcomeModel | undefined;
+  /** True when the newest task's plan is waiting on the user's decision. */
+  awaitingPlanApproval: boolean;
+  /** Resolves true when the decision was accepted, false when it failed. */
+  onPlanDecision: (decision: PlanDecision) => Promise<boolean>;
   onAnswerPermission: (approve: boolean, scope?: "once" | "task" | "workspace") => void;
   onCancel: () => void;
   onOpenArtifact: (artifact: Artifact) => void;
@@ -29,6 +33,8 @@ export function Conversation({
   live,
   running,
   outcome,
+  awaitingPlanApproval,
+  onPlanDecision,
   onAnswerPermission,
   onCancel,
   onOpenArtifact,
@@ -40,7 +46,15 @@ export function Conversation({
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
-  }, [messages.length, live.assistantText, live.activity.length, live.pendingPermission, outcome]);
+  }, [
+    messages.length,
+    live.assistantText,
+    live.activity.length,
+    live.plan,
+    live.pendingPermission,
+    awaitingPlanApproval,
+    outcome,
+  ]);
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
@@ -53,7 +67,13 @@ export function Conversation({
           <MessageBubble role="assistant" content={live.assistantText} />
         ) : null}
 
-        {live.plan ? <PlanCard plan={live.plan} /> : null}
+        {live.plan ? (
+          <PlanCard
+            plan={live.plan}
+            awaiting={awaitingPlanApproval}
+            onDecision={onPlanDecision}
+          />
+        ) : null}
 
         {live.activity.length > 0 ? (
           <ActivityTimeline items={live.activity} reasoning={live.reasoning} />
@@ -96,7 +116,9 @@ export function Conversation({
           />
         ) : null}
 
-        {running ? (
+        {running && !awaitingPlanApproval ? (
+          // While a plan waits on the user nothing is working — the plan
+          // card above carries the actions, so the busy line stays hidden.
           <div className="flex items-center gap-3">
             <span
               className="text-sm text-[var(--color-ink-muted)]"
@@ -182,10 +204,44 @@ function MessageBubble({ role, content }: { role: "user" | "assistant"; content:
   );
 }
 
-function PlanCard({ plan }: { plan: ConversationState["plan"] }) {
-  if (!plan) return null;
+/**
+ * The plan card. Display-only while a task is merely narrating what it will
+ * do; decisional — Start / Change plan / Cancel — while the task is parked
+ * waiting for the user's answer. A revision round-trips through
+ * `plan.updated`, which replaces the `plan` prop and resets the card back
+ * to its summary.
+ */
+function PlanCard({
+  plan,
+  awaiting,
+  onDecision,
+}: {
+  plan: TaskPlan;
+  awaiting: boolean;
+  onDecision: (decision: PlanDecision) => Promise<boolean>;
+}) {
+  const [mode, setMode] = useState<"summary" | "editing" | "revising">("summary");
+  const [feedback, setFeedback] = useState("");
+
+  // A new plan (created or revised) always starts back at the summary.
+  useEffect(() => {
+    setMode("summary");
+    setFeedback("");
+  }, [plan]);
+
+  const sendRevision = () => {
+    const text = feedback.trim();
+    if (!text) return;
+    setMode("revising");
+    void onDecision({ kind: "revise", feedback: text }).then((accepted) => {
+      // On success stay in "revising" until plan.updated resets the card;
+      // on failure hand the text back so the user can try again.
+      if (!accepted) setMode("editing");
+    });
+  };
+
   return (
-    <Card className="p-4">
+    <Card as="section" className="p-4">
       <h3 className="text-sm font-semibold">Plan</h3>
       <ol className="mt-2 space-y-1.5">
         {plan.steps.map((step, index) => (
@@ -209,6 +265,70 @@ function PlanCard({ plan }: { plan: ConversationState["plan"] }) {
         <p className="mt-2 text-sm text-[var(--color-warn)]">
           Needs your approval: {plan.consequential_actions.join(", ")}
         </p>
+      ) : null}
+      {plan.paths_likely_modified.length > 0 ? (
+        <div className="mt-3">
+          <h4 className="text-xs font-semibold tracking-wide text-[var(--color-ink-faint)] uppercase">
+            Files that may change
+          </h4>
+          <ul className="selectable mt-1.5 max-h-40 space-y-0.5 overflow-y-auto rounded-md bg-[var(--color-surface-sunken)] p-2.5 font-mono text-xs text-[var(--color-ink-muted)]">
+            {plan.paths_likely_modified.map((path) => (
+              <li key={path} className="truncate" title={path}>
+                {path}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {awaiting ? (
+        mode === "revising" ? (
+          <p className="mt-3 text-sm text-[var(--color-ink-muted)]" role="status" aria-live="polite">
+            Updating the plan…
+          </p>
+        ) : mode === "editing" ? (
+          <div className="mt-3">
+            <label htmlFor="plan-feedback" className="text-sm font-medium text-[var(--color-ink)]">
+              What should be different?
+            </label>
+            <textarea
+              id="plan-feedback"
+              value={feedback}
+              onChange={(event) => setFeedback(event.target.value)}
+              rows={3}
+              autoFocus
+              className="selectable mt-1.5 w-full resize-y rounded-md border border-[var(--color-line-strong)] bg-[var(--color-surface)] px-2.5 py-1.5 text-sm text-[var(--color-ink)] outline-none placeholder:text-[var(--color-ink-faint)]"
+            />
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={sendRevision}
+                disabled={feedback.trim().length === 0}
+              >
+                Send
+              </Button>
+              <Button size="sm" variant="quiet" onClick={() => setMode("summary")}>
+                Back
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <Button variant="primary" onClick={() => void onDecision({ kind: "start" })}>
+                Start
+              </Button>
+              <Button onClick={() => setMode("editing")}>Change plan</Button>
+              <Button variant="quiet" onClick={() => void onDecision({ kind: "cancel" })}>
+                Cancel
+              </Button>
+            </div>
+            <p className="mt-2 text-xs text-[var(--color-ink-faint)]">
+              Nothing runs until you press Start.
+            </p>
+          </>
+        )
       ) : null}
     </Card>
   );

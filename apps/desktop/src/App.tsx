@@ -10,12 +10,19 @@ import type {
   Workspace,
 } from "@commonspace/protocol";
 import * as ipc from "./lib/ipc";
-import { CommonspaceError, type TaskInfo } from "./lib/ipc";
-import { applyEvent, emptyConversationState, type ConversationState } from "./lib/activity";
+import { CommonspaceError, type PlanDecision, type TaskInfo } from "./lib/ipc";
+import {
+  applyEvent,
+  emptyConversationState,
+  isExecutionEvent,
+  type ConversationState,
+} from "./lib/activity";
 import {
   aggregateArtifacts,
   deriveOutcome,
+  isAwaitingPlanDecision,
   newestTask,
+  planGates,
   replayConversationState,
   type ReplayTask,
   type TaskArtifacts,
@@ -49,6 +56,13 @@ export function App() {
   const [artifactGroups, setArtifactGroups] = useState<TaskArtifacts[]>([]);
   /** True after the user pressed Stop on the current live task. */
   const [stopped, setStopped] = useState(false);
+  /**
+   * Live-stream mirror of "the plan is waiting on the user": set when a
+   * gating plan arrives on the channel, cleared by execution evidence, a
+   * decision, or leaving the task. The replay path ignores this flag and
+   * uses the pure derivation over the persisted task instead.
+   */
+  const [awaitingPlanLive, setAwaitingPlanLive] = useState(false);
   const [provider, setProvider] = useState("claude_code");
   const [model, setModel] = useState("default");
   const [attachments, setAttachments] = useState<string[]>([]);
@@ -140,6 +154,13 @@ export function App() {
     if (event.type === "task.completed" || event.type === "error") {
       setRunning(false);
     }
+    if (event.type === "plan.created" || event.type === "plan.updated") {
+      // A gating plan parks the task until the user answers; a harmless one
+      // auto-proceeds on the backend with no gap.
+      setAwaitingPlanLive(planGates(event.plan));
+    } else if (isExecutionEvent(event)) {
+      setAwaitingPlanLive(false);
+    }
   }, []);
 
   const submit = useCallback(
@@ -154,6 +175,7 @@ export function App() {
       setLive(emptyConversationState());
       setReplayTask(undefined);
       setStopped(false);
+      setAwaitingPlanLive(false);
       setRunning(true);
       // Show the prompt immediately rather than waiting for the round trip.
       setMessages((current) => [
@@ -242,6 +264,48 @@ export function App() {
     void ipc.cancelTask(taskId).catch(reportError);
   }, [taskId, reportError]);
 
+  /**
+   * Answer the plan the newest task is parked on. Resolves true when the
+   * backend accepted the decision, false when it failed (the card uses this
+   * to hand a rejected revision back for another try).
+   */
+  const onPlanDecision = useCallback(
+    async (decision: PlanDecision): Promise<boolean> => {
+      if (!taskId) return false;
+      const priorReplay = replayTask;
+      setError(undefined);
+      if (decision.kind === "start") {
+        // Execution events continue on the channel the original startTask
+        // call opened — nothing to recreate here.
+        setAwaitingPlanLive(false);
+        setReplayTask(undefined);
+        setRunning(true);
+      } else if (decision.kind === "cancel") {
+        setAwaitingPlanLive(false);
+        setRunning(false);
+        setStopped(true);
+        setReplayTask((task) => (task ? { ...task, state: "cancelled" } : task));
+      }
+      // "revise" changes nothing up front: the card shows its quiet
+      // "Updating the plan…" line and a plan.updated event re-renders it.
+      try {
+        await ipc.resolvePlanDecision(taskId, decision);
+        return true;
+      } catch (cause) {
+        reportError(cause);
+        if (decision.kind !== "revise") {
+          // Put the unanswered card back so the user can try again.
+          setReplayTask(priorReplay);
+          setAwaitingPlanLive(!priorReplay);
+          setRunning(false);
+          setStopped(false);
+        }
+        return false;
+      }
+    },
+    [taskId, replayTask, reportError],
+  );
+
   const openConversation = useCallback(
     async (id: string) => {
       setView("task");
@@ -250,6 +314,7 @@ export function App() {
       setTaskId(undefined);
       setRunning(false);
       setStopped(false);
+      setAwaitingPlanLive(false);
       setReplayTask(undefined);
       setArtifactGroups([]);
       try {
@@ -277,7 +342,11 @@ export function App() {
         if (newest) {
           setTaskId(newest.id);
           const events = await ipc.listTaskEvents(newest.id);
-          setLive(replayConversationState(events, loadedMessages));
+          const replayed = replayConversationState(events, loadedMessages);
+          // The task row's stored plan is the durable copy; prefer it over
+          // the one the event fold reconstructed so an unanswered plan card
+          // survives even if the event stream is incomplete.
+          setLive(newest.plan ? { ...replayed, plan: newest.plan } : replayed);
           setReplayTask(newest);
         }
       } catch (cause) {
@@ -307,6 +376,7 @@ export function App() {
     setTaskId(undefined);
     setRunning(false);
     setStopped(false);
+    setAwaitingPlanLive(false);
     setReplayTask(undefined);
     setArtifactGroups([]);
     setAttachments([]);
@@ -432,7 +502,20 @@ export function App() {
     return aggregateArtifacts(groups);
   }, [artifactGroups, replayTask, taskId, live.artifacts]);
 
+  /**
+   * Is the newest task parked on its plan? Replay answers with the pure
+   * derivation over the persisted task (its stored state and plan); the
+   * live stream answers with the flag the channel events maintain.
+   */
+  const awaitingPlanApproval = useMemo(() => {
+    if (replayTask) return isAwaitingPlanDecision(replayTask.state, live.plan, live);
+    return awaitingPlanLive;
+  }, [replayTask, live, awaitingPlanLive]);
+
   const outcome = useMemo<TaskOutcome | undefined>(() => {
+    // While the plan card is asking the question, the outcome card stays
+    // out of the way — both at once would be double UI for one decision.
+    if (awaitingPlanApproval) return undefined;
     if (running) return undefined;
     if (replayTask) {
       const derived = deriveOutcome(replayTask, live, panelArtifacts);
@@ -450,17 +533,20 @@ export function App() {
     };
     const derived = deriveOutcome(finishedTask, live, panelArtifacts);
     return derived.kind === "none" ? undefined : derived;
-  }, [running, replayTask, taskId, live, stopped, panelArtifacts]);
+  }, [awaitingPlanApproval, running, replayTask, taskId, live, stopped, panelArtifacts]);
 
   /* ---------------------------------------------------------------- view */
 
   const connectionsNeedAttention = usableConnections.length === 0;
-  const composerDisabled = running || !activeWorkspaceId || usableConnections.length === 0;
+  const composerDisabled =
+    running || awaitingPlanApproval || !activeWorkspaceId || usableConnections.length === 0;
   const composerReason = !activeWorkspaceId
     ? "Choose a folder in Workspaces to get started."
     : usableConnections.length === 0
       ? "Connect an agent in Connections to get started."
-      : undefined;
+      : awaitingPlanApproval
+        ? "Answer the plan above to continue, or cancel it."
+        : undefined;
 
   return (
     <div className="flex h-full">
@@ -567,6 +653,8 @@ export function App() {
               live={live}
               running={running}
               outcome={outcome}
+              awaitingPlanApproval={awaitingPlanApproval}
+              onPlanDecision={onPlanDecision}
               onAnswerPermission={answerPermission}
               onCancel={cancel}
               onOpenArtifact={openArtifact}

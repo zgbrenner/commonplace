@@ -15,6 +15,7 @@ import {
   healthReportSchema,
   messageSchema,
   operationResultSchema,
+  taskPlanSchema,
   parseFromBackend,
   workspaceSchema,
   type AgentEvent,
@@ -135,6 +136,34 @@ export const openExternalUrl = (url: string) =>
 
 /* ------------------------------------------------------------------ tasks */
 
+/**
+ * How the user answers a proposed plan. `start` begins execution under the
+ * plan's approval envelope; `revise` sends feedback back into planning;
+ * `cancel` ends the task. Execution/replanning events continue to arrive on
+ * the channel the original startTask call opened.
+ */
+export type PlanDecision =
+  | { kind: "start" }
+  | { kind: "cancel" }
+  | { kind: "revise"; feedback: string };
+
+export const resolvePlanDecision = (taskId: string, decision: PlanDecision) =>
+  call(
+    "resolve_plan_decision",
+    { taskId, decision },
+    z.enum([
+      "draft",
+      "planning",
+      "awaiting_approval",
+      "running",
+      "paused",
+      "completed",
+      "failed",
+      "cancelled",
+      "rolled_back",
+    ]),
+  );
+
 /** A persisted task, as needed to replay a conversation's history. */
 export const taskInfoSchema = z.object({
   id: z.string(),
@@ -153,6 +182,9 @@ export const taskInfoSchema = z.object({
   ]),
   summary: z.string().nullish(),
   error_message: z.string().nullish(),
+  /** The stored plan, when the task produced one — needed so a reopened
+   *  conversation can re-render an unanswered plan card. */
+  plan: taskPlanSchema.nullish(),
   created_at: z.string(),
   updated_at: z.string(),
 });

@@ -70,6 +70,7 @@ pub fn run() {
             commands::search_history,
             commands::start_task,
             commands::cancel_task,
+            commands::resolve_plan_decision,
             commands::answer_permission,
             commands::list_tasks,
             commands::resumable_session,

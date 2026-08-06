@@ -17,9 +17,10 @@
 
 use commonspace_agents::{AgentAdapter, ClaudeCodeAdapter};
 use commonspace_core::{
-    AgentEvent, AuthStatus, DecisionScope, InstallStatus, PermissionDecision, ProviderId, TaskState,
+    AgentEvent, AuthStatus, DecisionScope, InstallStatus, PermissionDecision, ProviderId, TaskId,
+    TaskState,
 };
-use commonspace_runtime::{Orchestrator, StartTask};
+use commonspace_runtime::{Orchestrator, PlanDecision, StartTask};
 use commonspace_storage::Storage;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,11 +45,34 @@ struct Outcome {
     permission_summaries: Vec<String>,
 }
 
-/// Run one task to completion, auto-approving every permission request and
-/// recording what was asked.
+/// Stand in for the user pressing "Start" on the plan card. Parking happens
+/// just after `plan.created` is emitted, so retry briefly; a harmless plan
+/// that auto-proceeded (or already finished) is detected via the task state.
+async fn approve_plan_when_parked(orchestrator: &Orchestrator, task_id: &TaskId) {
+    for _ in 0..100 {
+        if orchestrator
+            .resolve_plan_decision(task_id, PlanDecision::Start)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        let state = orchestrator.storage().get_task(task_id).map(|t| t.state);
+        if matches!(
+            state,
+            Ok(TaskState::Running | TaskState::Completed | TaskState::Failed)
+        ) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Run one task to completion, approving its plan and every permission
+/// request, and recording what was asked.
 async fn run_task(
     orchestrator: &Orchestrator,
-    adapter: &dyn AgentAdapter,
+    adapter: Arc<dyn AgentAdapter>,
     request: StartTask,
 ) -> Outcome {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -56,6 +80,7 @@ async fn run_task(
         .start(adapter, request, tx)
         .await
         .expect("task should start");
+    let task_id = handle.task_id.clone();
 
     let broker = orchestrator.broker().clone();
     let mut events = Vec::new();
@@ -73,11 +98,15 @@ async fn run_task(
                     },
                 );
             }
+            let approve_plan = matches!(&event, AgentEvent::PlanCreated { .. });
             let terminal = matches!(
                 event,
                 AgentEvent::TaskCompleted { .. } | AgentEvent::Error { .. }
             );
             events.push(event);
+            if approve_plan {
+                approve_plan_when_parked(orchestrator, &task_id).await;
+            }
             if terminal {
                 break;
             }
@@ -98,7 +127,7 @@ async fn run_task(
 #[tokio::test]
 #[ignore = "requires installed + authenticated Claude Code; uses real subscription usage"]
 async fn organize_a_folder_end_to_end() {
-    let adapter = ClaudeCodeAdapter;
+    let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeCodeAdapter);
     assert!(
         matches!(adapter.detect().await, InstallStatus::Installed { .. }),
         "Claude Code must be installed for this test"
@@ -130,7 +159,7 @@ async fn organize_a_folder_end_to_end() {
     let index_path = ws_dir.join("INDEX.md");
     let outcome = run_task(
         &orchestrator,
-        &adapter,
+        Arc::clone(&adapter),
         StartTask {
             conversation_id: conversation.id.clone(),
             workspace_id: workspace.id.clone(),
@@ -250,13 +279,15 @@ async fn organize_a_folder_end_to_end() {
 
 /// Declining the approval must leave the workspace untouched.
 ///
-/// This exercises the gate against a live model, so it depends on the agent
-/// actually attempting the edit; the deterministic guarantee is covered by
+/// Deleting is used as the probe because an approved plan's envelope covers
+/// in-workspace modifies, while deletes always ask. This exercises the gate
+/// against a live model, so it depends on the agent actually attempting the
+/// delete; the deterministic guarantee is covered by
 /// `tools::tests::denied_modify_leaves_the_file_alone`.
 #[tokio::test]
 #[ignore = "requires installed + authenticated Claude Code; uses real subscription usage"]
 async fn declining_an_approval_changes_nothing() {
-    let adapter = ClaudeCodeAdapter;
+    let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeCodeAdapter);
     if !matches!(adapter.detect().await, InstallStatus::Installed { .. }) {
         eprintln!("skipping: Claude Code is not installed");
         return;
@@ -287,21 +318,18 @@ async fn declining_an_approval_changes_nothing() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let handle = orchestrator
         .start(
-            &adapter,
+            Arc::clone(&adapter),
             StartTask {
                 conversation_id: conversation.id,
                 workspace_id: workspace.id,
                 provider: ProviderId::ClaudeCode,
-                // The content is spelled out in full and the edit is
-                // mundane. Earlier phrasings ("replace it with REPLACED")
-                // made the agent stop and ask what to write, which left no
-                // tool call for the gate to intercept and made this test
-                // flaky. What is under test is Commonspace's approval gate,
-                // not the model's willingness.
+                // Every argument is spelled out so the agent makes the call
+                // immediately instead of stopping to ask; what is under test
+                // is Commonspace's approval gate, not the model's
+                // willingness.
                 prompt: format!(
-                    "Call the `overwrite_file` tool from the `commonspace` MCP server exactly \
-                     once. Use path={} and content=\"# Notes\\n\\n- Call the supplier back.\\n- \
-                     Send the invoice.\\n\". Every argument you need is in this message, so make \
+                    "Call the `delete_to_trash` tool from the `commonspace` MCP server exactly \
+                     once, with path={}. Every argument you need is in this message, so make \
                      the call immediately without asking me anything.",
                     target.display()
                 ),
@@ -312,6 +340,7 @@ async fn declining_an_approval_changes_nothing() {
         )
         .await
         .expect("task should start");
+    let task_id = handle.task_id.clone();
 
     let broker = orchestrator.broker().clone();
     let mut declined = false;
@@ -322,11 +351,17 @@ async fn declining_an_approval_changes_nothing() {
                 declined = true;
                 broker.respond(&request.id, PermissionDecision::Deny);
             }
+            let approve_plan = matches!(&event, AgentEvent::PlanCreated { .. });
             let terminal = matches!(
                 event,
                 AgentEvent::TaskCompleted { .. } | AgentEvent::Error { .. }
             );
             seen.push(event);
+            if approve_plan {
+                // The plan is approved — the point under test is that the
+                // delete itself still asks, and declining it changes nothing.
+                approve_plan_when_parked(&orchestrator, &task_id).await;
+            }
             if terminal {
                 break;
             }
@@ -339,7 +374,7 @@ async fn declining_an_approval_changes_nothing() {
 
     assert!(
         declined,
-        "modifying a file must raise a permission request. Events: {seen:#?}"
+        "deleting a file must raise a permission request. Events: {seen:#?}"
     );
     assert_eq!(
         std::fs::read_to_string(&target).expect("read"),
