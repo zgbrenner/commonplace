@@ -41,7 +41,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "category": "Productivity",
     "shortDescription": "Delegate real work with your own AI subscription.",
     "longDescription": "Commonspace is an open-source desktop workspace: connect an AI subscription you already have, authorize the folders an agent may use, and delegate real work through a calm chat interface with previews, backups, and undo.",

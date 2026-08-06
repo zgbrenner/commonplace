@@ -102,14 +102,18 @@ To enable the signed, in-place path:
    private key out of the repository.
 2. Set two repository secrets: `TAURI_SIGNING_PRIVATE_KEY` and
    `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
-3. Paste the *public* key into `plugins.updater.pubkey` in
-   `apps/desktop/src-tauri/tauri.conf.json` and commit it.
+3. In `apps/desktop/src-tauri/tauri.conf.json`, paste the *public* key into
+   `plugins.updater.pubkey` and set `bundle.createUpdaterArtifacts` to
+   `true`, then commit both. The flag stays `false` until the secrets
+   exist, deliberately: with it on, the Tauri bundler builds updater
+   artifacts and *requires* the private key to sign them, so every build
+   without the secrets — PR builds included — would fail outright.
 4. Cut the next release normally. `release.yml` attaches `latest.json`
    automatically; every install of that release can then update itself in
    place from the release after it.
 
-Without the secrets the installers still build; the release simply carries
-no `.sig` files or manifest, and the app keeps using the download-page path.
+Until then the installers build unsigned and carry no updater manifest,
+and the app keeps using the download-page path.
 
 ## Building locally instead
 
