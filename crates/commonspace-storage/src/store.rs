@@ -82,6 +82,78 @@ pub struct TaskRecord {
     pub summary: Option<String>,
 }
 
+/// A task row shaped for conversation replay in the UI. Field names and the
+/// snake_case `state` strings serialize exactly as the frontend's
+/// `taskInfoSchema` expects, so this struct crosses the IPC boundary as-is.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TaskRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub provider: String,
+    pub state: String,
+    pub summary: Option<String>,
+    /// The human `message` pulled out of the stored error, when one exists.
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// The provider session a follow-up message can continue: the newest task in
+/// the conversation that left a resumable session id behind. Serializes to
+/// the frontend's `resumableSessionSchema`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ResumableSession {
+    pub provider: String,
+    pub provider_session_id: String,
+}
+
+/// Whether an attachment is a single file or a folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    File,
+    Folder,
+}
+
+impl AttachmentKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Folder => "folder",
+        }
+    }
+}
+
+/// Metadata for one attachment as collected at send time; `record_attachments`
+/// assigns the id and timestamp. Metadata only — file contents never enter
+/// the database.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewAttachment {
+    pub path: String,
+    pub kind: AttachmentKind,
+    pub size_bytes: Option<i64>,
+    pub modified_at: Option<String>,
+    pub content_hash: Option<String>,
+    pub in_workspace: bool,
+}
+
+/// A persisted attachment row. Serializes to the frontend's
+/// `attachmentInfoSchema` — note `in_workspace` crosses as a real boolean,
+/// not the 0/1 SQLite stores.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct AttachmentRecord {
+    pub id: String,
+    pub conversation_id: String,
+    pub task_id: Option<String>,
+    pub path: String,
+    pub kind: AttachmentKind,
+    pub size_bytes: Option<i64>,
+    pub modified_at: Option<String>,
+    pub content_hash: Option<String>,
+    pub in_workspace: bool,
+    pub created_at: String,
+}
+
 /// A provider session row (for resume).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionRecord {
@@ -113,6 +185,15 @@ fn fts_match_expression(query: &str) -> String {
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Pull the human `message` out of a stored `error_json` blob (a serialized
+/// `AgentErrorInfo`). Parsed leniently on purpose: a blob written by a
+/// different build — or a corrupted row — must degrade to "no message", never
+/// fail the whole task listing.
+fn error_message_from_json(error_json: Option<&str>) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(error_json?).ok()?;
+    value.get("message")?.as_str().map(str::to_owned)
 }
 
 fn provider_str(p: ProviderId) -> Result<String> {
@@ -548,6 +629,35 @@ impl Storage {
         })
     }
 
+    /// All tasks in a conversation, oldest first, shaped for replay. The
+    /// stored `state` strings already match the frontend's enum, so they pass
+    /// through untranslated; the stored error blob is reduced to its human
+    /// message here so the frontend never parses provider error JSON.
+    pub fn list_tasks(&self, conversation: &ConversationId) -> Result<Vec<TaskRow>> {
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, conversation_id, provider, state, summary, error_json,
+                        created_at, updated_at
+                 FROM tasks WHERE conversation_id = ?1 ORDER BY created_at, id",
+            )?;
+            let rows = stmt.query_map([&conversation.0], |r| {
+                Ok(TaskRow {
+                    id: r.get(0)?,
+                    conversation_id: r.get(1)?,
+                    provider: r.get(2)?,
+                    state: r.get(3)?,
+                    summary: r.get(4)?,
+                    error_message: error_message_from_json(
+                        r.get::<_, Option<String>>(5)?.as_deref(),
+                    ),
+                    created_at: r.get(6)?,
+                    updated_at: r.get(7)?,
+                })
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
     /// Tasks left in a live state by a previous process (crash recovery).
     pub fn stale_running_tasks(&self) -> Result<Vec<TaskId>> {
         self.with(|c| {
@@ -677,6 +787,38 @@ impl Storage {
         })
     }
 
+    /// The session a follow-up message in this conversation can continue:
+    /// the newest task (by creation time) that recorded a session with a
+    /// provider session id and the resumable capability, and within that task
+    /// the newest such row (the orchestrator records a placeholder row
+    /// without an id at start and the real id at completion). None when no
+    /// task left anything to continue.
+    pub fn resumable_session(
+        &self,
+        conversation: &ConversationId,
+    ) -> Result<Option<ResumableSession>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT s.provider, s.provider_session_id
+                 FROM provider_sessions AS s
+                 JOIN tasks AS t ON t.id = s.task_id
+                 WHERE t.conversation_id = ?1
+                   AND s.provider_session_id IS NOT NULL
+                   AND s.resumable = 1
+                 ORDER BY t.created_at DESC, t.id DESC, s.created_at DESC, s.rowid DESC
+                 LIMIT 1",
+                [&conversation.0],
+                |r| {
+                    Ok(ResumableSession {
+                        provider: r.get(0)?,
+                        provider_session_id: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+        })
+    }
+
     // ---- artifacts ----
 
     pub fn record_artifact(&self, artifact: &Artifact) -> Result<()> {
@@ -802,6 +944,109 @@ impl Storage {
             .optional()?
             .ok_or_else(|| StorageError::NotFound(format!("file operation {id}")))
             .and_then(|json| Ok(serde_json::from_str(&json)?))
+        })
+    }
+
+    /// Ids of a task's journaled operations, newest first — the order a
+    /// whole-task undo must apply them in, so later changes are reverted
+    /// before the earlier changes they may build on.
+    pub fn task_file_operation_ids_newest_first(&self, task: &TaskId) -> Result<Vec<String>> {
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id FROM file_operations WHERE task_id = ?1
+                 ORDER BY performed_at DESC, rowid DESC",
+            )?;
+            let rows = stmt
+                .query_map([&task.0], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    // ---- attachments ----
+
+    /// Persist attachment metadata rows for a message the user just sent.
+    /// Ids and the shared timestamp are assigned here.
+    pub fn record_attachments(
+        &self,
+        conversation: &ConversationId,
+        task: Option<&TaskId>,
+        attachments: &[NewAttachment],
+    ) -> Result<Vec<AttachmentRecord>> {
+        let ts = now();
+        self.with(|c| {
+            let mut out = Vec::with_capacity(attachments.len());
+            for attachment in attachments {
+                let id = format!("att_{}", uuid::Uuid::new_v4().simple());
+                c.execute(
+                    "INSERT INTO attachments
+                     (id, conversation_id, task_id, path, kind, size_bytes,
+                      modified_at, content_hash, in_workspace, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        id,
+                        conversation.0,
+                        task.map(|t| &t.0),
+                        attachment.path,
+                        attachment.kind.as_str(),
+                        attachment.size_bytes,
+                        attachment.modified_at,
+                        attachment.content_hash,
+                        attachment.in_workspace,
+                        ts
+                    ],
+                )?;
+                out.push(AttachmentRecord {
+                    id,
+                    conversation_id: conversation.0.clone(),
+                    task_id: task.map(|t| t.0.clone()),
+                    path: attachment.path.clone(),
+                    kind: attachment.kind,
+                    size_bytes: attachment.size_bytes,
+                    modified_at: attachment.modified_at.clone(),
+                    content_hash: attachment.content_hash.clone(),
+                    in_workspace: attachment.in_workspace,
+                    created_at: ts.clone(),
+                });
+            }
+            Ok(out)
+        })
+    }
+
+    /// Every attachment ever recorded for a conversation, oldest first.
+    /// A batch shares one timestamp, so rowid keeps insertion order within it.
+    pub fn list_conversation_attachments(
+        &self,
+        conversation: &ConversationId,
+    ) -> Result<Vec<AttachmentRecord>> {
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, task_id, path, kind, size_bytes, modified_at,
+                        content_hash, in_workspace, created_at
+                 FROM attachments WHERE conversation_id = ?1
+                 ORDER BY created_at, rowid",
+            )?;
+            let rows = stmt.query_map([&conversation.0], |r| {
+                let kind: String = r.get(3)?;
+                Ok(AttachmentRecord {
+                    id: r.get(0)?,
+                    conversation_id: conversation.0.clone(),
+                    task_id: r.get(1)?,
+                    path: r.get(2)?,
+                    // The CHECK constraint admits exactly these two values.
+                    kind: if kind == "folder" {
+                        AttachmentKind::Folder
+                    } else {
+                        AttachmentKind::File
+                    },
+                    size_bytes: r.get(4)?,
+                    modified_at: r.get(5)?,
+                    content_hash: r.get(6)?,
+                    in_workspace: r.get(7)?,
+                    created_at: r.get(8)?,
+                })
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
     }
 
@@ -1168,6 +1413,329 @@ mod tests {
         }
         assert_eq!(s.search_history("cactus", 3).unwrap().len(), 3);
         assert_eq!(s.search_history("cactus", 100).unwrap().len(), 10);
+    }
+
+    // ---- tasks for replay ----
+
+    /// Pin a task's timestamps directly. `create_task` stamps "now", which
+    /// can collide within a fast test; ordering assertions need distinct,
+    /// known values.
+    fn set_task_created_at(s: &Storage, task: &TaskId, ts: &str) {
+        let conn = s.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tasks SET created_at = ?1 WHERE id = ?2",
+            params![ts, task.0],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_tasks_orders_by_creation_and_extracts_error_messages() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let ok_task = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "first")
+            .unwrap();
+        let failed_task = s
+            .create_task(&conv.id, None, ProviderId::CodexCli, "second")
+            .unwrap();
+        let garbage_task = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "third")
+            .unwrap();
+        set_task_created_at(&s, &ok_task.id, "2026-01-01T00:00:01Z");
+        set_task_created_at(&s, &failed_task.id, "2026-01-01T00:00:02Z");
+        set_task_created_at(&s, &garbage_task.id, "2026-01-01T00:00:03Z");
+
+        s.set_task_summary(&ok_task.id, "Organized 4 files")
+            .unwrap();
+
+        // A real error_json fixture in the exact shape AgentErrorInfo
+        // serializes to (fail_task_for_recovery writes the same shape).
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE tasks SET error_json = ?1 WHERE id = ?2",
+                params![
+                    r#"{"code":"provider_unavailable","message":"Claude Code stopped responding.","recovery":"Try sending the message again.","transient":true}"#,
+                    failed_task.id.0
+                ],
+            )
+            .unwrap();
+            // Garbage must degrade to a null message, not fail the listing.
+            conn.execute(
+                "UPDATE tasks SET error_json = 'not json at all' WHERE id = ?1",
+                [&garbage_task.id.0],
+            )
+            .unwrap();
+        }
+
+        let rows = s.list_tasks(&conv.id).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].id, ok_task.id.0);
+        assert_eq!(rows[0].conversation_id, conv.id.0);
+        assert_eq!(rows[0].provider, "claude_code");
+        assert_eq!(rows[0].state, "draft");
+        assert_eq!(rows[0].summary.as_deref(), Some("Organized 4 files"));
+        assert_eq!(rows[0].error_message, None);
+
+        assert_eq!(rows[1].id, failed_task.id.0);
+        assert_eq!(
+            rows[1].error_message.as_deref(),
+            Some("Claude Code stopped responding.")
+        );
+
+        assert_eq!(rows[2].id, garbage_task.id.0);
+        assert_eq!(rows[2].error_message, None);
+    }
+
+    #[test]
+    fn list_tasks_reads_the_recovery_error_shape() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let task = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "p")
+            .unwrap();
+        s.transition_task(&task.id, TaskState::Planning).unwrap();
+        s.transition_task(&task.id, TaskState::Running).unwrap();
+        s.fail_task_for_recovery(&task.id, "Commonspace was closed during this task")
+            .unwrap();
+
+        let rows = s.list_tasks(&conv.id).unwrap();
+        assert_eq!(rows[0].state, "failed");
+        assert_eq!(
+            rows[0].error_message.as_deref(),
+            Some("Commonspace was closed during this task")
+        );
+    }
+
+    #[test]
+    fn task_rows_serialize_to_the_frontend_contract() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        s.create_task(&conv.id, None, ProviderId::ClaudeCode, "p")
+            .unwrap();
+        let rows = s.list_tasks(&conv.id).unwrap();
+        let json = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(json["state"], "draft");
+        assert_eq!(json["provider"], "claude_code");
+        assert!(json["summary"].is_null());
+        assert!(json["error_message"].is_null());
+        assert!(json["created_at"].is_string());
+    }
+
+    // ---- resumable sessions ----
+
+    #[test]
+    fn resumable_session_picks_the_newest_task_that_has_one() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let older = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "one")
+            .unwrap();
+        let newer = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "two")
+            .unwrap();
+        set_task_created_at(&s, &older.id, "2026-01-01T00:00:01Z");
+        set_task_created_at(&s, &newer.id, "2026-01-01T00:00:02Z");
+
+        // Both tasks got a session id; the newer task's wins.
+        s.record_session(&older.id, ProviderId::ClaudeCode, Some("sid-old"), true)
+            .unwrap();
+        // The orchestrator records a placeholder without an id at task start
+        // and the real id at completion; both rows exist in real data.
+        s.record_session(&newer.id, ProviderId::ClaudeCode, None, true)
+            .unwrap();
+        s.record_session(&newer.id, ProviderId::ClaudeCode, Some("sid-new"), true)
+            .unwrap();
+
+        let resume = s.resumable_session(&conv.id).unwrap().unwrap();
+        assert_eq!(resume.provider, "claude_code");
+        assert_eq!(resume.provider_session_id, "sid-new");
+    }
+
+    #[test]
+    fn resumable_session_falls_back_past_tasks_without_one() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let older = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "one")
+            .unwrap();
+        let newer = s
+            .create_task(&conv.id, None, ProviderId::CodexCli, "two")
+            .unwrap();
+        set_task_created_at(&s, &older.id, "2026-01-01T00:00:01Z");
+        set_task_created_at(&s, &newer.id, "2026-01-01T00:00:02Z");
+
+        s.record_session(&older.id, ProviderId::ClaudeCode, Some("sid-old"), true)
+            .unwrap();
+        // The newest task never produced a session id (e.g. it crashed).
+        s.record_session(&newer.id, ProviderId::CodexCli, None, true)
+            .unwrap();
+
+        let resume = s.resumable_session(&conv.id).unwrap().unwrap();
+        assert_eq!(resume.provider_session_id, "sid-old");
+    }
+
+    #[test]
+    fn resumable_session_is_none_when_absent_or_not_resumable() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        assert!(s.resumable_session(&conv.id).unwrap().is_none());
+
+        // A session id from a provider that cannot resume is not offered.
+        let task = s
+            .create_task(&conv.id, None, ProviderId::CodexCli, "p")
+            .unwrap();
+        s.record_session(&task.id, ProviderId::CodexCli, Some("sid-x"), false)
+            .unwrap();
+        assert!(s.resumable_session(&conv.id).unwrap().is_none());
+
+        // Sessions in other conversations never leak in.
+        let other = s.create_conversation(None, "other").unwrap();
+        let other_task = s
+            .create_task(&other.id, None, ProviderId::ClaudeCode, "p")
+            .unwrap();
+        s.record_session(&other_task.id, ProviderId::ClaudeCode, Some("sid-y"), true)
+            .unwrap();
+        assert!(s.resumable_session(&conv.id).unwrap().is_none());
+    }
+
+    // ---- file operation ids for whole-task undo ----
+
+    #[test]
+    fn file_operation_ids_come_back_newest_first() {
+        use commonspace_documents::{FileOpKind, FileOperation};
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let task = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "p")
+            .unwrap();
+        let mut first = FileOperation::new(FileOpKind::Create, PathBuf::from("/ws/a.txt"));
+        first.performed_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut second = FileOperation::new(FileOpKind::Create, PathBuf::from("/ws/b.txt"));
+        second.performed_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:02Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        s.record_file_operation(Some(&task.id), &first).unwrap();
+        s.record_file_operation(Some(&task.id), &second).unwrap();
+
+        let ids = s.task_file_operation_ids_newest_first(&task.id).unwrap();
+        assert_eq!(ids, vec![second.id.0.clone(), first.id.0.clone()]);
+    }
+
+    // ---- attachments ----
+
+    #[test]
+    fn attachments_round_trip_with_booleans_intact() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let task = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "p")
+            .unwrap();
+        let file = NewAttachment {
+            path: "/home/user/report.pdf".into(),
+            kind: AttachmentKind::File,
+            size_bytes: Some(12_345),
+            modified_at: Some("2026-01-01T00:00:00+00:00".into()),
+            content_hash: Some("abc123".into()),
+            in_workspace: true,
+        };
+        let folder = NewAttachment {
+            path: "/mnt/elsewhere/photos".into(),
+            kind: AttachmentKind::Folder,
+            size_bytes: None,
+            modified_at: None,
+            content_hash: None,
+            in_workspace: false,
+        };
+        let recorded = s
+            .record_attachments(&conv.id, Some(&task.id), &[file.clone(), folder.clone()])
+            .unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded[0].id.starts_with("att_"));
+
+        let listed = s.list_conversation_attachments(&conv.id).unwrap();
+        assert_eq!(listed, recorded);
+        assert_eq!(listed[0].kind, AttachmentKind::File);
+        assert!(listed[0].in_workspace);
+        assert_eq!(listed[0].task_id.as_deref(), Some(task.id.0.as_str()));
+        assert_eq!(listed[1].kind, AttachmentKind::Folder);
+        assert!(!listed[1].in_workspace);
+        assert_eq!(listed[1].size_bytes, None);
+        assert_eq!(listed[1].content_hash, None);
+
+        // The serialized shape carries real booleans and the lowercase kind
+        // strings the frontend's attachmentInfoSchema demands.
+        let json = serde_json::to_value(&listed).unwrap();
+        assert_eq!(json[0]["in_workspace"], serde_json::Value::Bool(true));
+        assert_eq!(json[0]["kind"], "file");
+        assert_eq!(json[1]["in_workspace"], serde_json::Value::Bool(false));
+        assert_eq!(json[1]["kind"], "folder");
+    }
+
+    #[test]
+    fn attachments_without_a_task_are_allowed() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let a = NewAttachment {
+            path: "/home/user/notes.txt".into(),
+            kind: AttachmentKind::File,
+            size_bytes: None,
+            modified_at: None,
+            content_hash: None,
+            in_workspace: false,
+        };
+        s.record_attachments(&conv.id, None, &[a]).unwrap();
+        let listed = s.list_conversation_attachments(&conv.id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].task_id, None);
+    }
+
+    #[test]
+    fn v2_database_upgrades_to_v3() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("commonspace.db");
+        {
+            // Freeze a populated database at schema v2 — the state installs
+            // from before the attachments feature are in.
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            crate::migrations::migrate_to(&mut conn, 2).unwrap();
+            conn.execute_batch(
+                "INSERT INTO conversations (id, title, created_at, updated_at)
+                 VALUES ('conv_1', 'Old conversation',
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+            let missing: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = 'attachments'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(missing, 0, "attachments must not exist at v2");
+        }
+
+        // Reopening applies v3; the new table works against the old rows.
+        let s = Storage::open(&db).unwrap();
+        let conv = ConversationId("conv_1".into());
+        assert!(s.list_conversation_attachments(&conv).unwrap().is_empty());
+        s.record_attachments(
+            &conv,
+            None,
+            &[NewAttachment {
+                path: "/home/user/a.txt".into(),
+                kind: AttachmentKind::File,
+                size_bytes: Some(1),
+                modified_at: None,
+                content_hash: None,
+                in_workspace: true,
+            }],
+        )
+        .unwrap();
+        assert_eq!(s.list_conversation_attachments(&conv).unwrap().len(), 1);
     }
 
     #[test]
