@@ -7,6 +7,7 @@
 
 mod commands;
 mod state;
+mod suggestions;
 mod updates;
 
 pub use state::AppState;
@@ -41,6 +42,7 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             use tauri::Manager;
             let state = AppState::initialize(app.handle())?;
@@ -84,6 +86,7 @@ pub fn run() {
             commands::open_external_url,
             commands::get_setting,
             commands::set_setting,
+            suggestions::suggest_tasks,
             updates::check_for_update,
             updates::install_update,
             updates::open_release_page,

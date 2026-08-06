@@ -356,7 +356,7 @@ pub async fn start_task(
     let conversation = match args.conversation_id {
         Some(id) => ConversationId(id),
         None => {
-            let title = title_from_prompt(&args.prompt);
+            let title = commonspace_core::titles::from_prompt(&args.prompt);
             state
                 .storage()
                 .create_conversation(Some(&workspace_id), &title)?
@@ -546,19 +546,6 @@ fn prompt_with_attachments(prompt: &str, attachments: &[NewAttachment]) -> Strin
         out.push_str(&attachment.path);
     }
     out
-}
-
-fn title_from_prompt(prompt: &str) -> String {
-    let first_line = prompt.lines().next().unwrap_or(prompt).trim();
-    let mut title: String = first_line.chars().take(70).collect();
-    if first_line.chars().count() > 70 {
-        title.push('…');
-    }
-    if title.is_empty() {
-        "New task".into()
-    } else {
-        title
-    }
 }
 
 #[tauri::command]
@@ -803,19 +790,6 @@ pub fn set_setting(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn titles_are_trimmed_and_never_empty() {
-        assert_eq!(
-            title_from_prompt("Organize my downloads\nplease"),
-            "Organize my downloads"
-        );
-        assert_eq!(title_from_prompt("   "), "New task");
-        let long = "a".repeat(200);
-        let title = title_from_prompt(&long);
-        assert_eq!(title.chars().count(), 71);
-        assert!(title.ends_with('…'));
-    }
 
     #[test]
     fn billing_notes_are_specific_and_truthful() {

@@ -25,11 +25,12 @@ loop rather than compete with it for attention.
 
 The current sequencing, in order: conversation replay ("reopen later with
 everything intact"), a persisted attachment model with plain disclosure,
-and a task-outcome view (all in progress); then a real plan-approval stage
-(approve the overall plan once, instead of twenty individual writes); then
-a knowledge-worker UX pass (projects instead of workspaces in the
-interface, a recommended default agent, generated titles, calm plain
-progress by default with technical events under details); then the
+and a task-outcome view; then a real plan-approval stage (approve the
+overall plan once, instead of twenty individual writes); then a
+knowledge-worker UX pass (projects instead of workspaces in the interface,
+a recommended default agent, generated titles, file-aware suggestions,
+first-run onboarding, completion notifications, and calm plain progress by
+default with technical events under details) — all in progress; then the
 document features in the order theme 6 lists.
 
 ## 1. A "Changes" center
@@ -258,10 +259,12 @@ Other engineering work:
 - A command palette and keyboard shortcuts.
 - Searchable conversation history (in progress, see theme 5).
 - Editable task titles (in progress).
-- File-aware prompt suggestions based on what's in the authorized folders.
-- Empty states tailored to context instead of one generic placeholder.
+- File-aware prompt suggestions based on what's in the authorized folders
+  (in progress).
+- Empty states tailored to context instead of one generic placeholder
+  (in progress).
 - Compact and expanded progress views, so a task can be glanced at or
-  inspected in depth.
+  inspected in depth (in progress).
 - Clear visibility into which provider, model, and billing mode (subscription
   vs. API) a task is using — matching the truthful-status principle already
   in README.md and ARCHITECTURE.md.

@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState, type KeyboardEvent } from "react";
 import type { Connection, Workspace } from "@commonspace/protocol";
 import { attachmentDisclosure, mergePaths } from "../lib/attachments";
+import { recommendedProvider, usableConnections } from "../lib/recommend";
 import { useFileDrop } from "../lib/useFileDrop";
 import { Button } from "./primitives";
 
@@ -45,9 +46,11 @@ export function Composer({
   // file picker does.
   const dragging = useFileDrop((paths) => onAttachmentsChange(mergePaths(attachments, paths)));
 
-  const usable = connections.filter(
-    (c) => c.auth.status === "subscription" || c.auth.status === "api_key" || c.auth.status === "local_model",
-  );
+  const usable = usableConnections(connections);
+  // With one agent connected there is no choice to make, so the composer
+  // states which one is running rather than presenting a menu of one.
+  const onlyAgent = usable.length === 1 ? usable[0] : undefined;
+  const recommended = recommendedProvider(connections);
   const activeConnection = connections.find((c) => c.provider === provider);
   const models = activeConnection?.capabilities.models ?? [];
 
@@ -184,25 +187,38 @@ export function Composer({
             </Button>
 
             <div className="ml-auto flex items-center gap-2">
-              <label htmlFor="agent" className="sr-only">
-                Agent
-              </label>
-              <select
-                id="agent"
-                value={provider}
-                onChange={(event) => onProviderChange(event.target.value)}
-                className="rounded-md border border-[var(--color-line)] bg-[var(--color-surface)] px-2 py-1 text-xs text-[var(--color-ink-muted)]"
-              >
-                {usable.length === 0 ? (
-                  <option value="">No agent connected</option>
-                ) : (
-                  usable.map((connection) => (
-                    <option key={connection.provider} value={connection.provider}>
-                      {connection.display_name}
-                    </option>
-                  ))
-                )}
-              </select>
+              {onlyAgent ? (
+                <p className="text-xs text-[var(--color-ink-muted)]">
+                  Using {onlyAgent.display_name}
+                </p>
+              ) : (
+                <>
+                  <label htmlFor="agent" className="sr-only">
+                    Agent
+                  </label>
+                  <select
+                    id="agent"
+                    value={provider}
+                    onChange={(event) => onProviderChange(event.target.value)}
+                    className="rounded-md border border-[var(--color-line)] bg-[var(--color-surface)] px-2 py-1 text-xs text-[var(--color-ink-muted)]"
+                  >
+                    {usable.length === 0 ? (
+                      <option value="">No agent connected</option>
+                    ) : (
+                      usable.map((connection) => (
+                        <option key={connection.provider} value={connection.provider}>
+                          {connection.provider === recommended
+                            ? // Named in the option text rather than shown as a
+                              // separate badge: a select can only carry text, and
+                              // the label has to survive the closed state too.
+                              `${connection.display_name} (recommended)`
+                            : connection.display_name}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                </>
+              )}
 
               {models.length > 1 ? (
                 <>

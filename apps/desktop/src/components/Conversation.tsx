@@ -2,12 +2,19 @@ import { useEffect, useRef, useState } from "react";
 import Markdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Artifact, Message, OperationResult, TaskPlan } from "@commonspace/protocol";
-import type { ActivityItem, ConversationState } from "../lib/activity";
-import { permissionHeadline } from "../lib/activity";
+import type { ActivityItem, CalmProgress, ConversationState } from "../lib/activity";
+import { calmProgress, permissionHeadline } from "../lib/activity";
 import type { TaskOutcome as TaskOutcomeModel } from "../lib/replay";
 import { openExternalUrl, type PlanDecision } from "../lib/ipc";
 import { TaskOutcome } from "./TaskOutcome";
-import { Button, Card, ErrorNotice, StatusPill, TechnicalDetails } from "./primitives";
+import {
+  Button,
+  Card,
+  Disclosure,
+  ErrorNotice,
+  StatusPill,
+  TechnicalDetails,
+} from "./primitives";
 
 interface ConversationProps {
   messages: Message[];
@@ -44,14 +51,19 @@ export function Conversation({
 }: ConversationProps) {
   const endRef = useRef<HTMLDivElement>(null);
 
+  // Follow the newest content. Every dependency here is something that adds
+  // a block above the anchor or changes one's height: `live.activity` by
+  // identity rather than length, because a step changing status rewrites the
+  // progress card's headline and notices without the list growing.
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
   }, [
     messages.length,
     live.assistantText,
-    live.activity.length,
+    live.activity,
     live.plan,
     live.pendingPermission,
+    running,
     awaitingPlanApproval,
     outcome,
   ]);
@@ -75,8 +87,19 @@ export function Conversation({
           />
         ) : null}
 
-        {live.activity.length > 0 ? (
-          <ActivityTimeline items={live.activity} reasoning={live.reasoning} />
+        {live.activity.length > 0 || running ? (
+          // Rendered from the moment the task starts, so pressing Send is
+          // answered on screen before the first step arrives, and left in
+          // place afterwards so the finished task can still be read back.
+          <ProgressCard
+            progress={calmProgress(live, running)}
+            items={live.activity}
+            reasoning={live.reasoning}
+            // While a plan waits on the user nothing is working — the plan
+            // card above carries the actions, so Stop stays hidden.
+            canStop={running && !awaitingPlanApproval}
+            onCancel={onCancel}
+          />
         ) : null}
 
         {live.pendingPermission ? (
@@ -114,23 +137,6 @@ export function Conversation({
             onUndoArtifact={onUndoArtifact}
             onUndoTask={onUndoTask}
           />
-        ) : null}
-
-        {running && !awaitingPlanApproval ? (
-          // While a plan waits on the user nothing is working — the plan
-          // card above carries the actions, so the busy line stays hidden.
-          <div className="flex items-center gap-3">
-            <span
-              className="text-sm text-[var(--color-ink-muted)]"
-              role="status"
-              aria-live="polite"
-            >
-              Working…
-            </span>
-            <Button size="sm" variant="quiet" onClick={onCancel}>
-              Stop
-            </Button>
-          </div>
         ) : null}
 
         <div ref={endRef} />
@@ -335,37 +341,85 @@ function PlanCard({
 }
 
 /**
- * The activity timeline. One readable line per step, with the raw
- * provider-facing information folded away under Technical details.
+ * Progress, told the way a person would tell it: one sentence for what is
+ * happening, a count, and anything that went wrong or was refused. The
+ * step-by-step record — and the agent's reasoning — wait under Details for
+ * whoever wants them.
  */
-function ActivityTimeline({
+function ProgressCard({
+  progress,
   items,
   reasoning,
+  canStop,
+  onCancel,
 }: {
+  progress: CalmProgress;
   items: ActivityItem[];
   reasoning: string[];
+  canStop: boolean;
+  onCancel: () => void;
 }) {
   return (
-    <Card className="overflow-hidden">
-      <ul className="divide-y divide-[var(--color-line)]">
-        {items.map((item) => (
-          <li key={item.id} className="flex items-start gap-3 px-4 py-2.5">
-            <ActivityGlyph status={item.status} />
-            <div className="min-w-0 flex-1">
-              <p className="text-sm text-[var(--color-ink)]">{item.title}</p>
-              {item.detail ? (
-                <p className="truncate text-xs text-[var(--color-ink-muted)]">{item.detail}</p>
-              ) : null}
-            </div>
-          </li>
-        ))}
-      </ul>
-      {reasoning.length > 0 ? (
-        <div className="px-4 pb-3">
-          <TechnicalDetails label="What the agent was thinking">
-            {reasoning.join("\n\n")}
-          </TechnicalDetails>
+    <Card as="section" className="p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          {/* The conversation's only live region: one voice, so a screen
+              reader hears the current step and nothing competing. */}
+          <p className="text-sm text-[var(--color-ink)]" role="status" aria-live="polite">
+            {progress.headline}
+          </p>
+          {progress.progress ? (
+            <p className="mt-0.5 text-xs text-[var(--color-ink-faint)]">{progress.progress}</p>
+          ) : null}
         </div>
+        {canStop ? (
+          <Button size="sm" variant="quiet" className="shrink-0" onClick={onCancel}>
+            Stop
+          </Button>
+        ) : null}
+      </div>
+
+      {progress.notices.length > 0 ? (
+        <ul className="mt-2.5 space-y-1">
+          {progress.notices.map((notice) => (
+            <li key={notice} className="text-sm text-[var(--color-warn)]">
+              <span aria-hidden="true" className="mr-1.5">
+                ⚠
+              </span>
+              {/* A failed step's notice is just its title, so the warning
+                  needs a word of its own for anyone not seeing the glyph. */}
+              <span className="sr-only">Needs your attention: </span>
+              {notice}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      {items.length > 0 || reasoning.length > 0 ? (
+        <Disclosure label="Details">
+          {items.length > 0 ? (
+            <ul className="divide-y divide-[var(--color-line)] rounded-md border border-[var(--color-line)]">
+              {items.map((item) => (
+                <li key={item.id} className="flex items-start gap-3 px-3 py-2">
+                  <ActivityGlyph status={item.status} />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm text-[var(--color-ink)]">{item.title}</p>
+                    {item.detail ? (
+                      <p className="truncate text-xs text-[var(--color-ink-muted)]">
+                        {item.detail}
+                      </p>
+                    ) : null}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          {reasoning.length > 0 ? (
+            <TechnicalDetails label="What the agent was thinking">
+              {reasoning.join("\n\n")}
+            </TechnicalDetails>
+          ) : null}
+        </Disclosure>
       ) : null}
     </Card>
   );

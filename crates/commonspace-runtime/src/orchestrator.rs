@@ -17,7 +17,7 @@ use crate::tools::{ToolContext, ToolServer, ToolServerHandle};
 use commonspace_agents::adapter::{AgentAdapter, McpEndpoint, SessionRequest};
 use commonspace_agents::process::KillHandle;
 use commonspace_core::{
-    AgentErrorInfo, AgentEvent, ConversationId, MessageRole, PlanStep, ProviderId, TaskId,
+    titles, AgentErrorInfo, AgentEvent, ConversationId, MessageRole, PlanStep, ProviderId, TaskId,
     TaskPlan, TaskState, WorkspaceId,
 };
 use commonspace_documents::{BackupStore, SafeFs};
@@ -597,11 +597,13 @@ impl Orchestrator {
                     let _ = storage.record_session(&task_id, provider, Some(&sid), resumable);
                 }
 
-                let (state, summary) = terminal.unwrap_or((
-                    TaskState::Failed,
-                    "The task ended without a result.".to_string(),
-                ));
+                let (state, summary) =
+                    terminal.unwrap_or((TaskState::Failed, titles::NO_RESULT_SUMMARY.to_string()));
                 let _ = storage.set_task_summary(&task_id, &summary);
+                // Ahead of the transition on purpose: the UI reacts to a task
+                // becoming Completed, so the better name is already in place
+                // by the time it looks.
+                refine_conversation_title(&storage, &task_id, state, &summary);
                 if let Err(error) = storage.transition_task(&task_id, state) {
                     tracing::warn!(%error, "task ended in an unexpected state");
                 }
@@ -881,6 +883,29 @@ fn plan_needs_gate(plan: &TaskPlan) -> bool {
         || !plan.paths_likely_modified.is_empty()
         || !plan.consequential_actions.is_empty()
         || !plan.external_services.is_empty()
+}
+
+/// Let a task that finished well name its conversation. The opening prompt is
+/// a guess at what the work is; the summary is what the work turned out to be,
+/// and usually the better name — but only for a conversation the user has not
+/// named themselves, which `retitle_conversation_if_auto` enforces.
+///
+/// A task that failed is left alone: nothing it can say about going wrong
+/// belongs in the sidebar. Every failure here is cosmetic and swallowed —
+/// a title is never worth losing a finished task over.
+fn refine_conversation_title(storage: &Storage, task_id: &TaskId, state: TaskState, summary: &str) {
+    if state != TaskState::Completed {
+        return;
+    }
+    let Some(title) = titles::from_summary(summary) else {
+        return;
+    };
+    let retitled = storage
+        .get_task(task_id)
+        .and_then(|task| storage.retitle_conversation_if_auto(&task.conversation_id, &title));
+    if let Err(error) = retitled {
+        tracing::warn!(%error, "could not name the conversation after its task");
+    }
 }
 
 /// A structured error suitable for surfacing to the user.
@@ -1394,6 +1419,84 @@ mod tests {
         let requests = adapter.requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].resume.as_deref(), Some("fake-session-1"));
+    }
+
+    fn conversation_title(storage: &Storage, id: &ConversationId) -> String {
+        storage
+            .list_conversations(50)
+            .expect("conversations")
+            .into_iter()
+            .find(|c| &c.id == id)
+            .expect("the conversation")
+            .title
+    }
+
+    #[tokio::test]
+    async fn a_completed_task_names_its_conversation_after_the_work() {
+        let (_tmp, orchestrator, workspace, _dir) = setup();
+        let storage = Arc::clone(orchestrator.storage());
+        // The name the opening prompt produced: a guess, and still automatic.
+        let conv = storage
+            .create_conversation(Some(&workspace), "Organize my files")
+            .expect("conversation");
+        let adapter = FakeAdapter::scripted(vec![
+            plan_reply(HARMLESS_PLAN),
+            vec![AgentEvent::TaskCompleted {
+                summary: "Sorted 42 downloads into folders by file type.".into(),
+                usage: None,
+            }],
+        ]);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = orchestrator
+            .start(
+                Arc::clone(&adapter) as Arc<dyn AgentAdapter>,
+                start_request(&conv.id, &workspace),
+                tx,
+            )
+            .await
+            .expect("start");
+        wait_for_state(&storage, &handle.task_id, TaskState::Completed).await;
+
+        assert_eq!(
+            conversation_title(&storage, &conv.id),
+            "Sorted 42 downloads into folders by file type"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_task_leaves_the_conversation_name_alone() {
+        let (_tmp, orchestrator, workspace, _dir) = setup();
+        let storage = Arc::clone(orchestrator.storage());
+        let conv = storage
+            .create_conversation(Some(&workspace), "Organize my files")
+            .expect("conversation");
+        // A message that would make a perfectly readable title — the point is
+        // that a task which did not finish never gets to write one.
+        let adapter = FakeAdapter::scripted(vec![
+            plan_reply(HARMLESS_PLAN),
+            vec![AgentEvent::Error {
+                error: AgentErrorInfo {
+                    code: "provider_error".into(),
+                    message: "The provider stopped halfway through sorting".into(),
+                    recovery: None,
+                    transient: false,
+                },
+            }],
+        ]);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = orchestrator
+            .start(
+                Arc::clone(&adapter) as Arc<dyn AgentAdapter>,
+                start_request(&conv.id, &workspace),
+                tx,
+            )
+            .await
+            .expect("start");
+        wait_for_state(&storage, &handle.task_id, TaskState::Failed).await;
+
+        assert_eq!(conversation_title(&storage, &conv.id), "Organize my files");
     }
 
     #[tokio::test]

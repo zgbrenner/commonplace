@@ -8,7 +8,12 @@
 use rusqlite::Connection;
 
 /// Ordered migrations. Index 0 brings the schema to version 1, and so on.
-const MIGRATIONS: &[&str] = &[V1_INITIAL, V2_HISTORY_FTS, V3_ATTACHMENTS];
+const MIGRATIONS: &[&str] = &[
+    V1_INITIAL,
+    V2_HISTORY_FTS,
+    V3_ATTACHMENTS,
+    V4_CONVERSATION_TITLE_AUTO,
+];
 
 /// Apply all pending migrations inside transactions.
 pub fn migrate_to_latest(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -279,6 +284,17 @@ CREATE TABLE attachments (
     created_at      TEXT NOT NULL
 ) STRICT;
 CREATE INDEX idx_attachments_conversation ON attachments(conversation_id, created_at);
+"#;
+
+/// V4: whether a conversation's title is still the one Commonspace wrote.
+///
+/// Titles are generated from the opening prompt and improved from a finished
+/// task's summary, but only while nobody has taken them over: renaming a
+/// conversation sets this to 0 and nothing overwrites it afterwards. The
+/// default of 1 is also the right answer for every row that already exists,
+/// since every title written before this column did came from a prompt.
+const V4_CONVERSATION_TITLE_AUTO: &str = r#"
+ALTER TABLE conversations ADD COLUMN title_auto INTEGER NOT NULL DEFAULT 1;
 "#;
 
 #[cfg(test)]

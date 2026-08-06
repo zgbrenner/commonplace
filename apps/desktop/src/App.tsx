@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type {
   AgentEvent,
@@ -29,14 +29,18 @@ import {
   type TaskOutcome,
 } from "./lib/replay";
 import { mergePaths } from "./lib/attachments";
+import { recommendedProvider, usableConnections as usable } from "./lib/recommend";
+import { completionNotification, notifyTaskFinished } from "./lib/notify";
 import { Sidebar, type View } from "./components/Sidebar";
+import { Suggestions } from "./components/Suggestions";
 import { Conversation as ConversationView } from "./components/Conversation";
 import { Composer } from "./components/Composer";
 import { ArtifactPanel } from "./components/ArtifactPanel";
 import { Connections } from "./components/Connections";
-import { Workspaces } from "./components/Workspaces";
+import { Projects } from "./components/Projects";
+import { Onboarding } from "./components/Onboarding";
 import { SettingsView } from "./components/Settings";
-import { Button, EmptyState, ErrorNotice } from "./components/primitives";
+import { EmptyState, ErrorNotice } from "./components/primitives";
 
 export function App() {
   const [view, setView] = useState<View>("task");
@@ -66,6 +70,7 @@ export function App() {
   const [provider, setProvider] = useState("claude_code");
   const [model, setModel] = useState("default");
   const [attachments, setAttachments] = useState<string[]>([]);
+  const [suggestions, setSuggestions] = useState<ipc.TaskSuggestion[]>([]);
   const [error, setError] = useState<{ message: string; recovery?: string } | undefined>();
 
   const workspace = useMemo(
@@ -73,16 +78,17 @@ export function App() {
     [workspaces, activeWorkspaceId],
   );
 
-  const usableConnections = useMemo(
-    () =>
-      connections.filter(
-        (c) =>
-          c.auth.status === "subscription" ||
-          c.auth.status === "api_key" ||
-          c.auth.status === "local_model",
-      ),
-    [connections],
-  );
+  const usableConnections = useMemo(() => usable(connections), [connections]);
+
+  /**
+   * What the completion notification needs, kept in a ref because `onEvent`
+   * is handed to the backend once per task and would otherwise close over
+   * the project and artifact list as they looked when the task started.
+   */
+  const finished = useRef<{ projectName: string | undefined; changedFiles: number }>({
+    projectName: undefined,
+    changedFiles: 0,
+  });
 
   const reportError = useCallback((cause: unknown) => {
     if (cause instanceof CommonspaceError) {
@@ -97,23 +103,13 @@ export function App() {
     try {
       const next = await ipc.listConnections();
       setConnections(next);
-      const usable = next.find(
-        (c) =>
-          c.auth.status === "subscription" ||
-          c.auth.status === "api_key" ||
-          c.auth.status === "local_model",
-      );
-      if (usable) {
+      // Keep the person's choice when it still works; otherwise fall back to
+      // the recommendation rather than to whichever connection happened to
+      // be listed first.
+      const recommended = recommendedProvider(next);
+      if (recommended) {
         setProvider((current) =>
-          next.some(
-            (c) =>
-              c.provider === current &&
-              (c.auth.status === "subscription" ||
-                c.auth.status === "api_key" ||
-                c.auth.status === "local_model"),
-          )
-            ? current
-            : usable.provider,
+          usable(next).some((c) => c.provider === current) ? current : recommended,
         );
       }
     } catch (cause) {
@@ -147,12 +143,48 @@ export function App() {
     void refreshConversations();
   }, [refreshConnections, refreshWorkspaces, refreshConversations]);
 
+  /**
+   * Things worth doing in this project, from a bounded look at its folders.
+   * A failed lookup reads as "nothing to suggest" — the composer is right
+   * there, and an error banner over a hint would be out of proportion.
+   */
+  useEffect(() => {
+    if (!activeWorkspaceId) {
+      setSuggestions([]);
+      return;
+    }
+    let current = true;
+    void ipc.suggestTasks(activeWorkspaceId).then(
+      (found) => {
+        if (current) setSuggestions(found);
+      },
+      () => {
+        if (current) setSuggestions([]);
+      },
+    );
+    return () => {
+      current = false;
+    };
+  }, [activeWorkspaceId]);
+
   /* ------------------------------------------------------------- actions */
 
   const onEvent = useCallback((event: AgentEvent) => {
     setLive((state) => applyEvent(state, event));
     if (event.type === "task.completed" || event.type === "error") {
       setRunning(false);
+      // A task can run for minutes, so this is how it reaches someone who
+      // moved on to another window. Deliberately unawaited and unguarded:
+      // notify.ts stays silent when the window is focused, when the person
+      // has not turned notifications on, or when anything goes wrong.
+      void notifyTaskFinished(
+        completionNotification({
+          projectName: finished.current.projectName,
+          state: event.type === "error" ? "failed" : "completed",
+          summary: event.type === "error" ? event.error.message : event.summary,
+          changedFiles: finished.current.changedFiles,
+        }),
+      );
     }
     if (event.type === "plan.created" || event.type === "plan.updated") {
       // A gating plan parks the task until the user answers; a harmless one
@@ -166,7 +198,7 @@ export function App() {
   const submit = useCallback(
     async (prompt: string) => {
       if (!activeWorkspaceId) {
-        setView("workspaces");
+        setView("projects");
         return;
       }
       // Capture before the Composer clears its list on send.
@@ -492,6 +524,13 @@ export function App() {
 
   /* ------------------------------------------------------- derived state */
 
+  useEffect(() => {
+    finished.current = {
+      projectName: workspace?.name,
+      changedFiles: live.artifacts.length,
+    };
+  }, [workspace, live.artifacts.length]);
+
   const panelArtifacts = useMemo(() => {
     const groups = [...artifactGroups];
     // During a live task the stream is the source of truth; on replay the
@@ -541,7 +580,7 @@ export function App() {
   const composerDisabled =
     running || awaitingPlanApproval || !activeWorkspaceId || usableConnections.length === 0;
   const composerReason = !activeWorkspaceId
-    ? "Choose a folder in Workspaces to get started."
+    ? "Choose a folder in Projects to get started."
     : usableConnections.length === 0
       ? "Connect an agent in Connections to get started."
       : awaitingPlanApproval
@@ -580,9 +619,9 @@ export function App() {
             onCheckHealth={(p) => ipc.providerHealth(p)}
             refreshing={refreshingConnections}
           />
-        ) : view === "workspaces" ? (
-          <Workspaces
-            workspaces={workspaces}
+        ) : view === "projects" ? (
+          <Projects
+            projects={workspaces}
             activeId={activeWorkspaceId}
             onSelect={(id) => {
               setActiveWorkspaceId(id);
@@ -592,10 +631,10 @@ export function App() {
               await ipc.createWorkspace(name, roots);
               await refreshWorkspaces();
             }}
-            onAddFolder={async (workspaceId) => {
+            onAddFolder={async (projectId) => {
               const folder = await pickFolder();
               if (folder) {
-                await ipc.addWorkspaceFolder(workspaceId, folder);
+                await ipc.addWorkspaceFolder(projectId, folder);
                 await refreshWorkspaces();
               }
             }}
@@ -608,27 +647,27 @@ export function App() {
           />
         ) : view === "settings" ? (
           <SettingsView />
-        ) : !activeWorkspaceId ? (
-          <EmptyState
-            title="Choose a folder to work in"
-            description="Commonspace only sees the folders you authorize. Pick one to get started; you can add more later."
-            action={<Button variant="primary" onClick={() => setView("workspaces")}>Choose a folder</Button>}
-          />
-        ) : usableConnections.length === 0 ? (
-          <EmptyState
-            title="Connect an agent you already pay for"
-            description="Commonspace runs on the official tools from Anthropic, OpenAI and others. Sign in there once and Commonspace will use it — no new account, no extra charge from us."
-            action={
-              <Button variant="primary" onClick={() => setView("connections")}>
-                Open Connections
-              </Button>
-            }
+        ) : !activeWorkspaceId || usableConnections.length === 0 ? (
+          // Both prerequisites are the same conversation with a new person,
+          // so they share one screen: whichever is missing is the next step,
+          // and the other stays visible rather than appearing out of nowhere
+          // once the first is done.
+          <Onboarding
+            hasProject={Boolean(activeWorkspaceId)}
+            hasConnection={usableConnections.length > 0}
+            onChooseFolder={() => setView("projects")}
+            onConnectAgent={() => setView("connections")}
           />
         ) : messages.length === 0 && !live.assistantText ? (
           <>
             <EmptyState
               title={`Ready to work in ${workspace?.name ?? "your folder"}`}
               description="Ask for something concrete: summarize these contracts, find duplicate files, turn this folder of PDFs into a spreadsheet, rename these scans by date."
+            />
+            <Suggestions
+              suggestions={suggestions}
+              onPick={(prompt) => void submit(prompt)}
+              disabled={composerDisabled}
             />
             <Composer
               workspace={workspace}

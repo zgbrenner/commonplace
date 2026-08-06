@@ -1,14 +1,18 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Commonspace's window permissions. Deliberately minimal: the frontend cannot read or write files directly — every filesystem operation goes through typed Rust commands that pass the permission engine. The dialog plugin is allowed so the user can authorize folders with a native picker, and the opener plugin so artifacts can be opened in their default application after an explicit click.",
+  "description": "Commonspace's window permissions. Deliberately minimal: the frontend cannot read or write files directly — every filesystem operation goes through typed Rust commands that pass the permission engine. The dialog plugin is allowed so the user can authorize folders with a native picker, the opener plugin so artifacts can be opened in their default application after an explicit click, and the notification plugin so a task that finishes while the window is in the background can say so.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
+    "core:window:allow-is-focused",
     "dialog:allow-open",
     "dialog:allow-message",
     "opener:allow-open-path",
-    "opener:allow-reveal-item-in-dir"
+    "opener:allow-reveal-item-in-dir",
+    "notification:allow-is-permission-granted",
+    "notification:allow-request-permission",
+    "notification:allow-notify"
   ]
 }

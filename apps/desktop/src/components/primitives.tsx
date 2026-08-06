@@ -136,6 +136,25 @@ export function TechnicalDetails({
   );
 }
 
+/**
+ * A closed-by-default disclosure whose body is ordinary content, not raw
+ * text. Same summary affordance as `TechnicalDetails`, so the two read as
+ * one idea: the optional layer, folded away until asked for.
+ */
+export function Disclosure({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <details className="group mt-2">
+      <summary className="cursor-pointer list-none text-xs text-[var(--color-ink-faint)] hover:text-[var(--color-ink-muted)]">
+        <span aria-hidden="true" className="mr-1 inline-block group-open:rotate-90">
+          ›
+        </span>
+        {label}
+      </summary>
+      <div className="mt-2">{children}</div>
+    </details>
+  );
+}
+
 /** Inline error with a recovery action, never a bare stack trace. */
 export function ErrorNotice({
   message,

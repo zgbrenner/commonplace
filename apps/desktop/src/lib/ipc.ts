@@ -92,6 +92,22 @@ export const createWorkspace = (name: string, roots: string[]) =>
 export const addWorkspaceFolder = (workspaceId: string, root: string) =>
   call("add_workspace_folder", { workspaceId, root }, z.void().or(z.null()));
 
+/**
+ * One concrete thing worth doing in this project, derived on the backend
+ * from a bounded scan of the authorized folders. `label` is the button text;
+ * `prompt` is what gets sent if the user picks it. Never guesses: an empty
+ * array means the folders held nothing recognizable.
+ */
+export const taskSuggestionSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  prompt: z.string(),
+});
+export type TaskSuggestion = z.infer<typeof taskSuggestionSchema>;
+
+export const suggestTasks = (workspaceId: string): Promise<TaskSuggestion[]> =>
+  call("suggest_tasks", { workspaceId }, z.array(taskSuggestionSchema));
+
 /* ---------------------------------------------------------- conversations */
 
 export const listConversations = (limit?: number) =>

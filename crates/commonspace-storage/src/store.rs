@@ -177,6 +177,18 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
+/// Fit an already-trimmed title to the length a conversation row may carry.
+/// Anything longer is cut with a visible ellipsis, so the row admits that text
+/// was dropped instead of pretending the title simply ends there.
+fn capped_title(trimmed: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let mut capped: String = trimmed.chars().take(MAX_CHARS).collect();
+    if trimmed.chars().count() > MAX_CHARS {
+        capped.push('…');
+    }
+    capped
+}
+
 /// Turn raw user input into an FTS5 MATCH expression that can never be a
 /// syntax error. Every whitespace-separated term becomes a quoted phrase
 /// (embedded quotes doubled, per FTS5 string rules), so operator syntax like
@@ -446,9 +458,13 @@ impl Storage {
     }
 
     /// Rename a conversation. The title is trimmed, must be non-empty, and is
-    /// capped with a visible ellipsis (the same convention `title_from_prompt`
-    /// uses for auto-generated titles) rather than silently losing text. The
-    /// v2 FTS triggers keep the search index in step with the update.
+    /// capped with a visible ellipsis (the same convention
+    /// `commonspace_core::titles` uses for generated titles) rather than
+    /// silently losing text. The v2 FTS triggers keep the search index in step
+    /// with the update.
+    ///
+    /// Clearing `title_auto` is the point: once a person has named a
+    /// conversation, nothing generated ever overwrites that name.
     pub fn rename_conversation(&self, id: &ConversationId, title: &str) -> Result<()> {
         let trimmed = title.trim();
         if trimmed.is_empty() {
@@ -456,19 +472,42 @@ impl Storage {
                 "a conversation title cannot be empty".into(),
             ));
         }
-        let mut capped: String = trimmed.chars().take(120).collect();
-        if trimmed.chars().count() > 120 {
-            capped.push('…');
-        }
+        let capped = capped_title(trimmed);
         self.with(|c| {
             let changed = c.execute(
-                "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                "UPDATE conversations SET title = ?1, title_auto = 0, updated_at = ?2
+                 WHERE id = ?3",
                 params![capped, now(), id.0],
             )?;
             if changed == 0 {
                 return Err(StorageError::NotFound(format!("conversation {}", id.0)));
             }
             Ok(())
+        })
+    }
+
+    /// Replace a conversation's title, but only while that title is still one
+    /// Commonspace generated. Returns whether a row actually changed: false
+    /// means the user has named this conversation themselves (or the id is
+    /// unknown), and the caller has nothing to fix.
+    ///
+    /// `title_auto` stays 1, so a later task with a better summary can improve
+    /// the name again.
+    pub fn retitle_conversation_if_auto(&self, id: &ConversationId, title: &str) -> Result<bool> {
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "a conversation title cannot be empty".into(),
+            ));
+        }
+        let capped = capped_title(trimmed);
+        self.with(|c| {
+            let changed = c.execute(
+                "UPDATE conversations SET title = ?1, updated_at = ?2
+                 WHERE id = ?3 AND title_auto = 1",
+                params![capped, now(), id.0],
+            )?;
+            Ok(changed > 0)
         })
     }
 
@@ -1389,6 +1428,68 @@ mod tests {
     }
 
     #[test]
+    fn automatic_titles_can_be_improved_and_stay_searchable() {
+        let s = storage();
+        let conv = s
+            .create_conversation(None, "Rename the zebra scans")
+            .unwrap();
+
+        assert!(s
+            .retitle_conversation_if_auto(&conv.id, "Renamed 42 aardvark scans by date")
+            .unwrap());
+        let listed = s.list_conversations(10).unwrap();
+        assert_eq!(listed[0].title, "Renamed 42 aardvark scans by date");
+
+        // The v2 FTS triggers fire for this UPDATE too: the new title is
+        // findable and the old one is gone.
+        let hits = s.search_history("aardvark", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, "conversation");
+        assert_eq!(hits[0].conversation_id, conv.id.0);
+        assert!(s.search_history("zebra", 10).unwrap().is_empty());
+
+        // Still automatic, so a later, better summary may improve it again.
+        assert!(s
+            .retitle_conversation_if_auto(&conv.id, "Renamed and filed 42 scans")
+            .unwrap());
+    }
+
+    #[test]
+    fn a_manual_rename_stops_automatic_retitling() {
+        let s = storage();
+        let conv = s.create_conversation(None, "Rename the scans").unwrap();
+        s.rename_conversation(&conv.id, "Scan archive").unwrap();
+
+        assert!(!s
+            .retitle_conversation_if_auto(&conv.id, "Renamed 42 scans by date")
+            .unwrap());
+        assert_eq!(s.list_conversations(10).unwrap()[0].title, "Scan archive");
+    }
+
+    #[test]
+    fn retitling_rejects_empty_caps_length_and_shrugs_at_missing_rows() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+
+        assert!(matches!(
+            s.retitle_conversation_if_auto(&conv.id, "   "),
+            Err(StorageError::InvalidInput(_))
+        ));
+
+        let long = "x".repeat(200);
+        assert!(s.retitle_conversation_if_auto(&conv.id, &long).unwrap());
+        let title = s.list_conversations(1).unwrap()[0].title.clone();
+        assert_eq!(title.chars().count(), 121);
+        assert!(title.ends_with('…'));
+
+        // A cosmetic write against a conversation that is gone is not an
+        // error the caller can act on; it simply changed nothing.
+        assert!(!s
+            .retitle_conversation_if_auto(&ConversationId("conv_missing".into()), "x")
+            .unwrap());
+    }
+
+    #[test]
     fn hostile_search_queries_return_ok() {
         let s = storage();
         let conv = s.create_conversation(None, "t").unwrap();
@@ -1765,6 +1866,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.list_conversation_attachments(&conv).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn v3_database_upgrades_to_v4_with_titles_still_automatic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("commonspace.db");
+        {
+            // Freeze a populated database at schema v3 — the state installs
+            // from before titles could be improved are in.
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            crate::migrations::migrate_to(&mut conn, 3).unwrap();
+            conn.execute_batch(
+                "INSERT INTO conversations (id, title, created_at, updated_at)
+                 VALUES ('conv_1', 'Rename the zebra scans',
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        // Reopening applies v4. The old row's title came from a prompt, so it
+        // counts as automatic and the first good summary may replace it.
+        let s = Storage::open(&db).unwrap();
+        let conv = ConversationId("conv_1".into());
+        assert!(s
+            .retitle_conversation_if_auto(&conv, "Renamed 42 aardvark scans by date")
+            .unwrap());
+        assert_eq!(
+            s.list_conversations(1).unwrap()[0].title,
+            "Renamed 42 aardvark scans by date"
+        );
     }
 
     #[test]
