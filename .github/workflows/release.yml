@@ -148,3 +148,71 @@ jobs:
           # version check plus a download-page link.
           includeUpdaterJson: true
           args: ${{ matrix.args }}
+
+  # Automates the "download at least one installer and install it" half of the
+  # release checklist for Windows: fetch the freshly drafted release's NSIS
+  # installer, install it silently, and fail the run if the packaged binary
+  # does not land on disk. Launching the GUI — and the macOS and Linux
+  # installs — remain manual for now, and the release stays a draft either
+  # way: a human still opens it, launches one build, and presses publish.
+  verify-windows-install:
+    name: Verify Windows install
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    # Draft releases are only visible to authenticated callers with write
+    # access, so the read-only default token would not see the draft at all.
+    permissions:
+      contents: write
+    steps:
+      # `gh release download <tag>` resolves via the releases/tags API, which
+      # never returns drafts. Listing all releases and matching tag_name does,
+      # so find the asset id that way and download it by id with the
+      # octet-stream Accept header. bash (Git Bash) keeps the byte stream
+      # intact when redirecting to a file.
+      - name: Download the drafted Windows installer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "Locating the release drafted for tag ${RELEASE_TAG}..."
+          asset="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name == \"${RELEASE_TAG}\") | .assets[] | select(.name | endswith(\"-setup.exe\"))][0] // empty | \"\(.id) \(.name)\"")"
+          if [ -z "${asset}" ]; then
+            echo "::error::No *-setup.exe asset found on the release for tag ${RELEASE_TAG}."
+            exit 1
+          fi
+          asset_id="${asset%% *}"
+          asset_name="${asset#* }"
+          echo "Downloading ${asset_name} (asset id ${asset_id})..."
+          gh api -H "Accept: application/octet-stream" \
+            "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+            > commonspace-setup.exe
+          ls -l commonspace-setup.exe
+
+      - name: Silent-install and verify the packaged binary
+        shell: pwsh
+        run: |
+          $setup = Join-Path $PWD 'commonspace-setup.exe'
+          Write-Host "Silently installing $setup"
+          $proc = Start-Process -FilePath $setup -ArgumentList '/S' -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            Write-Error "Installer exited with code $($proc.ExitCode)."
+            exit 1
+          }
+          $exe = Get-ChildItem -Path $env:LOCALAPPDATA -Filter 'Commonspace.exe' -Recurse -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $exe) {
+            Write-Error "Silent install finished but Commonspace.exe was not found anywhere under $env:LOCALAPPDATA."
+            exit 1
+          }
+          Write-Host "Packaged binary installed at: $($exe.FullName)"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @(
+            '### Windows install verification',
+            '',
+            '- Drafted NSIS installer ran silently and exited 0.',
+            "- ``Commonspace.exe`` found at ``$($exe.FullName)``.",
+            '- Not verified here: launching the GUI, and the macOS/Linux installers. The release is still a draft; a human presses publish.'
+          )
