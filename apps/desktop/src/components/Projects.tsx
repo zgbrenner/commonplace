@@ -2,27 +2,30 @@ import { useState } from "react";
 import type { Workspace } from "@commonspace/protocol";
 import { Button, Card, ErrorNotice } from "./primitives";
 
-interface WorkspacesProps {
-  workspaces: Workspace[];
+interface ProjectsProps {
+  projects: Workspace[];
   activeId: string | undefined;
   onSelect: (id: string) => void;
   onCreate: (name: string, roots: string[]) => Promise<void>;
-  onAddFolder: (workspaceId: string) => Promise<void>;
+  onAddFolder: (projectId: string) => Promise<void>;
   onPickFolder: () => Promise<string | undefined>;
 }
 
+/** The name a project falls back to when someone leaves the field empty. */
+const UNNAMED_PROJECT = "Project";
+
 /**
- * Workspaces: the folders the agent is allowed to touch. Everything outside
+ * Projects: the folders the agent is allowed to touch. Everything outside
  * them requires a fresh, explicit grant through the native picker.
  */
-export function Workspaces({
-  workspaces,
+export function Projects({
+  projects,
   activeId,
   onSelect,
   onCreate,
   onAddFolder,
   onPickFolder,
-}: WorkspacesProps) {
+}: ProjectsProps) {
   const [name, setName] = useState("");
   const [roots, setRoots] = useState<string[]>([]);
   const [error, setError] = useState<string | undefined>();
@@ -33,7 +36,7 @@ export function Workspaces({
     if (folder && !roots.includes(folder)) {
       setRoots([...roots, folder]);
       if (!name) {
-        setName(folder.split(/[/\\]/).filter(Boolean).pop() ?? "Workspace");
+        setName(folder.split(/[/\\]/).filter(Boolean).pop() ?? UNNAMED_PROJECT);
       }
     }
   };
@@ -42,7 +45,7 @@ export function Workspaces({
     setBusy(true);
     setError(undefined);
     try {
-      await onCreate(name.trim() || "Workspace", roots);
+      await onCreate(name.trim() || UNNAMED_PROJECT, roots);
       setName("");
       setRoots([]);
     } catch (cause) {
@@ -55,20 +58,20 @@ export function Workspaces({
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto max-w-3xl px-6 py-6">
-        <h1 className="text-lg font-semibold">Workspaces</h1>
+        <h1 className="text-lg font-semibold">Projects</h1>
         <p className="mt-1 text-sm text-[var(--color-ink-muted)]">
-          A workspace is the set of folders you&apos;ve authorized. Commonspace can read and
-          write inside them; anything else needs your explicit permission first.
+          A project is the set of folders you&apos;ve given Commonspace permission to work in;
+          anything outside them needs a fresh yes from you first.
         </p>
 
         <ul className="mt-5 space-y-3">
-          {workspaces.map((workspace) => (
-            <Card as="li" key={workspace.id} className="p-4">
+          {projects.map((project) => (
+            <Card as="li" key={project.id} className="p-4">
               <div className="flex items-start justify-between gap-4">
                 <div className="min-w-0">
-                  <h2 className="text-sm font-semibold">{workspace.name}</h2>
+                  <h2 className="text-sm font-semibold">{project.name}</h2>
                   <ul className="selectable mt-1.5 space-y-0.5">
-                    {workspace.roots.map((root) => (
+                    {project.roots.map((root) => (
                       <li
                         key={root}
                         className="truncate font-mono text-xs text-[var(--color-ink-muted)]"
@@ -82,16 +85,16 @@ export function Workspaces({
                 <div className="flex shrink-0 flex-col gap-1.5">
                   <Button
                     size="sm"
-                    variant={workspace.id === activeId ? "primary" : "secondary"}
-                    onClick={() => onSelect(workspace.id)}
+                    variant={project.id === activeId ? "primary" : "secondary"}
+                    onClick={() => onSelect(project.id)}
                   >
-                    {workspace.id === activeId ? "Selected" : "Use this"}
+                    {project.id === activeId ? "Selected" : "Use this"}
                   </Button>
                   <Button
                     size="sm"
                     variant="quiet"
                     onClick={() => {
-                      void onAddFolder(workspace.id);
+                      void onAddFolder(project.id);
                     }}
                   >
                     Add folder
@@ -103,13 +106,13 @@ export function Workspaces({
         </ul>
 
         <Card className="mt-5 p-4">
-          <h2 className="text-sm font-semibold">New workspace</h2>
+          <h2 className="text-sm font-semibold">New project</h2>
           <div className="mt-3">
-            <label htmlFor="workspace-name" className="text-xs text-[var(--color-ink-muted)]">
+            <label htmlFor="project-name" className="text-xs text-[var(--color-ink-muted)]">
               Name
             </label>
             <input
-              id="workspace-name"
+              id="project-name"
               value={name}
               onChange={(event) => setName(event.target.value)}
               placeholder="Contracts"
@@ -142,7 +145,7 @@ export function Workspaces({
                 void create();
               }}
             >
-              {busy ? "Creating…" : "Create workspace"}
+              {busy ? "Creating…" : "Create project"}
             </Button>
           </div>
 

@@ -4,7 +4,7 @@ import * as ipc from "../lib/ipc";
 import { createLatestGuard } from "../lib/search";
 import { Button } from "./primitives";
 
-export type View = "task" | "workspaces" | "skills" | "connections" | "settings";
+export type View = "task" | "projects" | "skills" | "connections" | "settings";
 
 /** How long typing must pause before a search request is sent. */
 const SEARCH_DEBOUNCE_MS = 200;
@@ -83,7 +83,7 @@ export function Sidebar({
 
       {workspace ? (
         <p className="px-4 pb-2 text-xs text-[var(--color-ink-faint)]">
-          Working in <span className="text-[var(--color-ink-muted)]">{workspace.name}</span>
+          Project: <span className="text-[var(--color-ink-muted)]">{workspace.name}</span>
         </p>
       ) : null}
 
@@ -133,9 +133,9 @@ export function Sidebar({
 
       <ul className="space-y-0.5 border-t border-[var(--color-line)] p-2">
         <NavItem
-          label="Workspaces"
-          active={view === "workspaces"}
-          onClick={() => onNavigate("workspaces")}
+          label="Projects"
+          active={view === "projects"}
+          onClick={() => onNavigate("projects")}
         />
         <NavItem
           label="Skills"

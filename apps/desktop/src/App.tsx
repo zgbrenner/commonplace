@@ -34,9 +34,10 @@ import { Conversation as ConversationView } from "./components/Conversation";
 import { Composer } from "./components/Composer";
 import { ArtifactPanel } from "./components/ArtifactPanel";
 import { Connections } from "./components/Connections";
-import { Workspaces } from "./components/Workspaces";
+import { Projects } from "./components/Projects";
+import { Onboarding } from "./components/Onboarding";
 import { SettingsView } from "./components/Settings";
-import { Button, EmptyState, ErrorNotice } from "./components/primitives";
+import { EmptyState, ErrorNotice } from "./components/primitives";
 
 export function App() {
   const [view, setView] = useState<View>("task");
@@ -166,7 +167,7 @@ export function App() {
   const submit = useCallback(
     async (prompt: string) => {
       if (!activeWorkspaceId) {
-        setView("workspaces");
+        setView("projects");
         return;
       }
       // Capture before the Composer clears its list on send.
@@ -541,7 +542,7 @@ export function App() {
   const composerDisabled =
     running || awaitingPlanApproval || !activeWorkspaceId || usableConnections.length === 0;
   const composerReason = !activeWorkspaceId
-    ? "Choose a folder in Workspaces to get started."
+    ? "Choose a folder in Projects to get started."
     : usableConnections.length === 0
       ? "Connect an agent in Connections to get started."
       : awaitingPlanApproval
@@ -580,9 +581,9 @@ export function App() {
             onCheckHealth={(p) => ipc.providerHealth(p)}
             refreshing={refreshingConnections}
           />
-        ) : view === "workspaces" ? (
-          <Workspaces
-            workspaces={workspaces}
+        ) : view === "projects" ? (
+          <Projects
+            projects={workspaces}
             activeId={activeWorkspaceId}
             onSelect={(id) => {
               setActiveWorkspaceId(id);
@@ -592,10 +593,10 @@ export function App() {
               await ipc.createWorkspace(name, roots);
               await refreshWorkspaces();
             }}
-            onAddFolder={async (workspaceId) => {
+            onAddFolder={async (projectId) => {
               const folder = await pickFolder();
               if (folder) {
-                await ipc.addWorkspaceFolder(workspaceId, folder);
+                await ipc.addWorkspaceFolder(projectId, folder);
                 await refreshWorkspaces();
               }
             }}
@@ -608,21 +609,16 @@ export function App() {
           />
         ) : view === "settings" ? (
           <SettingsView />
-        ) : !activeWorkspaceId ? (
-          <EmptyState
-            title="Choose a folder to work in"
-            description="Commonspace only sees the folders you authorize. Pick one to get started; you can add more later."
-            action={<Button variant="primary" onClick={() => setView("workspaces")}>Choose a folder</Button>}
-          />
-        ) : usableConnections.length === 0 ? (
-          <EmptyState
-            title="Connect an agent you already pay for"
-            description="Commonspace runs on the official tools from Anthropic, OpenAI and others. Sign in there once and Commonspace will use it — no new account, no extra charge from us."
-            action={
-              <Button variant="primary" onClick={() => setView("connections")}>
-                Open Connections
-              </Button>
-            }
+        ) : !activeWorkspaceId || usableConnections.length === 0 ? (
+          // Both prerequisites are the same conversation with a new person,
+          // so they share one screen: whichever is missing is the next step,
+          // and the other stays visible rather than appearing out of nowhere
+          // once the first is done.
+          <Onboarding
+            hasProject={Boolean(activeWorkspaceId)}
+            hasConnection={usableConnections.length > 0}
+            onChooseFolder={() => setView("projects")}
+            onConnectAgent={() => setView("connections")}
           />
         ) : messages.length === 0 && !live.assistantText ? (
           <>
