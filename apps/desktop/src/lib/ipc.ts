@@ -99,6 +99,40 @@ export const listConversations = (limit?: number) =>
 export const listMessages = (conversationId: string) =>
   call("list_messages", { conversationId }, z.array(messageSchema));
 
+export const renameConversation = (conversationId: string, title: string) =>
+  call("rename_conversation", { conversationId, title }, z.void().or(z.null()));
+
+/* ----------------------------------------------------------------- search */
+
+/**
+ * One full-text search hit: either a conversation matched by title or a
+ * message matched by content. The snippet is plain text with … ellipses —
+ * no HTML — so it can be rendered directly.
+ *
+ * Exported (unlike most local schemas here) so the contract test can parse
+ * fixture responses against it.
+ */
+export const searchResultSchema = z.object({
+  kind: z.enum(["conversation", "message"]),
+  conversation_id: z.string(),
+  title: z.string(),
+  snippet: z.string(),
+  created_at: z.string(),
+});
+export type SearchResult = z.infer<typeof searchResultSchema>;
+
+export const searchHistory = (query: string, limit?: number) =>
+  call("search_history", { query, limit }, z.array(searchResultSchema));
+
+/* ---------------------------------------------------------------- opening */
+
+/**
+ * Open a link in the user's default browser. The webview itself must never
+ * navigate — the backend validates and hands the URL to the OS.
+ */
+export const openExternalUrl = (url: string) =>
+  call("open_external_url", { url }, z.void().or(z.null()));
+
 /* ------------------------------------------------------------------ tasks */
 
 export interface StartTaskArgs {
