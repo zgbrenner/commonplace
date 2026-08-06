@@ -1,0 +1,140 @@
+name: PR builds
+
+# Builds real, installable packages for every code PR and attaches them as
+# short-lived artifacts, so the maintainer can click-test packaged behaviour
+# without building a release locally.
+#
+# Why this exists: a dev build is not evidence about a packaged one. The
+# console-window bug documented in docs/status.md was invisible in
+# development — where the app already owns a console — and only surfaced in
+# an installed build. These artifacts make "install exactly what this PR
+# would ship" a download away.
+#
+# Why this does not reuse scripts/build verbatim: that script first runs a
+# full `cargo build --workspace --release` pass and then lets Tauri build
+# every bundle type configured for the OS (tauri.conf.json sets
+# `targets: "all"`, which adds MSI on Windows and RPM on Linux). Both are
+# right for a release and wasted wall-clock on a PR, so this workflow calls
+# `npm run tauri build -- --bundles <subset>` directly with one useful
+# installer set per OS. Lint and tests are ci.yml's job, not repeated here.
+#
+# macOS is built host-arch only. The universal binary is release.yml's job;
+# building both architectures here would roughly double PR wall-clock for no
+# extra click-testing value.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/**"
+      - "crates/**"
+      - "packages/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/pr-builds.yml"
+  workflow_dispatch:
+
+# A newer push to the PR supersedes an in-flight build of the same ref.
+concurrency:
+  group: pr-builds-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bundles: deb,appimage
+          - os: windows-latest
+            bundles: nsis
+          - os: macos-latest
+            bundles: app,dmg
+    steps:
+      - uses: actions/checkout@v5
+
+      # Key kept distinct from ci.yml's (`<os>`) and release.yml's
+      # (`release-<os>`) so caches for lint/test, release, and PR-build
+      # profiles do not evict each other.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: prbuild-${{ matrix.os }}
+
+      - name: Install Linux build dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev patchelf
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # Tauri's beforeBuildCommand (`npm run build`) builds the frontend, so
+      # this one command produces the finished installers. The tauri crate is
+      # a cargo workspace member, so bundles land in the workspace-root
+      # `target/release/bundle/`.
+      - name: Build installers
+        shell: bash
+        working-directory: apps/desktop
+        run: npm run tauri build -- --bundles ${{ matrix.bundles }}
+
+      # This automates the "install it" half of the manual release check for
+      # Windows: run the NSIS installer silently and assert the packaged
+      # binary actually landed on disk. Actually *launching* the GUI stays a
+      # manual step — headless CI cannot see a window, so a green run here
+      # proves "it installs", not "it runs".
+      - name: Verify silent install (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem -Path 'target/release/bundle/nsis' -Filter '*-setup.exe' -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $setup) {
+            Write-Error 'No *-setup.exe found under target/release/bundle/nsis.'
+            exit 1
+          }
+          Write-Host "Silently installing $($setup.FullName)"
+          $proc = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            Write-Error "Installer exited with code $($proc.ExitCode)."
+            exit 1
+          }
+          $exe = Get-ChildItem -Path $env:LOCALAPPDATA -Filter 'Commonspace.exe' -Recurse -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $exe) {
+            Write-Error "Silent install finished but Commonspace.exe was not found anywhere under $env:LOCALAPPDATA."
+            exit 1
+          }
+          Write-Host "Packaged binary installed at: $($exe.FullName)"
+
+      # The .app bundle is a directory and is already inside the DMG, so the
+      # DMG alone is uploaded for macOS.
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: commonspace-${{ matrix.os }}-pr
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage

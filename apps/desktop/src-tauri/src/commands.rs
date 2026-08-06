@@ -24,13 +24,13 @@ pub struct CommandError {
 }
 
 impl CommandError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             recovery: None,
         }
     }
-    fn with_recovery(message: impl Into<String>, recovery: impl Into<String>) -> Self {
+    pub(crate) fn with_recovery(message: impl Into<String>, recovery: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             recovery: Some(recovery.into()),
@@ -67,6 +67,9 @@ pub async fn list_connections(state: State<'_, AppState>) -> Result<Vec<Connecti
     for adapter in state.adapters() {
         let install = adapter.detect().await;
         let auth = adapter.auth_status().await;
+        // An explicit refresh is the freshest information there is; let
+        // task starts reuse it instead of probing again per message.
+        state.record_auth_status(adapter.id(), &auth);
         let instructions = adapter.auth_instructions();
         out.push(ConnectionInfo {
             provider: adapter.id(),
@@ -318,7 +321,9 @@ pub async fn start_task(
         )
     })?;
 
-    match adapter.auth_status().await {
+    // Served from a short-lived cache: probing spawns the provider CLI, and
+    // doing that for every message means seconds of extra latency per send.
+    match state.auth_status_cached(adapter).await {
         AuthStatus::Subscription { .. } | AuthStatus::ApiKey | AuthStatus::LocalModel => {}
         AuthStatus::NotInstalled => {
             return Err(CommandError::with_recovery(

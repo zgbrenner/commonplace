@@ -92,6 +92,7 @@ pub async fn probe_output(
     program: &Path,
     args: &[String],
     cwd: &Path,
+    envs: &[(String, String)],
     timeout: std::time::Duration,
 ) -> std::io::Result<(Option<i32>, String)> {
     let mut command = tokio::process::Command::new(program);
@@ -102,6 +103,9 @@ pub async fn probe_output(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    for (k, v) in envs {
+        command.env(k, v);
+    }
     #[cfg(windows)]
     {
         // 0x08000000 = CREATE_NO_WINDOW. Applied directly, with no wrapper

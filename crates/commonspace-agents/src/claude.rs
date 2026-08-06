@@ -30,6 +30,29 @@ use serde_json::{json, Value};
 
 const CLI: &str = "claude";
 
+/// Environment for every Claude Code invocation Commonspace makes.
+///
+/// A fresh `claude -p` is spawned per message, and each invocation runs the
+/// CLI's own background activity — most visibly its auto-updater, which
+/// spawns helper processes. Those helpers are outside Commonspace's process
+/// setup, and on Windows some of them briefly open console windows (a
+/// long-standing upstream Claude Code issue). They also add startup latency
+/// and network traffic to every message. Commonspace has no use for any of
+/// it — the app manages its own updates — so it is switched off with the
+/// CLI's documented environment variables.
+fn cli_quiet_env() -> Vec<(String, String)> {
+    vec![
+        // No background auto-update. Manual `claude update` still works.
+        ("DISABLE_AUTOUPDATER".into(), "1".into()),
+        // No telemetry or error-reporting traffic; nothing but the model
+        // traffic the task needs.
+        (
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(),
+            "1".into(),
+        ),
+    ]
+}
+
 /// Read-only Claude tools enabled in v1. Mutations go through Commonspace's
 /// MCP tools ("mcp__commonspace") instead of Write/Edit/Bash.
 const ALLOWED_TOOLS: &str = "Read,Glob,Grep,LS,TodoWrite,Task,mcp__commonspace";
@@ -49,7 +72,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
     }
 
     async fn detect(&self) -> InstallStatus {
-        probe_version(CLI).await
+        probe_version(CLI, &cli_quiet_env()).await
     }
 
     async fn auth_status(&self) -> AuthStatus {
@@ -62,9 +85,14 @@ impl AgentAdapter for ClaudeCodeAdapter {
         // Primary probe: the CLI's own non-destructive status command.
         let args = vec!["auth".to_string(), "status".to_string()];
         let cwd = std::env::temp_dir();
-        if let Ok((code, output)) =
-            crate::process::probe_output(&path, &args, &cwd, std::time::Duration::from_secs(20))
-                .await
+        if let Ok((code, output)) = crate::process::probe_output(
+            &path,
+            &args,
+            &cwd,
+            &cli_quiet_env(),
+            std::time::Duration::from_secs(20),
+        )
+        .await
         {
             if code == Some(0) {
                 // `claude auth status` emits JSON:
@@ -219,9 +247,11 @@ impl AgentAdapter for ClaudeCodeAdapter {
         };
 
         let mut cli =
-            spawn_cli(&path, &args, &request.cwd, &[]).map_err(|source| AdapterError::Spawn {
-                cli: "Claude Code",
-                source,
+            spawn_cli(&path, &args, &request.cwd, &cli_quiet_env()).map_err(|source| {
+                AdapterError::Spawn {
+                    cli: "Claude Code",
+                    source,
+                }
             })?;
 
         // The prompt goes via stdin as a stream-json user message; closing

@@ -1,0 +1,65 @@
+name: CodeQL
+
+# CodeQL complements the dependency audits in audit.yml: cargo-audit and
+# npm-audit flag known-vulnerable versions of things we depend on, while
+# CodeQL statically analyzes the code we wrote — injection, path traversal,
+# unsafe workflow expressions, and similar flaws that no advisory database
+# will ever list. Findings land in the repository's Security tab rather than
+# failing the build.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Thursdays, 06:30 UTC — deliberately away from audit.yml's Monday 07:00
+    # slot so the two scheduled runs stay distinguishable in the Actions log.
+    - cron: "30 6 * * 4"
+  workflow_dispatch:
+
+# A newer push supersedes an in-flight run of the same branch.
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # Required to upload analysis results to code scanning.
+  security-events: write
+  # Required by the CodeQL action to fetch workflow metadata and CodeQL packs.
+  actions: read
+  packages: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `build-mode: none` everywhere: CodeQL extracts all three languages
+          # without a build (Rust included, as of 2025), which keeps this
+          # workflow fast and free of the Tauri system-dependency setup that
+          # CI needs for a real compile.
+          - language: actions
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+          - language: rust
+            build-mode: none
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"

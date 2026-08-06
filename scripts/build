@@ -38,16 +38,16 @@ step_header "Installers"
 os="$(os_name)"
 case "${os}" in
   windows)
-    info "Windows installers: apps/desktop/src-tauri/target/release/bundle/nsis and .../bundle/msi"
+    info "Windows installers: target/release/bundle/nsis and .../bundle/msi"
     ;;
   macos)
-    info "macOS installers: apps/desktop/src-tauri/target/release/bundle/dmg and .../bundle/macos"
+    info "macOS installers: target/release/bundle/dmg and .../bundle/macos"
     ;;
   linux)
-    info "Linux installers: apps/desktop/src-tauri/target/release/bundle/deb, .../bundle/rpm, and .../bundle/appimage"
+    info "Linux installers: target/release/bundle/deb, .../bundle/rpm, and .../bundle/appimage"
     ;;
   *)
-    warn "Unrecognized OS; check apps/desktop/src-tauri/target/release/bundle/ for the produced artifacts."
+    warn "Unrecognized OS; check target/release/bundle/ for the produced artifacts."
     ;;
 esac
 info "Cross-compiling is not supported -- build each OS's installers on that OS."

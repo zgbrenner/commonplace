@@ -59,11 +59,33 @@ shipped binary, but no one has yet clicked through them:
   build; `crates/commonspace-agents/examples/console_probe.rs` reproduces
   both paths. The lesson generalises: a dev build is not evidence about a
   packaged one.
+
+  Console windows during a task were reported again even with that fix in
+  place. Everything Commonspace spawns is created hidden, but Claude Code
+  spawns processes of its own — most notably its background auto-updater,
+  which runs on every fresh `claude -p` invocation, i.e. once per message —
+  and those spawns flashing console windows on Windows is a long-standing
+  upstream Claude Code issue with no parent-side flag that reaches
+  grandchildren. Two mitigations shipped, neither yet verified by a human
+  on a packaged Windows build: the CLI's auto-updater and telemetry are
+  disabled for Commonspace's invocations via the CLI's documented
+  environment variables (`DISABLE_AUTOUPDATER`,
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`), and the per-message
+  `claude auth status` probe is gone — a recent "signed in" answer is now
+  cached instead of re-spawning the CLI before every task. If a console
+  still appears after this, it is coming from inside Claude Code and needs
+  an upstream fix.
 - Codex CLI task execution. The adapter's detection, auth probe, event
   normalization, and error path are verified live; a full task run was not,
   because the test account hit its usage limit during the verification pass.
 - Conversation history replay in the UI (`list_task_events` is implemented and
   tested at the storage layer; the UI does not yet call it on open).
+- Update checks in Settings. "Check for updates" asks the GitHub releases
+  API for the newest published release and either installs it in place
+  (signed releases, once signing is configured — see `docs/releasing.md`)
+  or opens the download page (today's unsigned releases). The Rust side is
+  unit-tested; nobody has clicked the button against a real newer release
+  yet.
 - Attachments. The composer collects paths and appends them to the prompt;
   they are not yet uploaded, previewed, or scope-checked separately.
 

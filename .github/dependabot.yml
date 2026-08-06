@@ -1,0 +1,36 @@
+# Dependabot keeps dependencies fresh so a solo maintainer does not have to.
+# Patch and minor updates are grouped into one PR per ecosystem, so the weekly
+# review effort stays small; major updates arrive as individual PRs because
+# each one deserves its own look at the changelog. Security updates are opened
+# by Dependabot as soon as an advisory lands, regardless of this schedule.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: npm
+    # The workspaces share a single root package-lock.json, so one entry at
+    # the root covers apps/desktop and packages/protocol too.
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
