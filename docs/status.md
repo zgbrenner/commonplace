@@ -78,16 +78,33 @@ shipped binary, but no one has yet clicked through them:
 - Codex CLI task execution. The adapter's detection, auth probe, event
   normalization, and error path are verified live; a full task run was not,
   because the test account hit its usage limit during the verification pass.
-- Conversation history replay in the UI (`list_task_events` is implemented and
-  tested at the storage layer; the UI does not yet call it on open).
+- Conversation history replay in the UI. Opening a conversation replays its
+  newest task's event stream through the same reducer the live path uses, so
+  the reopened view matches what was on screen; artifacts, undo, and the
+  provider session all survive. Covered by unit tests over completed, failed,
+  cancelled, permission-denied and interrupted tasks; the click-through is
+  unverified.
 - Update checks in Settings. "Check for updates" asks the GitHub releases
   API for the newest published release and either installs it in place
   (signed releases, once signing is configured — see `docs/releasing.md`)
   or opens the download page (today's unsigned releases). The Rust side is
   unit-tested; nobody has clicked the button against a real newer release
   yet.
-- Attachments. The composer collects paths and appends them to the prompt;
-  they are not yet uploaded, previewed, or scope-checked separately.
+- Attachments. Paths are canonicalized, recorded with size, modified time,
+  content hash and whether they sit inside the project, and disclosed to the
+  user before anything is sent. They are not yet previewed, and extraction
+  status is not tracked per attachment.
+- The knowledge-worker pass: the interface says "projects", the composer
+  hides the agent picker when there is only one agent and marks the
+  recommended one otherwise, conversation titles are derived from the prompt
+  and improved from a completed task's own summary (never overwriting a name
+  someone typed), the empty state offers jobs drawn from a bounded survey of
+  the project's folders, first run is a three-step screen, and progress is
+  one plain sentence with the step-by-step record under Details. Each piece
+  is unit-tested; none has been clicked through in a packaged build.
+- Desktop notifications when a task finishes. Off until turned on in
+  Settings, sent only when the window is not in front. The wording is
+  unit-tested; no one has yet seen one arrive from the operating system.
 
 ## Not started
 
