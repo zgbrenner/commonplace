@@ -149,14 +149,16 @@ cost and complexity of an embedding pipeline.
 `commonspace-documents` already does Markdown/text editing and DOCX/PDF work
 for the MVP (ARCHITECTURE.md, "Document tooling";
 [docs/document-tools.md](document-tools.md)); status.md lists
-formatting-preserving DOCX edits, XLSX, PPTX, OCR, and format conversion as
-not started. The order below is deliberate — it serves knowledge workers
-before it serves integrations, and it comes before adding new providers,
-local-model configuration, browser automation, arbitrary MCP servers,
-vector RAG, or multi-agent controls:
+formatting-preserving DOCX edits, PPTX, OCR, and format conversion as not
+started, and spreadsheet reading and creation as built and tested but not
+yet exercised by a human. The order below is deliberate — it serves
+knowledge workers before it serves integrations, and it comes before
+adding new providers, local-model configuration, browser automation,
+arbitrary MCP servers, vector RAG, or multi-agent controls:
 
 1. XLSX reading and polished spreadsheet creation, including formulas and
-   validation.
+   validation (in progress — see status.md for what is built and what is
+   still unverified).
 2. OCR for scans and image-only PDFs, with confidence scores and
    page-level provenance — not a black-box transcription.
 3. DOCX edits that preserve existing formatting instead of regenerating
