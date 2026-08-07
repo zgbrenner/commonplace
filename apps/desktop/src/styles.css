@@ -151,8 +151,34 @@ body {
  */
 @media (forced-colors: active) {
   .card,
-  .status-pill {
+  .status-pill,
+  .studio-row {
     border: 1px solid CanvasText;
+  }
+
+  /* A diff loses its two tinted backgrounds here, so the edge and the marker
+     glyph become the whole signal. Both are already there for colour-blind
+     readers; these rules just make sure the edge survives in the system's own
+     colour rather than in ours. */
+  .diff-line-added .diff-text,
+  .diff-line-removed .diff-text,
+  .diff-note {
+    border-left-color: CanvasText;
+  }
+
+  /* Word-level emphasis keeps its underline regardless, and picks up the
+     system's highlight pair so the changed words stay distinguishable inside
+     a line that is otherwise all one colour. */
+  .diff-word {
+    background: Mark;
+    color: MarkText;
+  }
+
+  /* A conflicted change is tinted and outlined in the danger colour, and both
+     go here. The weight of its edge is what is left to separate it from the
+     rows it must not be confused with. */
+  .studio-row-conflicted {
+    border: 2px solid CanvasText;
   }
 }
 
@@ -305,4 +331,138 @@ body {
   margin: 0.75rem 0;
   border: 0;
   border-top: 1px solid var(--color-line);
+}
+
+/*
+ * The Artifact Studio: proposed changes on one side, the comparison on the
+ * other.
+ *
+ * The split answers the width it is given rather than the window's, because
+ * the Studio is mounted in different places — a container query keeps the
+ * list above the comparison when it is narrow and puts them side by side when
+ * there is room, without either arrangement being a second design.
+ */
+.studio {
+  container-type: inline-size;
+}
+
+.studio-layout {
+  display: grid;
+  grid-template-rows: minmax(0, 18rem) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* The line between the two panes belongs to whichever edge they meet on. */
+.studio-list {
+  border-bottom: 1px solid var(--color-line);
+}
+
+@container (min-width: 52rem) {
+  .studio-layout {
+    grid-template-rows: minmax(0, 1fr);
+    grid-template-columns: minmax(17rem, 22rem) minmax(0, 1fr);
+  }
+
+  .studio-list {
+    border-bottom: 0;
+    border-right: 1px solid var(--color-line);
+  }
+}
+
+/*
+ * A staged-change comparison.
+ *
+ * The body font, not a monospace one: the files being compared are contracts
+ * and reports, and a reflowed paragraph is harder to read in a code column,
+ * not easier. Long lines wrap instead of running off the side for the same
+ * reason. Whitespace is preserved so an indent that changed is still visible.
+ *
+ * Colour is never alone: an added line carries a "+", a removed one a "−", a
+ * left edge, and a word for a screen reader; word-level emphasis is underlined
+ * as well as tinted.
+ */
+.diff-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.diff-hunk-heading {
+  padding: 0.3125rem 0.625rem;
+  text-align: left;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--color-ink-faint);
+  background: var(--color-surface-sunken);
+  border-top: 1px solid var(--color-line);
+  border-bottom: 1px solid var(--color-line);
+}
+.diff-table tbody:first-of-type .diff-hunk-heading {
+  border-top: 0;
+}
+
+.diff-num {
+  width: 1%;
+  padding: 0.0625rem 0.375rem;
+  text-align: right;
+  vertical-align: top;
+  white-space: nowrap;
+  font-size: 0.6875rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-ink-faint);
+  /* Line numbers are scaffolding — copying a passage should not pick them up. */
+  user-select: none;
+}
+
+.diff-text {
+  width: 100%;
+  padding: 0.0625rem 0.625rem 0.0625rem 0.25rem;
+  vertical-align: top;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-left: 3px solid transparent;
+}
+
+.diff-marker {
+  display: inline-block;
+  width: 1ch;
+  margin-right: 0.5rem;
+  color: var(--color-ink-faint);
+  user-select: none;
+}
+
+.diff-line-added .diff-text {
+  background: var(--color-ok-soft);
+  border-left-color: var(--color-ok);
+}
+.diff-line-added .diff-marker {
+  color: var(--color-ok);
+}
+
+.diff-line-removed .diff-text {
+  background: var(--color-danger-soft);
+  border-left-color: var(--color-danger);
+}
+.diff-line-removed .diff-marker {
+  color: var(--color-danger);
+}
+
+/* <mark> arrives with a browser yellow that belongs to no theme here. */
+.diff-word {
+  background: transparent;
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 0.0625rem;
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 2px;
+}
+.diff-line-added .diff-word {
+  background: color-mix(in oklab, var(--color-ok) 28%, transparent);
+}
+.diff-line-removed .diff-word {
+  background: color-mix(in oklab, var(--color-danger) 28%, transparent);
 }

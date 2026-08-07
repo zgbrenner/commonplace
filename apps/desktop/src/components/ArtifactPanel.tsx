@@ -1,22 +1,51 @@
 import { useEffect, useRef, useState } from "react";
 import type { Artifact, ArtifactKind, OperationResult } from "@commonspace/protocol";
 import { formatDateTime } from "../lib/format";
+import { pendingNotice } from "../lib/staging";
 import { Button, Card, PanelHeading, StatusPill } from "./primitives";
 
-interface ArtifactPanelProps {
+export interface ArtifactPanelProps {
+  /** Files that are already real: created or changed on disk. */
   artifacts: Artifact[];
+  /**
+   * How many proposed changes are still waiting in the Artifact Studio, if
+   * any. Proposals are not files yet, so they are never listed here — the
+   * panel only points at them.
+   */
+  pendingCount?: number | undefined;
+  /** Opens the Studio. Without it the pending notice is only a statement. */
+  onReviewPending?: (() => void) | undefined;
   onOpen: (artifact: Artifact) => void;
   onReveal: (artifact: Artifact) => void;
   onUndo: (artifact: Artifact) => Promise<OperationResult>;
 }
 
-/** The right-hand panel: what the task produced or changed. */
-export function ArtifactPanel({ artifacts, onOpen, onReveal, onUndo }: ArtifactPanelProps) {
+/**
+ * The right-hand panel: files the task has actually written.
+ *
+ * Its counterpart is the Artifact Studio, which holds changes that have been
+ * proposed and not yet applied. The two stay separate on purpose — everything
+ * in this panel exists on disk and can be opened, shown in a folder, or
+ * undone, and none of that is true of a proposal. Mixing them would put "this
+ * is your file" and "this might become your file" in one list.
+ */
+export function ArtifactPanel({
+  artifacts,
+  pendingCount = 0,
+  onReviewPending,
+  onOpen,
+  onReveal,
+  onUndo,
+}: ArtifactPanelProps) {
   return (
     <aside
       aria-label="Files"
       className="flex w-80 shrink-0 flex-col border-l border-[var(--color-line)] bg-[var(--color-surface-sunken)]"
     >
+      {pendingCount > 0 ? (
+        <PendingNotice count={pendingCount} onReview={onReviewPending} />
+      ) : null}
+
       <PanelHeading>Files</PanelHeading>
       {artifacts.length === 0 ? (
         <p className="px-4 pb-4 text-sm text-[var(--color-ink-faint)]">
@@ -37,6 +66,34 @@ export function ArtifactPanel({ artifacts, onOpen, onReveal, onUndo }: ArtifactP
         </ul>
       )}
     </aside>
+  );
+}
+
+/**
+ * Proposals waiting in the Studio, announced here because this panel is where
+ * a person looks for "what happened to my files" — and the honest answer,
+ * while changes are staged, is "nothing yet, and here is where to decide".
+ */
+function PendingNotice({ count, onReview }: { count: number; onReview: (() => void) | undefined }) {
+  const line = pendingNotice(count);
+  if (!line) return null;
+  return (
+    <div className="border-b border-[var(--color-line)] px-4 py-3">
+      <p className="text-sm text-[var(--color-ink)]">
+        <span aria-hidden="true" className="mr-1.5 text-[var(--color-warn)]">
+          ●
+        </span>
+        {line}
+      </p>
+      <p className="mt-0.5 text-xs text-[var(--color-ink-faint)]">
+        They have not touched your files.
+      </p>
+      {onReview ? (
+        <Button size="sm" variant="primary" className="mt-2" onClick={onReview}>
+          Review changes
+        </Button>
+      ) : null}
+    </div>
   );
 }
 
