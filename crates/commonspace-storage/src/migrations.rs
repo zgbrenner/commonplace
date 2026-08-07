@@ -16,6 +16,7 @@ const MIGRATIONS: &[&str] = &[
     V5_HISTORY_FTS_PREFIX,
     V6_SKILL_PROVENANCE,
     V7_BACKUPS,
+    V8_STAGED_CHANGES,
 ];
 
 /// Apply all pending migrations inside transactions.
@@ -465,6 +466,42 @@ WHERE json_valid(f.op_json)
   AND json_extract(f.op_json, '$.source') IS NOT NULL;
 "#;
 
+/// V8: proposed filesystem changes an agent has produced but not yet applied
+/// — the record the staging filesystem needs to survive a restart, so
+/// someone who closes the app with work pending finds it again on the next
+/// launch instead of losing it.
+///
+/// Rows are never deleted on resolution: `applied_at` and `discarded_at`
+/// record a change's fate instead of the row disappearing, because the
+/// Changes view wants to show what was applied and a vanished row cannot be
+/// audited. The index matches the one read the staging panel always does —
+/// one task's set, in the order it was proposed.
+///
+/// `commonspace_documents::staging`, which will own the authoritative
+/// `StagedChange` type, was still unwritten when this migration was added —
+/// there was no type on disk to build against. The columns below match its
+/// documented shape field for field, so adopting the real type later is a
+/// storage-layer conversion, not a schema change.
+const V8_STAGED_CHANGES: &str = r#"
+CREATE TABLE staged_changes (
+    id             TEXT PRIMARY KEY,
+    task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    kind           TEXT NOT NULL CHECK (kind IN
+                       ('create','modify','rename','move','delete')),
+    target         TEXT NOT NULL,
+    destination    TEXT,
+    staged_content TEXT,
+    hash_before    TEXT,
+    hash_after     TEXT,
+    size_after     INTEGER,
+    summary        TEXT NOT NULL,
+    staged_at      TEXT NOT NULL,
+    applied_at     TEXT,
+    discarded_at   TEXT
+) STRICT;
+CREATE INDEX idx_staged_changes_task ON staged_changes(task_id, staged_at);
+"#;
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -476,7 +513,7 @@ mod tests {
     /// it with nothing to justify the change — which is the whole point, since
     /// an edited migration leaves `user_version` untouched and every other
     /// check happy.
-    const SCHEMA_FINGERPRINT: &str = "bd27913fa0494099";
+    const SCHEMA_FINGERPRINT: &str = "b4fd0c9666c17a39";
 
     /// A stable digest of every schema object's type, name and DDL. Whitespace
     /// inside the DDL is collapsed so re-indenting a migration string is not
@@ -686,5 +723,61 @@ mod tests {
         conn.execute("DELETE FROM conversations WHERE id = 'conv_1'", [])
             .unwrap();
         assert_eq!(count(&conn), 0);
+    }
+
+    #[test]
+    fn v7_database_upgrades_to_v8_with_existing_rows_intact() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // Freeze a populated database at v7 — the state an install that
+        // predates staged changes is in.
+        migrate_to(&mut conn, 7).unwrap();
+        conn.execute_batch(
+            "INSERT INTO conversations (id, title, created_at, updated_at)
+             VALUES ('conv_1', 'Old conversation',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO tasks (id, conversation_id, provider, state, prompt,
+                                created_at, updated_at)
+             VALUES ('task_1', 'conv_1', 'claude_code', 'completed', 'p',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        let missing: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'staged_changes'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(missing, 0, "staged_changes must not exist at v7");
+
+        migrate_to(&mut conn, 8).unwrap();
+
+        // The table exists and works against the row that predates it.
+        conn.execute(
+            "INSERT INTO staged_changes
+             (id, task_id, kind, target, summary, staged_at)
+             VALUES ('staged_1', 'task_1', 'create', '/ws/new.txt', 'Created new.txt',
+                     '2026-01-02T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM conversations WHERE id = 'conv_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "Old conversation", "the pre-existing row survived");
+
+        // Cascade delete on the task's parent conversation still reaches the
+        // new table through the task.
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute("DELETE FROM conversations WHERE id = 'conv_1'", [])
+            .unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT count(*) FROM staged_changes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 }
