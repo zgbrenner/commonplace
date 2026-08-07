@@ -14,6 +14,7 @@ pub mod fsops;
 pub mod inspect;
 pub mod journal;
 pub mod office;
+pub mod sheets;
 pub mod textio;
 
 pub use backup::BackupStore;
@@ -21,3 +22,7 @@ pub use fsops::{FsToolError, SafeFs};
 pub use inspect::{DirEntryInfo, DirListing};
 pub use journal::{FileOpKind, FileOperation};
 pub use office::{DocBlock, DocumentError, ExtractedDocument};
+pub use sheets::{
+    create_xlsx, read_spreadsheet, CellValue, ColumnFormat, NewColumn, NewSheet, ReadLimits, Sheet,
+    Workbook,
+};
