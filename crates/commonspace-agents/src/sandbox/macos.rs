@@ -499,6 +499,12 @@ mod tests {
         }
     }
 
+    /// Unix only. Not because the behaviour is unix-specific — a Windows
+    /// junction would exercise the same code — but because creating a
+    /// symlink on Windows needs Developer Mode or an elevated process, so
+    /// this would be testing the runner's privileges rather than the
+    /// profile. Linux CI proves the logic; macOS is where it matters.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_workspace_root_reaches_the_profile_in_its_resolved_form() {
         // The bug this guards: Seatbelt matches `subpath` against the path
@@ -511,7 +517,6 @@ mod tests {
         let link = base.join("link");
         std::fs::create_dir_all(&real).expect("create the real directory");
         let _ = std::fs::remove_file(&link);
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&real, &link).expect("create the symlink");
 
         let text = profile(&policy(&[&link.to_string_lossy()], &[]));
