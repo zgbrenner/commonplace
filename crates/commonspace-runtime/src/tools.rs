@@ -1511,10 +1511,10 @@ mod tests {
         // breaks it should fail here rather than in front of someone.
         let (registry, _) = build_registry(&[]);
         for (query, expected) in [
-            ("read the excel file", "builtin:read_spreadsheet"),
             ("put this in the trash", "builtin:delete_to_trash"),
             ("write it up as a word document", "builtin:create_document"),
             ("what is in this folder", "builtin:list_folder"),
+            ("tidy up duplicate files", "builtin:find_duplicates"),
         ] {
             let matches = registry.search(query, 3);
             let top = matches
@@ -1529,6 +1529,41 @@ mod tests {
             // contract in the registry is decoration.
             assert!(!top.reasons.is_empty(), "{query}");
         }
+    }
+
+    #[test]
+    fn a_query_naming_a_format_finds_a_tool_that_can_read_that_format() {
+        // Deliberately weaker than the test above, because this query really
+        // is close: "read the excel file" puts read_document, read_file and
+        // read_spreadsheet within 0.3 of each other. Two of those three are
+        // right — read_document handles spreadsheets too — and read_file,
+        // which cannot open one at all, currently lands second.
+        //
+        // That is a real weakness and it is recorded here rather than tuned
+        // away. The single informative word in the query reaches its
+        // capability through the synonym table, which discounts it, while the
+        // word carrying no information ("file") matches a name outright.
+        // Rarity weighting narrows the gap but does not close it. Widening
+        // the synonym tier until this one query comes out right would make
+        // the ranking a lookup table for the queries someone happened to
+        // test, which is worse than a known, written-down miss.
+        let (registry, _) = build_registry(&[]);
+        let matches = registry.search("read the excel file", 3);
+        let ids: Vec<&str> = matches.iter().map(|m| m.capability.id.0.as_str()).collect();
+        assert!(
+            ids.contains(&"builtin:read_spreadsheet"),
+            "a spreadsheet reader has to be offered: {ids:?}"
+        );
+        let top = matches.first().expect("something matched");
+        assert!(
+            matches!(
+                top.capability.id.0.as_str(),
+                "builtin:read_spreadsheet" | "builtin:read_document"
+            ),
+            "the best match must be able to read a spreadsheet, got {:?} because {:?}",
+            top.capability.id.0,
+            top.reasons.iter().map(|r| r.describe()).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

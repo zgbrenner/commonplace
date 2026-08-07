@@ -143,6 +143,11 @@ const SYNONYMS: &[(&str, &[&str])] = &[
     ("email", &["mail", "message"]),
     ("make", &["create", "new", "generate"]),
     ("build", &["create", "generate"]),
+    // "write it up as a document" is how a person asks for one to be made.
+    // Without this row, "write" reaches only the capabilities whose prose
+    // happens to contain the word — which includes the *reading* tools,
+    // because their descriptions say what they do not write.
+    ("write", &["create", "save"]),
     ("open", &["read", "load"]),
     ("edit", &["write", "update"]),
     ("find", &["search", "list"]),
@@ -177,16 +182,25 @@ pub fn search<'a>(
         return Vec::new();
     }
 
-    let mut matches: Vec<Match> = capabilities
-        .filter_map(|capability| {
-            let indexed = Indexed::of(capability);
+    // Two passes, so the second one knows how discriminating each word was.
+    // The iterator has to be collected for that, which is the price of
+    // rarity weighting and is paid once per search over a registry of tens.
+    let indexed: Vec<(&Capability, Indexed)> = capabilities
+        .map(|capability| (capability, Indexed::of(capability)))
+        .collect();
+    let rarity = Rarity::over(&terms, &indexed);
+
+    let mut matches: Vec<Match> = indexed
+        .iter()
+        .filter_map(|(capability, fields)| {
             // One reason per distinct term is how "matched three of your four
             // words" beats "matched one word five times": a repeat buys
             // nothing, because the second occurrence has no term of its own
             // to score against. Breadth is the only thing that accumulates.
             let mut reasons: Vec<Reason> = terms
                 .iter()
-                .filter_map(|term| evidence(term, &indexed))
+                .filter_map(|term| evidence(term, fields))
+                .map(|reason| rarity.scale(&reason))
                 .collect();
             if reasons.is_empty() {
                 return None;
@@ -200,7 +214,7 @@ pub fn search<'a>(
             // bit rather than to some tolerance.
             let score: f32 = reasons.iter().map(Reason::weight).sum();
             Some(Match {
-                capability: capability.clone(),
+                capability: (*capability).clone(),
                 score,
                 reasons,
             })
@@ -294,6 +308,123 @@ impl Field {
             }
         }
         None
+    }
+}
+
+/// How much each query term is worth, given how many capabilities it reaches.
+///
+/// Without this, "read the excel file" ranks `read_file` above
+/// `read_spreadsheet`: "file" is in almost every tool's name or description
+/// and "excel" is in none of them, yet "file" landing in a name scored full
+/// marks while "excel" reaching "spreadsheet" through the synonym table
+/// scored a fraction of one. The word carrying all the information lost to
+/// the word carrying none.
+///
+/// So a term's weight is scaled by how *few* capabilities it reaches. This is
+/// the standard inverse-document-frequency idea and it is applied the
+/// standard way rather than as an invented curve, but with one deliberate
+/// difference: document frequency here counts the capabilities a term
+/// *matched by any route*, not the ones whose text literally contains it.
+/// That is forced rather than chosen — "excel" appears nowhere in
+/// Commonspace's tool text at all, so its literal frequency is zero and every
+/// idf formula is undefined there. Counting matches makes the quantity mean
+/// "how many candidates does this word fail to separate", which is the thing
+/// actually worth knowing, and it reuses the matcher instead of inventing a
+/// second notion of "contains".
+///
+/// The score stays exactly the sum of the printed reasons, because scaling
+/// happens to each reason's own weight before anything is summed.
+struct Rarity {
+    /// Multiplier per query term, keyed by stem.
+    weights: std::collections::HashMap<String, f32>,
+}
+
+/// What rarity may do to a weight.
+///
+/// A term reaching one capability out of many is the strongest signal a query
+/// can carry, and doubling it lets that word overturn a rival that matched a
+/// commoner word in a stronger field — which is the whole point — without
+/// letting one word decide a four-word query on its own.
+///
+/// The floor is a quarter rather than zero because a word every capability
+/// matches is uninformative, not false: "file" in "read the excel file" is
+/// still evidence the person wants a file tool, it just cannot say which one.
+/// Zero would also print reasons weighing nothing, which reads as a bug to
+/// anyone looking at the explanation.
+///
+/// Together they bound the damage: the widest inversion this permits is a
+/// maximally rare hit in the summary beating a maximally common hit in the
+/// name, a factor of four. Anything wider and rarity would be deciding
+/// results that the fields should decide.
+const RARITY_FLOOR: f32 = 0.25;
+const RARITY_CEILING: f32 = 2.0;
+
+impl Rarity {
+    fn over(terms: &[Term], indexed: &[(&Capability, Indexed)]) -> Self {
+        let total = indexed.len() as f32;
+        let mut weights = std::collections::HashMap::new();
+        for term in terms {
+            let hits = indexed
+                .iter()
+                .filter(|(_, fields)| evidence(term, fields).is_some())
+                .count() as f32;
+            weights.insert(term.stem.clone(), Self::multiplier(hits, total));
+        }
+        Self { weights }
+    }
+
+    /// Probabilistic idf, smoothed so it can never go negative, then mapped
+    /// onto [`RARITY_FLOOR`]..[`RARITY_CEILING`] by its value at the rarest
+    /// possible term. Normalizing against `df = 1` rather than a constant
+    /// keeps the band meaning the same thing as the registry grows.
+    fn multiplier(hits: f32, total: f32) -> f32 {
+        if total <= 1.0 || hits <= 0.0 {
+            // Nothing to discriminate between, or a term that matched
+            // nothing and will not produce a reason anyway.
+            return 1.0;
+        }
+        let idf = |df: f32| ((total - df + 0.5) / (df + 0.5) + 1.0).ln();
+        let rarest = idf(1.0);
+        let share = if rarest > 0.0 {
+            idf(hits) / rarest
+        } else {
+            1.0
+        };
+        RARITY_FLOOR + share.clamp(0.0, 1.0) * (RARITY_CEILING - RARITY_FLOOR)
+    }
+
+    /// Rescales one reason's weight in place.
+    fn scale(&self, reason: &Reason) -> Reason {
+        let factor = |term: &str| {
+            self.weights
+                .get(&stem(term))
+                .copied()
+                .or_else(|| self.weights.get(term).copied())
+                .unwrap_or(1.0)
+        };
+        match reason {
+            Reason::NameMatch { term, weight } => Reason::NameMatch {
+                weight: weight * factor(term),
+                term: term.clone(),
+            },
+            Reason::KeywordMatch { term, weight } => Reason::KeywordMatch {
+                weight: weight * factor(term),
+                term: term.clone(),
+            },
+            Reason::SummaryMatch { term, weight } => Reason::SummaryMatch {
+                weight: weight * factor(term),
+                term: term.clone(),
+            },
+            Reason::RelatedMatch {
+                term,
+                matched,
+                weight,
+            } => Reason::RelatedMatch {
+                weight: weight * factor(term),
+                term: term.clone(),
+                matched: matched.clone(),
+            },
+        }
     }
 }
 
@@ -796,8 +927,15 @@ mod tests {
         let second = search(caps.iter(), "deck", 10);
         assert_eq!(first, second);
 
+        // Tied, which is the precondition this test needs — not any
+        // particular number. The absolute score depends on how rare "deck"
+        // is across these three, which is exactly the kind of thing that
+        // should be free to change without a determinism test noticing.
         let scores: Vec<f32> = first.iter().map(|m| m.score).collect();
-        assert_eq!(scores, [NAME_WEIGHT, NAME_WEIGHT, NAME_WEIGHT]);
+        assert!(
+            scores.windows(2).all(|pair| pair[0] == pair[1]),
+            "the candidates were meant to tie: {scores:?}"
+        );
         let ids: Vec<&str> = first.iter().map(|m| m.capability.id.0.as_str()).collect();
         assert_eq!(
             ids,
