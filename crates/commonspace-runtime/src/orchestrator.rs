@@ -196,6 +196,18 @@ pub struct Orchestrator {
     /// user's own folders would be a place their files could appear without
     /// them having asked for it.
     staging_root: PathBuf,
+    /// Where a user's own skills live: skill directories Commonspace manages,
+    /// under its data directory rather than in anyone else's namespace.
+    ///
+    /// Commonspace reads the portable Agent Skills format, but deliberately
+    /// does not auto-load `.claude/skills` out of a project folder. A skill is
+    /// instructions the model will follow, and a repository someone cloned is
+    /// not a place to pick those up silently — the same reason Commonspace
+    /// passes `--setting-sources user` to the provider CLI instead of letting
+    /// a checked-in settings file configure the run. A project's own skills
+    /// live at `<workspace>/.commonspace/skills`, which is somewhere a person
+    /// had to deliberately put them.
+    skills_root: PathBuf,
     policy_settings: PolicySettings,
     /// Tasks holding in `AwaitingApproval`, keyed by task. In-memory only:
     /// after a restart the sessions are gone, and crash recovery fails these
@@ -215,9 +227,23 @@ impl Orchestrator {
             broker: PermissionBroker::new(),
             backup_root: data_dir.join("backups"),
             staging_root: data_dir.join("staged"),
+            skills_root: data_dir.join("skills"),
             policy_settings: PolicySettings::default(),
             pending: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Where to look for skills, in precedence order: the user's own first,
+    /// then each workspace root's `.commonspace/skills`, so a project can
+    /// deliberately override a personal skill of the same name.
+    fn skill_roots(&self, workspace_roots: &[PathBuf]) -> Vec<PathBuf> {
+        let mut roots = vec![self.skills_root.clone()];
+        roots.extend(
+            workspace_roots
+                .iter()
+                .map(|root| root.join(".commonspace").join("skills")),
+        );
+        roots
     }
 
     pub fn broker(&self) -> &PermissionBroker {
@@ -276,7 +302,13 @@ impl Orchestrator {
             .transition_task(&task.id, TaskState::Planning)?;
 
         let control = TaskControl::default();
-        let prompt = planning_prompt(&request.prompt);
+        // The planning session gets no MCP endpoint, so it cannot search the
+        // registry — which would leave it planning as though the person had
+        // installed nothing. Skills are named here instead, at the cost the
+        // format is designed around: a line each. Without this, a plan can
+        // reinvent, badly, work a skill already describes how to do.
+        let (registry, _) = crate::tools::build_registry(&self.skill_roots(&roots));
+        let prompt = planning_prompt(&request.prompt, &registry);
         let resume = request.resume.clone();
         self.start_planning_session(PlanPhase {
             adapter,
@@ -511,6 +543,19 @@ impl Orchestrator {
         // unreviewed changes with it rather than leaving them for the next
         // task to inherit.
         let staging = StagingStore::new(self.staging_root.join(task_id.as_ref()));
+        // Built per task, not cached: a skill the person just installed
+        // should be there for the next thing they ask, without restarting.
+        // A dozen tool descriptors and a handful of small Markdown files is
+        // not a cost worth a cache-invalidation bug.
+        let (capabilities, skill_report) = crate::tools::build_registry(&self.skill_roots(&roots));
+        if !skill_report.skipped.is_empty() {
+            // Surfaced, not swallowed. A skill that quietly does not exist is
+            // the most confusing failure this feature can have, and the user
+            // is the only one who can fix the file.
+            let _ = events.send(AgentEvent::Warning {
+                message: skills_skipped_message(&skill_report),
+            });
+        }
         let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
         let context = Arc::new(ToolContext {
             task_id: task_id.clone(),
@@ -520,6 +565,7 @@ impl Orchestrator {
             broker: self.broker.clone(),
             events: events.clone(),
             journal: journal_tx,
+            capabilities: Arc::new(capabilities),
         });
         let tool_server = ToolServer::start(context).await?;
 
@@ -882,13 +928,14 @@ impl Orchestrator {
 
 /// The instruction wrapper around the user's request for the planning
 /// session. Kept in one place so tests can assert against the exact text.
-fn planning_prompt(user_request: &str) -> String {
+fn planning_prompt(user_request: &str, registry: &commonspace_capabilities::Registry) -> String {
     format!(
         "Before doing any work, write a short plan for the request below.\n\
          \n\
          You may investigate first — reading files and listing folders is fine — but do not \
          create, modify, move, or delete anything, and do not contact any external service \
          while planning.\n\
+         {}\
          \n\
          The request:\n\
          {user_request}\n\
@@ -907,8 +954,46 @@ fn planning_prompt(user_request: &str) -> String {
          delete anything, or contact anything beyond the model itself.\n\
          - Keep it to at most 6 steps, in plain language a non-technical person understands.\n\
          - \"detail\" is optional; leave it out when the title says enough.\n\
-         - Do not use markdown inside the JSON strings."
+         - Do not use markdown inside the JSON strings.",
+        installed_skills_note(registry)
     )
+}
+
+/// Names the skills this person has installed, for the planning prompt.
+///
+/// Level one of the format's own disclosure model: a name and a description
+/// each, and nothing else, until something actually needs the instructions.
+/// Capped, because a person with fifty skills should not have the planning
+/// prompt turn into a catalogue — the cap is stated in the prompt rather
+/// than hidden, so a plan built from a truncated list says so.
+fn installed_skills_note(registry: &commonspace_capabilities::Registry) -> String {
+    const SHOWN: usize = 20;
+    let skills: Vec<_> = registry
+        .capabilities()
+        .filter(|c| c.kind == commonspace_capabilities::CapabilityKind::Skill)
+        .collect();
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut note = String::from(
+        "\nThis person has installed skills — written instructions for particular kinds of \
+         work. If one of these fits the request, plan to use it, and say so in the step that \
+         does. Once the plan is approved you can read a skill in full with `load_capability`.\n",
+    );
+    for skill in skills.iter().take(SHOWN) {
+        note.push_str(&format!(
+            "- {} ({}): {}\n",
+            skill.name, skill.id, skill.summary
+        ));
+    }
+    if skills.len() > SHOWN {
+        note.push_str(&format!(
+            "…and {} more, which you can find with `search_capabilities` once the plan is \
+             approved.\n",
+            skills.len() - SHOWN
+        ));
+    }
+    note
 }
 
 /// Sent when the execution phase resumes the planning session.
@@ -1099,6 +1184,27 @@ fn preview_of(store: &StagingStore, change: &StagedChange) -> commonspace_docume
     text_diff(&old_text, &new_text, budget)
 }
 
+/// What to tell someone when a skill they installed did not load.
+///
+/// Names the file rather than the count. "1 skill was skipped" sends a person
+/// looking; the path and the reason let them go and fix it.
+fn skills_skipped_message(report: &commonspace_capabilities::LoadReport) -> String {
+    const SHOWN: usize = 3;
+    let mut lines: Vec<String> = report
+        .skipped
+        .iter()
+        .take(SHOWN)
+        .map(|error| error.to_string())
+        .collect();
+    if report.skipped.len() > SHOWN {
+        lines.push(format!("…and {} more.", report.skipped.len() - SHOWN));
+    }
+    format!(
+        "Some skills could not be used, so they are not available in this task:\n{}",
+        lines.join("\n")
+    )
+}
+
 /// The file a proposal is about, named the way a person would name it.
 fn display_target(change: &StagedChange) -> String {
     change
@@ -1114,6 +1220,10 @@ mod tests {
     use super::*;
     use commonspace_agents::adapter::{AuthInstructions, EventSink, RunningSession};
     use commonspace_agents::AdapterError;
+    #[allow(unused_imports)]
+    use commonspace_capabilities::{
+        Capability, CapabilityId, CapabilityKind, CapabilitySource, LoadedCapability, Registry,
+    };
     use commonspace_core::{
         AdapterCapabilities, AuthStatus, HealthReport, InstallStatus, MessageId, OperationClass,
         RiskLevel, SessionId,
@@ -1133,6 +1243,73 @@ mod tests {
             .expect("workspace row");
         let orchestrator = Orchestrator::new(Arc::clone(&storage), tmp.path().to_path_buf());
         (tmp, orchestrator, workspace.id, ws_dir)
+    }
+
+    fn skill(name: &str) -> (Capability, LoadedCapability) {
+        (
+            Capability {
+                id: CapabilityId::new("skill", name),
+                kind: CapabilityKind::Skill,
+                name: name.to_string(),
+                summary: format!("Does the {name} thing."),
+                keywords: vec![],
+                source: CapabilitySource::File {
+                    path: PathBuf::from(format!("/skills/{name}/SKILL.md")),
+                },
+            },
+            LoadedCapability::Instructions {
+                body: "...".into(),
+                bundled: vec![],
+                requires: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn a_plan_is_told_which_skills_exist_since_it_cannot_search_for_them() {
+        let mut registry = Registry::new();
+        let (capability, loaded) = skill("quarterly-deck");
+        registry.insert(capability, loaded);
+
+        let prompt = planning_prompt("make the Q3 deck", &registry);
+        assert!(prompt.contains("quarterly-deck"), "{prompt}");
+        assert!(prompt.contains("skill:quarterly-deck"), "{prompt}");
+        assert!(
+            prompt.contains("Does the quarterly-deck thing."),
+            "{prompt}"
+        );
+        // The request itself must survive intact alongside the note.
+        assert!(prompt.contains("make the Q3 deck"), "{prompt}");
+    }
+
+    #[test]
+    fn a_plan_with_no_skills_installed_says_nothing_about_skills() {
+        let prompt = planning_prompt("tidy the invoices folder", &Registry::new());
+        assert!(!prompt.to_lowercase().contains("skill"), "{prompt}");
+    }
+
+    #[test]
+    fn built_in_tools_are_not_listed_as_skills_in_the_plan() {
+        // The registry holds the built-in tools too. Naming them here would
+        // spend the planning prompt describing what the agent already has.
+        let (registry, _) = crate::tools::build_registry(&[]);
+        assert!(registry.len() > 5, "the built-ins should be registered");
+        let prompt = planning_prompt("read the contract", &registry);
+        assert!(!prompt.contains("builtin:"), "{prompt}");
+    }
+
+    #[test]
+    fn a_long_skill_list_is_capped_and_says_that_it_was() {
+        let mut registry = Registry::new();
+        for i in 0..25 {
+            let (capability, loaded) = skill(&format!("skill-{i:02}"));
+            registry.insert(capability, loaded);
+        }
+        let prompt = planning_prompt("do a thing", &registry);
+        assert!(prompt.contains("skill-00"), "{prompt}");
+        assert!(!prompt.contains("skill-24"), "{prompt}");
+        // A plan built from a truncated list has to be able to say so.
+        assert!(prompt.contains("and 5 more"), "{prompt}");
     }
 
     #[test]

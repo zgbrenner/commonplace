@@ -785,6 +785,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "commonspace-capabilities"
+version = "0.1.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
 name = "commonspace-core"
 version = "0.1.1"
 dependencies = [
@@ -881,6 +892,7 @@ dependencies = [
  "axum",
  "chrono",
  "commonspace-agents",
+ "commonspace-capabilities",
  "commonspace-core",
  "commonspace-documents",
  "commonspace-permissions",

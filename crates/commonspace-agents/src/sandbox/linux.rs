@@ -293,7 +293,7 @@ fn build(policy: &SandboxPolicy) -> Result<RulesetCreated, RulesetError> {
         ))?
         .add_rules(path_beneath_rules(["/dev"], device_access(abi)))?
         .add_rules(path_beneath_rules(
-            readable_roots(policy),
+            &policy.readable,
             AccessFs::from_read(abi),
         ))?
         .add_rules(path_beneath_rules(
@@ -302,12 +302,13 @@ fn build(policy: &SandboxPolicy) -> Result<RulesetCreated, RulesetError> {
         ))
 }
 
-/// Everything the child may read but not write.
-fn readable_roots(policy: &SandboxPolicy) -> Vec<PathBuf> {
-    policy.readable.clone()
-}
-
 /// Everything the child may write, which is also everything it may read.
+///
+/// The last few are a floor rather than a policy: a caller composing a
+/// `SandboxPolicy` by hand still gets a child that can start and resume, and
+/// [`SandboxPolicy::for_session`] naming the same paths costs nothing but a
+/// duplicate rule. The rule that the boundary must not break legitimate work
+/// is held here, where the boundary is, rather than being trusted upwards.
 fn writable_roots(policy: &SandboxPolicy) -> Vec<PathBuf> {
     let mut roots = policy.writable.clone();
     // The session settings file — the one carrying the MCP bearer token — is
@@ -340,12 +341,20 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    //! [`Prepared::apply`] is never called on a test thread. Landlock confines
+    //! the caller for the rest of that thread's life, so a test that confined
+    //! itself would poison the harness thread it was handed. Enforcement is
+    //! proved in a child process instead, at the bottom of this module.
+    //!
+    //! Everything else here — [`probe`], [`prepare`], [`build`] — is expected
+    //! to leave the caller untouched, and several tests read a file afterwards
+    //! to say so out loud rather than assume it.
+
     use super::*;
     use std::path::Path;
 
-    /// The crate's own manifest: a real file, outside every hierarchy this
-    /// module grants, so being able to read it proves nothing has confined
-    /// the test process.
+    /// The crate's own manifest: a real file the shipped ruleset does not name,
+    /// so reading it after a call proves that call confined nothing.
     const OUTSIDE_EVERY_POLICY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
 
     /// A policy shaped like a real one, over paths that exist.
@@ -356,10 +365,6 @@ mod tests {
         }
     }
 
-    /// `apply()` is never called on a test thread. Landlock confines the
-    /// caller for the rest of its life, and libtest reuses the harness thread
-    /// for reporting; a test that confined itself would take the run down
-    /// with it. Enforcement is proved in a child process instead, below.
     #[test]
     fn probe_reports_without_confining_the_caller() {
         let containment = probe();

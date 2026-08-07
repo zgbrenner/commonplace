@@ -60,7 +60,101 @@ const SYSTEM_READ_PATHS: &[&str] = &[
     "/dev",
     "/opt/homebrew",
     "/usr/local",
+    // `/bin/sh` re-execs itself as bash, dash or zsh according to this
+    // symlink — see sh(1). Nix grants it explicitly for the same reason
+    // ("This is used by /bin/sh on macOS 10.15 and later"), and a shell that
+    // cannot resolve it cannot start.
+    "/private/var/select",
+    "/var/select",
 ];
+
+/// Paths the dynamic linker must be able to *map executable*, which is a
+/// separate SBPL operation from reading: `file-read*` is a glob over the read
+/// operations and never covers it.
+///
+/// Every profile that wants both spells out both — Chromium copies its
+/// cryptex block verbatim from Apple's own `dyld-support.sb`, Firefox denies
+/// `file-map-executable` explicitly and re-allows these trees, Codex emits
+/// its own block. Firefox's profiles also note that `file-map-executable` is
+/// *not* covered by `(deny default)`, which makes this most likely
+/// belt-and-braces rather than load-bearing. It costs a few dozen bytes and
+/// removes a whole class of "why did the linker fail" from the table.
+const SYSTEM_EXEC_MAP_PATHS: &[&str] = &[
+    "/usr/lib",
+    "/System/Library/Frameworks",
+    "/System/Library/PrivateFrameworks",
+    "/System/Library/SubFrameworks",
+    "/System/Library/Extensions",
+    "/Library/Apple/usr/lib",
+    // The dyld shared cache moved into cryptexes in Ventura.
+    "/System/Cryptexes/App",
+    "/System/Cryptexes/OS",
+    "/System/Volumes/Preboot/Cryptexes/App/System",
+    "/System/Volumes/Preboot/Cryptexes/OS",
+];
+
+/// Mach services the child may reach, named individually.
+///
+/// The first version of this profile allowed `mach-lookup` unfiltered, with a
+/// comment arguing that a service name is not a file or a socket, so allowing
+/// it did not widen the boundary. That argument was wrong, and the people who
+/// ship these sandboxes say so plainly. Anthropic's own sandbox runtime puts
+/// `com.apple.trustd.agent` behind an opt-in flag it labels a potential data
+/// exfiltration vector, and the Apple Events services behind another that it
+/// documents as meaning the sandbox no longer provides code-execution
+/// isolation — a confined command can `open` an application which then runs
+/// outside every restriction here. Chromium goes further and *denies* one
+/// service deliberately, so that CFPreferences falls back to reading
+/// preference files in-process where the file rules can bind it.
+///
+/// So this is enumerated, as every shipping profile surveyed does it. The
+/// cost is exactly what the old comment feared — a service missing from this
+/// list becomes a silent breakage on some future macOS — and it is the right
+/// trade. Being too narrow produces a bug report. Being too wide produces a
+/// boundary that is not there.
+const MACH_SERVICES: &[&str] = &[
+    // User and group lookup. `getpwuid` runs during startup in more places
+    // than one would expect.
+    "com.apple.system.opendirectoryd.libinfo",
+    "com.apple.system.opendirectoryd.membership",
+    "com.apple.system.DirectoryService.libinfo_v1",
+    "com.apple.bsd.dirhelper",
+    // Logging. A process that cannot log still runs, but the diagnostics are
+    // worth more than the narrowing.
+    "com.apple.logd",
+    "com.apple.logd.events",
+    "com.apple.system.logger",
+    "com.apple.diagnosticd",
+    "com.apple.analyticsd",
+    "com.apple.system.notification_center",
+    // Preferences.
+    "com.apple.cfprefsd.daemon",
+    "com.apple.cfprefsd.agent",
+    // Process startup and power assertions.
+    "com.apple.secinitd",
+    "com.apple.PowerManagement.control",
+    // Certificate validation, which a CLI talking to its provider's API over
+    // TLS needs. Included deliberately despite being the service Anthropic
+    // flags: this profile leaves the network open by design, so the route it
+    // opens is one that is already open here. A profile that closed the
+    // network would have to revisit this line.
+    "com.apple.trustd",
+    "com.apple.trustd.agent",
+];
+
+/// Tag on every denial, so `log show` can be filtered down to this profile's
+/// violations and nothing else:
+///
+/// ```text
+/// log show --last 5m --info --debug --style compact \
+///   --predicate 'eventMessage ENDSWITH "commonspace-sandbox"'
+/// ```
+///
+/// Without it, diagnosing a denial means reading every sandbox violation on
+/// the machine. This is the technique Anthropic's sandbox runtime uses, and
+/// it is the difference between "something was denied" and knowing which
+/// operation and which path.
+const DENY_TAG: &str = "commonspace-sandbox";
 
 /// Directory names, relative to `$HOME`, that a provider CLI owns and must
 /// be able to read *and write* regardless of what the caller's policy says
@@ -129,9 +223,11 @@ pub fn probe() -> Containment {
 /// because the profile is the entire security boundary — it must be
 /// unit-testable without spawning anything.
 ///
-/// Pure string generation: no filesystem access beyond reading `$HOME` and
-/// `$TMPDIR`-equivalent from the environment (not stat-ing or resolving
-/// them), so this runs identically, and is fully testable, on any host OS —
+/// String generation plus path resolution: it reads `$HOME` and `$TMPDIR`
+/// from the environment and canonicalizes every path it emits (see
+/// [`both_spellings`] for why that is not optional on macOS), but it opens
+/// nothing, spawns nothing, and never fails — an unresolvable path keeps the
+/// spelling it was given. So it runs, and is fully testable, on any host OS,
 /// which is why the tests below are not `#[cfg(target_os = "macos")]`.
 ///
 /// Structure is deny-by-default, then narrow allows:
@@ -145,7 +241,8 @@ pub fn probe() -> Containment {
 pub fn profile(policy: &SandboxPolicy) -> String {
     let mut out = String::new();
 
-    out.push_str("(version 1)\n(deny default)\n\n");
+    out.push_str("(version 1)\n");
+    out.push_str(&format!("(deny default (with message \"{DENY_TAG}\"))\n\n"));
 
     out.push_str(
         "; Network stays open: the CLI has to reach its own provider's API \
@@ -160,31 +257,89 @@ policed separately, at the tool layer (THREAT_MODEL.md).\n",
         "; Baseline operations every process needs merely to run, none of \
 which touch the filesystem or network this profile actually bounds: \
 forking and exec-ing its own subprocesses (git, npm, language runtimes), \
-signalling itself, sysctl reads (libSystem probes these on startup), and \
-file *metadata* reads so ordinary path resolution — stat-ing ancestor \
-directories, following symlinks — doesn't fail on locations that are \
-otherwise denied for content access. mach-lookup is left unrestricted \
-rather than enumerated: the well-known service names a process needs \
-(opendirectoryd for user lookups, cfprefsd, notifyd, distnoted, ...) \
-differ across macOS versions and would be a silent-breakage trap on every \
-OS update, and a mach service name is not a file or a socket — allowing \
-it does not widen the write/read/network boundary this module exists to \
-enforce.\n",
+signalling and inspecting others in the same sandbox, sysctl reads \
+(libSystem probes these on startup), and file *metadata* reads so ordinary \
+path resolution — stat-ing ancestor directories, following symlinks — \
+doesn't fail on locations that are otherwise denied for content access.\n",
     );
     out.push_str("(allow process-fork)\n");
     out.push_str("(allow process-exec)\n");
-    out.push_str("(allow signal (target self))\n");
+    // `(target self)` is not enough: /bin/sh re-execs, node forks workers,
+    // and a process signalling its own child is not signalling itself.
+    // Codex, Nix and Anthropic's sandbox runtime all use `same-sandbox`,
+    // which still cannot reach anything outside this confinement.
+    out.push_str("(allow signal (target same-sandbox))\n");
+    out.push_str("(allow process-info* (target same-sandbox))\n");
     out.push_str("(allow sysctl-read)\n");
     out.push_str("(allow file-read-metadata)\n");
-    out.push_str("(allow mach-lookup)\n\n");
+    out.push_str("(allow user-preference-read)\n\n");
 
     out.push_str(
-        "; /dev/null and /dev/tty are behaviour sinks, not exfiltration \
-routes: any CLI that redirects a subprocess's output, or talks to a \
-controlling terminal, needs to write to them. Read access to both is \
-already covered by the system read-paths block below.\n",
+        "; The root directory itself, readable. Not a way into anything — \
+`(literal \"/\")` is the directory entry, not its contents — but without it \
+`getcwd` fails and the loader can abort before the program starts, with \
+nothing on stderr to say why. Both Codex and Anthropic's sandbox runtime \
+emit this line, each with a comment about the failure it prevents.\n",
     );
-    out.push_str("(allow file-write-data (literal \"/dev/null\") (literal \"/dev/tty\"))\n\n");
+    out.push_str("(allow file-read* file-test-existence (literal \"/\"))\n\n");
+
+    out.push_str(
+        "; Inter-process primitives, which sound exotic and are not: POSIX \
+semaphores and shared memory are how Python's multiprocessing and libomp \
+start up, and the SysV pair is what an embedded database reaches for. None \
+of them carries data across this boundary — the sandbox is the boundary, \
+and these are only reachable within it. They are here because a process \
+denied one of them aborts with signal 6 and prints nothing at all, which \
+is the single most opaque failure this profile can produce, and the one \
+that cost this module a CI round to find.\n",
+    );
+    out.push_str("(allow ipc-posix-sem)\n");
+    out.push_str("(allow ipc-posix-shm)\n");
+    out.push_str("(allow ipc-sysv-sem)\n");
+    out.push_str("(allow ipc-sysv-shm)\n\n");
+
+    out.push_str(
+        "; Startup checks every Mach-O binary makes through the MAC layer: \
+whether a vnode is guarded, and whether it is expected to be inside a \
+container. Denying either is the same silent abort.\n",
+    );
+    out.push_str("(allow system-mac-syscall (mac-policy-name \"vnguard\"))\n");
+    out.push_str(
+        "(allow system-mac-syscall (require-all (mac-policy-name \"Sandbox\") \
+(mac-syscall-number 67)))\n",
+    );
+    out.push_str("(allow system-fsctl (fsctl-command FSIOC_CAS_BSDFLAGS))\n");
+    out.push_str("(allow iokit-open (iokit-registry-entry-class \"RootDomainUserClient\"))\n\n");
+
+    out.push_str(
+        "; Mach services, named one at a time rather than allowed wholesale. \
+See MACH_SERVICES for why the wholesale version was a mistake.\n",
+    );
+    out.push_str("(allow mach-lookup\n");
+    for service in MACH_SERVICES {
+        out.push_str(&format!("    (global-name \"{service}\")\n"));
+    }
+    // cfprefsd is reachable under either name depending on context.
+    out.push_str("    (local-name \"com.apple.cfprefsd.agent\")\n");
+    out.push_str(")\n\n");
+
+    out.push_str(
+        "; Device nodes are behaviour sinks, not exfiltration routes: any CLI \
+that redirects a subprocess's output, talks to a controlling terminal, or \
+seeds a random number generator needs these. /dev/fd matters more than it \
+looks — a shell reopens its own descriptors through it, and clang's \
+configure tests write to /dev/null through it. Read access is already \
+covered by the system read-paths block below; this is the write half.\n",
+    );
+    out.push_str(
+        "(allow file-write-data \
+(literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\"))\n",
+    );
+    out.push_str("(allow file-read-data file-write-data (subpath \"/dev/fd\"))\n");
+    out.push_str("(allow file-read* file-write-data file-ioctl (literal \"/dev/dtracehelper\"))\n");
+    out.push_str("(allow file-read* file-write* file-ioctl (literal \"/dev/ptmx\"))\n");
+    out.push_str("(allow file-read* file-write* file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))\n");
+    out.push_str("(allow pseudo-tty)\n\n");
 
     out.push_str(
         "; Read-only: the OS itself. The dynamic linker, shared libraries, \
@@ -192,27 +347,39 @@ frameworks, and language runtimes installed system-wide or via Homebrew. \
 None of this is writable.\n",
     );
     out.push_str(&allow_block(
-        "file-read*",
+        "file-read* file-test-existence",
         SYSTEM_READ_PATHS.iter().map(Path::new),
     ));
     out.push('\n');
 
+    out.push_str(
+        "; Mapping a file executable is its own operation in SBPL, not part \
+of file-read*. See SYSTEM_EXEC_MAP_PATHS.\n",
+    );
+    out.push_str(&allow_block(
+        "file-map-executable file-read*",
+        SYSTEM_EXEC_MAP_PATHS.iter().map(Path::new),
+    ));
+    out.push('\n');
+
     if !policy.readable.is_empty() {
+        let readable = both_spellings(policy.readable.clone());
         out.push_str("; Read-only: caller-specified paths outside the writable set.\n");
         out.push_str(&allow_block(
-            "file-read*",
-            policy.readable.iter().map(PathBuf::as_path),
+            "file-read* file-test-existence file-map-executable",
+            readable.iter().map(PathBuf::as_path),
         ));
         out.push('\n');
     }
 
     let mut writable: Vec<PathBuf> = policy.writable.clone();
-    writable.push(resolved_temp_dir());
+    writable.push(std::env::temp_dir());
     if let Some(home) = home_dir() {
         for name in PROVIDER_CONFIG_DIRS {
             writable.push(home.join(name));
         }
     }
+    let writable = both_spellings(writable);
     out.push_str(
         "; Read+write: the workspace roots this session was given, the \
 temp directory (Commonspace's own MCP session-settings file for this run \
@@ -222,9 +389,17 @@ the latter and *will* write there mid-run; a sandbox that stopped it \
 resuming a session would have broken the product, not secured it.\n",
     );
     out.push_str(&allow_block(
-        "file-read* file-write*",
+        "file-read* file-write* file-test-existence file-map-executable",
         writable.iter().map(PathBuf::as_path),
     ));
+
+    // On `file-map-executable` over a *writable* tree: this is normally the
+    // thing a sandbox exists to prevent — write a dylib, then load it. It is
+    // granted here because `process-exec` above is already unfiltered, so a
+    // child that can write a file can already run it; withholding the map
+    // would block a legitimate case (a CLI installing a native module into
+    // its own config directory) without closing anything. If `process-exec`
+    // ever becomes path-filtered, this line has to be revisited with it.
 
     out
 }
@@ -295,22 +470,53 @@ fn escape_sbpl_string(input: &str) -> String {
     out
 }
 
-/// The per-user temp directory, canonicalized.
+/// Every path, in both the spelling the caller gave and the one the kernel
+/// actually evaluates, de-duplicated and with trailing separators removed.
 ///
-/// macOS reports it through the `/var` symlink (`/var/folders/.../T/`)
-/// while the kernel resolves filesystem operations against the real path
-/// (`/private/var/folders/.../T/`) — the same mismatch already documented
-/// and worked around in
-/// `commonspace-permissions::protected::user_temp_dir`. A profile built
-/// from the symlinked form would match nothing at runtime and silently
-/// make the temp directory unwritable, taking the MCP session-settings
-/// file every provider adapter writes there down with it. Falls back to
-/// the unresolved path if canonicalization fails (e.g. the directory
-/// doesn't exist yet) rather than erroring — consistent with "containment
-/// never fails a spawn".
-fn resolved_temp_dir() -> PathBuf {
-    let temp = std::env::temp_dir();
-    std::fs::canonicalize(&temp).unwrap_or(temp)
+/// macOS is a symlink farm at exactly the places this module cares about:
+/// `/tmp` is a symlink to `/private/tmp`, `$TMPDIR` is reported through
+/// `/var/folders/.../T/` while `/var` is a symlink to `/private/var`, and a
+/// user's project folder can sit under any number of their own symlinks.
+/// Seatbelt matches `subpath` against the *resolved* path, so a profile
+/// built only from the caller's spelling matches nothing at runtime — the
+/// sandbox then denies the very writes it was configured to permit, which
+/// is the failure mode `sandbox/mod.rs` names first: a boundary that breaks
+/// legitimate work. This is the same mismatch already documented and worked
+/// around in `commonspace-permissions::protected::user_temp_dir`.
+///
+/// Both spellings are emitted rather than only the resolved one, because a
+/// symlink can be repointed between profile generation and the child's
+/// syscall; the given form costs one extra rule and covers that. Paths that
+/// cannot be canonicalized (a provider config directory that does not exist
+/// yet) keep only their given form rather than erroring — consistent with
+/// "containment never fails a spawn".
+///
+/// The trailing separator matters: SBPL's `(subpath "/a/b/")` matches
+/// nothing, and `std::env::temp_dir()` hands back `$TMPDIR` verbatim, which
+/// on macOS ends in `/`.
+fn both_spellings(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::with_capacity(paths.len() * 2);
+    for path in paths {
+        let resolved = std::fs::canonicalize(&path).ok();
+        for candidate in [Some(path), resolved].into_iter().flatten() {
+            let trimmed = trim_trailing_separator(&candidate);
+            if !out.contains(&trimmed) {
+                out.push(trimmed);
+            }
+        }
+    }
+    out
+}
+
+/// Drops trailing `/` from a path, leaving the root itself alone.
+fn trim_trailing_separator(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let trimmed = text.trim_end_matches('/');
+    if trimmed.is_empty() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(trimmed)
+    }
 }
 
 /// `$HOME`, the only portable way to find the user profile from inside this
@@ -372,7 +578,13 @@ mod tests {
     #[test]
     fn profile_denies_by_default() {
         let text = profile(&SandboxPolicy::default());
-        assert!(text.starts_with("(version 1)\n(deny default)\n"), "{text}");
+        assert!(text.starts_with("(version 1)\n(deny default"), "{text}");
+        // Tagged, or a denial cannot be found in the machine's log without
+        // reading every sandbox violation on it.
+        assert!(
+            text.contains(&format!("(deny default (with message \"{DENY_TAG}\"))")),
+            "{text}"
+        );
     }
 
     #[test]
@@ -434,9 +646,68 @@ mod tests {
     #[test]
     fn temp_directory_is_always_writable_even_with_an_empty_policy() {
         let text = profile(&SandboxPolicy::default());
-        let temp = resolved_temp_dir();
-        let expected = subpath_literal(&temp);
-        assert!(text.contains(&expected), "missing {expected} in:\n{text}");
+        for spelling in both_spellings(vec![std::env::temp_dir()]) {
+            let expected = subpath_literal(&spelling);
+            assert!(text.contains(&expected), "missing {expected} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn both_spellings_keeps_the_resolved_path_and_drops_trailing_separators() {
+        // A directory that exists on every platform CI runs on, addressed
+        // with a trailing separator the way `$TMPDIR` hands one back.
+        let spellings = both_spellings(vec![PathBuf::from("/usr/")]);
+        assert!(
+            spellings.contains(&PathBuf::from("/usr")),
+            "expected the trimmed form in {spellings:?}"
+        );
+        assert!(
+            !spellings.iter().any(|p| p.to_string_lossy().ends_with('/')),
+            "a trailing separator survived: {spellings:?}"
+        );
+        // Whatever /usr resolves to on this host must be present too — on a
+        // Mac that is the same path, on a host where it is a symlink it is
+        // not, and the profile has to carry both either way.
+        if let Ok(resolved) = std::fs::canonicalize("/usr") {
+            assert!(
+                spellings.contains(&trim_trailing_separator(&resolved)),
+                "missing resolved form {resolved:?} in {spellings:?}"
+            );
+        }
+    }
+
+    /// Unix only. Not because the behaviour is unix-specific — a Windows
+    /// junction would exercise the same code — but because creating a
+    /// symlink on Windows needs Developer Mode or an elevated process, so
+    /// this would be testing the runner's privileges rather than the
+    /// profile. Linux CI proves the logic; macOS is where it matters.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_workspace_root_reaches_the_profile_in_its_resolved_form() {
+        // The bug this guards: Seatbelt matches `subpath` against the path
+        // the kernel resolved, so a workspace given through a symlink (the
+        // normal case for /tmp and $TMPDIR on macOS) would match nothing and
+        // the sandbox would deny the writes it exists to permit.
+        let base =
+            std::env::temp_dir().join(format!("commonspace-spelling-test-{}", std::process::id()));
+        let real = base.join("real");
+        let link = base.join("link");
+        std::fs::create_dir_all(&real).expect("create the real directory");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).expect("create the symlink");
+
+        let text = profile(&policy(&[&link.to_string_lossy()], &[]));
+        let resolved = std::fs::canonicalize(&link).expect("resolve the symlink");
+        assert!(
+            text.contains(&subpath_literal(&resolved)),
+            "resolved form missing from:\n{text}"
+        );
+        assert!(
+            text.contains(&subpath_literal(&link)),
+            "given form missing from:\n{text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -510,30 +781,66 @@ mod tests {
         );
     }
 
+    /// This module compiles and its tests run on every platform (see the
+    /// comment on `pub mod macos` in `sandbox/mod.rs`), so `wrap` and
+    /// `probe` are exercised in two genuinely different worlds: a Linux CI
+    /// container with no `sandbox-exec`, and a Mac that has it. Branching on
+    /// what is actually on disk asserts the right behaviour in each rather
+    /// than baking one environment's answer in as the only correct one —
+    /// which is what made these two tests fail the first time they ran on a
+    /// real Mac.
+    fn sandbox_exec_is_installed() -> bool {
+        Path::new(SANDBOX_EXEC).is_file()
+    }
+
     #[test]
-    fn wrap_returns_original_command_when_sandbox_exec_is_absent() {
-        // This container has no /usr/bin/sandbox-exec — nor would a real
-        // Mac on the day Apple finally removes it (see module docs).
+    fn wrap_leaves_the_command_alone_when_it_cannot_confine_it() {
         let program = PathBuf::from("/usr/bin/true");
         let args = vec!["--flag".to_string(), "value".to_string()];
         let (resolved_program, resolved_args, containment) =
             wrap(&program, &args, &SandboxPolicy::default());
-        assert_eq!(resolved_program, program);
-        assert_eq!(resolved_args, args);
-        assert!(!containment.is_enforced());
-        assert!(matches!(containment, Containment::Unavailable { .. }));
+
+        if sandbox_exec_is_installed() {
+            // The command must be rewritten to run *through* sandbox-exec,
+            // with the original program and its arguments preserved after
+            // the `--` separator and nothing reordered or dropped.
+            assert!(containment.is_enforced(), "{containment:?}");
+            assert_eq!(resolved_program, PathBuf::from(SANDBOX_EXEC));
+            let separator = resolved_args
+                .iter()
+                .position(|a| a == "--")
+                .expect("a `--` separating sandbox-exec's flags from the command");
+            assert_eq!(resolved_args[separator + 1], program.to_string_lossy());
+            assert_eq!(&resolved_args[separator + 2..], &args[..]);
+            assert_eq!(resolved_args[0], "-p");
+            assert!(
+                resolved_args[1].starts_with("(version 1)"),
+                "{resolved_args:?}"
+            );
+        } else {
+            // No mechanism here — the spawn still has to happen, unchanged
+            // and honestly labelled (`sandbox/mod.rs`, first two rules).
+            assert_eq!(resolved_program, program);
+            assert_eq!(resolved_args, args);
+            assert!(!containment.is_enforced());
+            assert!(matches!(containment, Containment::Unavailable { .. }));
+        }
     }
 
     #[test]
-    fn probe_is_unavailable_without_the_binary() {
-        assert!(
-            !Path::new(SANDBOX_EXEC).exists(),
-            "test assumes a container without sandbox-exec"
-        );
+    fn probe_reports_what_is_actually_on_this_machine() {
         let containment = probe();
-        assert!(
-            matches!(containment, Containment::Unavailable { mechanism, .. } if mechanism == MECHANISM)
-        );
+        if sandbox_exec_is_installed() {
+            assert!(
+                matches!(containment, Containment::Enforced { mechanism } if mechanism == MECHANISM),
+                "{containment:?}"
+            );
+        } else {
+            assert!(
+                matches!(containment, Containment::Unavailable { mechanism, .. } if mechanism == MECHANISM),
+                "{containment:?}"
+            );
+        }
     }
 
     /// Tests below this line need a real macOS kernel and did not run in
@@ -552,49 +859,210 @@ mod tests {
             ));
         }
 
+        /// Runs `/bin/sh -c <script>` under the profile for `policy` and
+        /// returns whether it succeeded, along with everything the sandbox
+        /// and the shell said.
+        ///
+        /// Captured rather than inherited on purpose: when this fails it
+        /// fails on a machine nobody working on the change can log into, and
+        /// "assertion failed: status.success()" on its own says nothing
+        /// about whether the profile was rejected outright or a legitimate
+        /// write was denied. sandbox-exec puts both answers on stderr.
+        fn run_confined(policy: &SandboxPolicy, script: &str) -> (bool, String) {
+            let (program, args, containment) = wrap(
+                Path::new("/bin/sh"),
+                &["-c".into(), script.to_string()],
+                policy,
+            );
+            assert!(containment.is_enforced(), "{containment:?}");
+            let output = std::process::Command::new(&program)
+                .args(&args)
+                // In production the child's working directory *is* a
+                // workspace root, so it is inside the writable set. Running
+                // the test from cargo's directory instead would confine a
+                // process whose cwd it cannot read, which is a documented way
+                // to break getcwd and has nothing to do with what this test
+                // is checking.
+                .current_dir(
+                    policy
+                        .writable
+                        .first()
+                        .map_or(Path::new("/"), |p| p.as_path()),
+                )
+                .output()
+                .expect("run the sandboxed shell");
+            let detail = format!(
+                "script: {script}\nstatus: {}\nstderr:\n{}\nstdout:\n{}\nprofile:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout),
+                profile(policy),
+            );
+            (output.status.success(), detail)
+        }
+
+        /// Where the boundary actually is, when the control half fails.
+        ///
+        /// The first run of this test on real hardware came back with signal
+        /// 6 and *nothing* on either stream, which rules out reading the
+        /// answer off stderr: either the profile denies writing to the
+        /// inherited pipes, or the child died before libsystem could say
+        /// anything. A wait status survives both — it comes from `waitpid`,
+        /// not from the child's ability to produce output — so this walks a
+        /// ladder from "can any binary start at all" up to the real case and
+        /// reports each rung's status. The first rung that fails is the
+        /// boundary, and one CI round locates it instead of a guess per
+        /// round.
+        fn containment_ladder(policy: &SandboxPolicy, workspace: &Path) -> String {
+            let (sandbox_exec, _, _) = wrap(Path::new("/bin/sh"), &[], policy);
+            let rungs: [(&str, Vec<String>); 5] = [
+                // Does anything start under this profile?
+                ("/usr/bin/true", vec![]),
+                // Does the shell start, and can it set an exit code without
+                // writing anywhere?
+                ("/bin/sh exit 7", vec!["-c".into(), "exit 7".into()]),
+                // Can it write to the inherited stdout pipe?
+                (
+                    "/bin/sh echo to stdout",
+                    vec!["-c".into(), "echo hi".into()],
+                ),
+                // Can it read the directory it is allowed to write in?
+                (
+                    "/bin/sh ls workspace",
+                    vec![
+                        "-c".into(),
+                        format!("ls {} > /dev/null", workspace.display()),
+                    ],
+                ),
+                // The real case.
+                (
+                    "/bin/sh redirect into workspace",
+                    vec![
+                        "-c".into(),
+                        format!("echo hi > {}/ladder.txt", workspace.display()),
+                    ],
+                ),
+            ];
+
+            let mut report =
+                String::from("\ncontainment ladder (first failing rung is the boundary):\n");
+            for (label, script) in rungs {
+                let program: &Path = if script.is_empty() {
+                    Path::new("/usr/bin/true")
+                } else {
+                    Path::new("/bin/sh")
+                };
+                let (_, args, _) = wrap(program, &script, policy);
+                let status = std::process::Command::new(&sandbox_exec)
+                    .args(&args)
+                    .output()
+                    .map(|o| o.status.to_string())
+                    .unwrap_or_else(|e| format!("could not run: {e}"));
+                report.push_str(&format!("  {label}: {status}\n"));
+            }
+            // The same ladder with no profile at all, so a rung that fails
+            // both ways is the runner's problem rather than the sandbox's.
+            let unconfined = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &format!("echo hi > {}/unconfined.txt", workspace.display()),
+                ])
+                .output()
+                .map(|o| o.status.to_string())
+                .unwrap_or_else(|e| format!("could not run: {e}"));
+            report.push_str(&format!("  same redirect with no profile: {unconfined}\n"));
+            report.push_str(&sandbox_violations());
+            report
+        }
+
+        /// What the kernel says it denied.
+        ///
+        /// Every denial in this profile is tagged (see `DENY_TAG`), so this
+        /// filters the unified log down to this profile's violations and
+        /// nothing else on the machine. It is the only source that names the
+        /// *operation* and the *path or service* — a wait status says a
+        /// process died, and this says why.
+        fn sandbox_violations() -> String {
+            let filtered = std::process::Command::new("/usr/bin/log")
+                .args([
+                    "show",
+                    "--last",
+                    "2m",
+                    "--info",
+                    "--debug",
+                    "--style",
+                    "compact",
+                    "--predicate",
+                    &format!("eventMessage CONTAINS \"{DENY_TAG}\""),
+                ])
+                .output();
+            let mut out = String::from("\nsandbox violations from the unified log:\n");
+            match filtered {
+                Ok(result) => {
+                    let text = String::from_utf8_lossy(&result.stdout);
+                    // The last few lines are the interesting ones and the
+                    // whole log would bury the rest of the report.
+                    let lines: Vec<&str> = text.lines().rev().take(40).collect();
+                    if lines.is_empty() {
+                        out.push_str(
+                            "  (nothing tagged — either the denial was not logged, or \
+                             `(deny default (with message ...))` is not doing what this \
+                             module thinks it does)\n",
+                        );
+                    }
+                    for line in lines.into_iter().rev() {
+                        out.push_str("  ");
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+                Err(error) => out.push_str(&format!("  could not read the log: {error}\n")),
+            }
+            out
+        }
+
         #[test]
         fn wrap_actually_confines_the_child() {
-            let tmp = std::env::temp_dir().join(format!(
+            let workspace = std::env::temp_dir().join(format!(
                 "commonspace-macos-sandbox-test-{}",
                 std::process::id()
             ));
-            std::fs::create_dir_all(&tmp).expect("create workspace");
-            let outside = std::env::temp_dir().join(format!(
+            std::fs::create_dir_all(&workspace).expect("create workspace");
+            let policy = SandboxPolicy {
+                writable: vec![workspace.clone()],
+                readable: vec![],
+            };
+
+            // The control half. A sandbox that denies this has not made
+            // anything safer, it has broken the product — `sandbox/mod.rs`'s
+            // third rule, and the half far more likely to regress.
+            let (ok, detail) = run_confined(
+                &policy,
+                &format!("echo hi > {}/ok.txt", workspace.display()),
+            );
+            if !ok {
+                panic!(
+                    "a write inside the workspace was refused\n{detail}{}",
+                    containment_ladder(&policy, &workspace)
+                );
+            }
+            assert!(workspace.join("ok.txt").exists(), "{detail}");
+
+            // The half that matters. `$HOME` itself is outside every allow
+            // in the profile — unlike the temp directory, which the profile
+            // deliberately makes writable, so a target under it would prove
+            // nothing.
+            let outside = home_dir().expect("macOS always sets $HOME").join(format!(
                 "commonspace-macos-sandbox-outside-{}",
                 std::process::id()
             ));
+            let _ = std::fs::remove_file(&outside);
+            let (ok, detail) = run_confined(&policy, &format!("echo hi > {}", outside.display()));
+            assert!(!ok, "a write outside the workspace was allowed\n{detail}");
+            assert!(!outside.exists(), "{detail}");
 
-            let policy = SandboxPolicy {
-                writable: vec![tmp.clone()],
-                readable: vec![],
-            };
-            let (program, args, containment) =
-                wrap(Path::new("/bin/sh"), &["-c".into(), String::new()], &policy);
-            assert!(containment.is_enforced());
-
-            // Writing inside the writable root succeeds.
-            let inside_script = format!("echo hi > {}/ok.txt", tmp.display());
-            let mut inside_args = args.clone();
-            *inside_args.last_mut().unwrap() = inside_script;
-            let status = std::process::Command::new(&program)
-                .args(&inside_args)
-                .status()
-                .expect("run sandboxed write inside");
-            assert!(status.success());
-            assert!(tmp.join("ok.txt").exists());
-
-            // Writing outside it is denied by the kernel, not by the shell.
-            let outside_script = format!("echo hi > {}", outside.display());
-            let mut outside_args = args;
-            *outside_args.last_mut().unwrap() = outside_script;
-            let status = std::process::Command::new(&program)
-                .args(&outside_args)
-                .status()
-                .expect("run sandboxed write outside");
-            assert!(!status.success());
-            assert!(!outside.exists());
-
-            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = std::fs::remove_dir_all(&workspace);
+            let _ = std::fs::remove_file(&outside);
         }
     }
 }

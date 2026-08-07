@@ -96,6 +96,46 @@ Mitigations (designed now, shipped with MCP management):
 - Commonspace permission policy wraps MCP tool invocations; network-reaching
   tools disclose destination.
 
+### 4b. A hostile Agent Skill
+A skill is a folder with a `SKILL.md` in it: Markdown that becomes
+instructions the model follows, plus whatever scripts and reference files
+its author shipped. People will get them from colleagues, from the web,
+and from repositories. Anthropic's own guidance on the format is to treat
+installing one like installing software, and that is the right framing.
+
+What a skill can do is exactly what a person typing the same words could
+do. That is the entire security argument, and it only holds because of
+choices made elsewhere:
+
+- A skill's `allowed-tools` grants **nothing** in Commonspace. Elsewhere
+  the field pre-approves tools for the invoking turn; here it is recorded
+  so the model knows what the author expected and so a person can see what
+  a skill intends to use before trusting it. What actually runs is decided
+  by the policy engine and the permission broker, unchanged.
+- Skills are not auto-loaded from `.claude/skills` in a project folder.
+  Commonspace reads the portable Agent Skills *format*, but only from the
+  user's own skills directory and from `<workspace>/.commonspace/skills` —
+  somewhere a person had to deliberately put something. A cloned
+  repository is not a place to silently pick up instructions the model
+  will follow, for the same reason the provider CLI is launched with
+  `--setting-sources user` rather than trusting a checked-in settings
+  file.
+- The Claude-Code-specific frontmatter extensions are deliberately not
+  honoured. `hooks` above all: honouring it would reopen, from a file in
+  the user's project, precisely the injection path Commonspace closed when
+  it started passing `disableAllHooks`.
+- Bundled files are named, never read, until the model asks for one. A
+  skill cannot spend the user's context or smuggle content in merely by
+  existing.
+
+Residual risk, stated plainly: a skill can still *persuade*. It can tell
+the model to read a file and put its contents somewhere the user has
+already authorized, and the model may do it, because that is a thing the
+user could have asked for. Commonspace's answer is not that this cannot
+happen — it is that every consequence still passes through the policy
+engine, appears as a proposal in staging rather than a completed write,
+and is visible in the timeline. A skill is content, not authority.
+
 ### 5. Credential theft
 Malware or a curious process reads stored secrets; or Commonspace mishandles
 provider credentials.

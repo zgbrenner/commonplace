@@ -24,6 +24,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
+use commonspace_capabilities::{CapabilityId, LoadedCapability, Registry};
 use commonspace_core::{
     AgentEvent, Artifact, ArtifactId, ArtifactKind, OperationClass, PolicyVerdict, RiskLevel,
     TaskId, ToolCallId, ToolStatus,
@@ -70,6 +71,11 @@ pub struct ToolContext {
     /// apply path feeds this now — staging a proposal journals nothing,
     /// since nothing has happened to undo yet.
     pub journal: UnboundedSender<FileOperation>,
+    /// What this session can reach beyond the built-in tools: the user's
+    /// skills, and — later — a connected server's tools and the browser lane.
+    /// Shared rather than owned because it is read-only for the length of a
+    /// task and several tasks can run against the same one.
+    pub capabilities: Arc<Registry>,
 }
 
 /// A running tool server.
@@ -88,6 +94,31 @@ impl ToolServerHandle {
         let _ = self.shutdown.send(());
         let _ = self.join.await;
     }
+}
+
+/// The registry a session searches: Commonspace's own tools, indexed from
+/// the very schemas the model calls against, plus every skill found under
+/// `skill_roots`.
+///
+/// Roots are searched in order and later roots win a name collision, so a
+/// caller passes the personal directory before the project one.
+pub fn build_registry(skill_roots: &[PathBuf]) -> (Registry, commonspace_capabilities::LoadReport) {
+    let mut registry = Registry::new();
+    for (capability, loaded) in commonspace_capabilities::from_tool_definitions(
+        commonspace_capabilities::CapabilityKind::BuiltinTool,
+        &commonspace_capabilities::CapabilitySource::Builtin,
+        &tool_definitions(),
+    ) {
+        registry.insert(capability, loaded);
+    }
+    let report = commonspace_capabilities::skills::load_into(&mut registry, skill_roots);
+    for skipped in &report.skipped {
+        // Logged here as well as returned, because the return value goes to
+        // the UI and the log is what someone has when the UI is the thing
+        // that is broken.
+        tracing::warn!(path = %skipped.path().display(), error = %skipped, "skipping a skill");
+    }
+    (registry, report)
 }
 
 /// Builder/launcher for the tool server.
@@ -167,7 +198,11 @@ async fn handle_rpc(
             "serverInfo": { "name": "commonspace", "version": env!("CARGO_PKG_VERSION") }
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_definitions() })),
+        "tools/list" => {
+            let mut tools = tool_definitions();
+            tools.extend(capability_tool_definitions());
+            Ok(json!({ "tools": tools }))
+        }
         "tools/call" => call_tool(&state.context, &params).await,
         other => Err(RpcError::method_not_found(other)),
     };
@@ -210,8 +245,60 @@ impl RpcError {
     }
 }
 
+/// The two tools that reach the capability registry rather than the
+/// filesystem. Kept apart from [`tool_definitions`] because they are the one
+/// pair that must *not* be indexed by the registry they search — a search
+/// result telling the model to search is noise, and a load result telling it
+/// to load is worse.
+fn capability_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "search_capabilities",
+            "description": "Find out what Commonspace can do for a task, in plain words. Search before \
+                            assuming something is impossible: as well as the tools listed here, this \
+                            person may have skills installed that carry instructions for exactly this \
+                            kind of work. Returns matches with a short summary and the reasons each \
+                            one matched, best first. Nothing is loaded until you ask for it by id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What you are trying to do, in the words you would use to \
+                                        describe it — 'make a slide deck from these notes', not a \
+                                        tool name."
+                    },
+                    "limit": { "type": "integer", "description": "How many matches to return (default 5)." }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "load_capability",
+            "description": "Load one capability in full by the id search_capabilities gave you: a \
+                            skill's instructions, or a tool's exact input schema. Load it before \
+                            following it — a summary is not the instructions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "The id from a search_capabilities result." }
+                },
+                "required": ["id"]
+            }
+        }),
+    ]
+}
+
 /// Tool schemas advertised to the agent. Narrow and typed by design: there
 /// is no general shell tool here.
+///
+/// These stay enumerated rather than moving behind the registry. There are a
+/// dozen of them, every one of them is relevant to the kind of work
+/// Commonspace exists for, and the registry's job is to keep the *unbounded*
+/// surfaces — a user's skills, a connected server's tools — out of the
+/// prompt. Hiding the twelve tools the agent needs on almost every task
+/// behind a search step would cost a round trip to learn what it already
+/// knew.
 fn tool_definitions() -> Vec<Value> {
     let path_prop = |desc: &str| json!({ "type": "string", "description": desc });
     vec![
@@ -699,6 +786,108 @@ async fn dispatch(
     call_id: &ToolCallId,
 ) -> Result<ToolOutcome, ToolFailure> {
     match name {
+        // Neither capability tool is gated. Searching a list of descriptions
+        // and reading a skill's own instructions touch none of the user's
+        // files and grant nothing — a skill that *asks* for a file still has
+        // to call a tool that goes through the policy engine, exactly as an
+        // instruction the user typed would. Sending these through the broker
+        // would train people to approve prompts that never mattered, which is
+        // how approval fatigue starts.
+        "search_capabilities" => {
+            let query = args.get("query").and_then(Value::as_str).ok_or_else(|| {
+                ToolFailure::Protocol(RpcError::invalid_params("query is required"))
+            })?;
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(5)
+                .clamp(1, 25) as usize;
+            started(context, call_id, "Checking what it can do", None);
+            let matches = context.capabilities.search(query, limit);
+            if matches.is_empty() {
+                // An empty result is worth saying out loud. The failure this
+                // avoids is the model reading a bare `[]` as "Commonspace
+                // cannot do this" and telling the person so.
+                return Ok(ToolOutcome::plain(format!(
+                    "Nothing matched “{query}”. That means no skill or extra capability is installed \
+                     for it — the built-in tools listed in this session are still available and are \
+                     usually the right answer."
+                )));
+            }
+            let rendered: Vec<Value> = matches
+                .iter()
+                .map(|m| {
+                    json!({
+                        "id": m.capability.id.0,
+                        "name": m.capability.name,
+                        "summary": m.capability.summary,
+                        "kind": m.capability.kind,
+                        "why": m.reasons.iter().map(|r| r.describe()).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            serde_json::to_string_pretty(&json!({ "matches": rendered }))
+                .map(ToolOutcome::plain)
+                .map_err(|e| ToolFailure::Failed(e.to_string()))
+        }
+        "load_capability" => {
+            let id = args
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolFailure::Protocol(RpcError::invalid_params("id is required")))?;
+            let id = CapabilityId(id.to_string());
+            let Some(loaded) = context.capabilities.load(&id) else {
+                // Named rather than silent: the model invented or mistyped an
+                // id, and the useful next move is another search, not a
+                // retry of the same load.
+                return Err(ToolFailure::Failed(format!(
+                    "there is no capability with the id '{id}' — search for it again to get a \
+                     current id"
+                )));
+            };
+            started(context, call_id, "Reading the instructions", None);
+            let text = match loaded {
+                LoadedCapability::Instructions {
+                    body,
+                    bundled,
+                    requires,
+                } => {
+                    let mut text = body.clone();
+                    if !requires.is_empty() {
+                        // Said plainly because it is not a grant. The skill's
+                        // author expected these; whether they run is still the
+                        // policy engine's call and the person's.
+                        text.push_str(&format!(
+                            "\n\n---\nThis skill's author expected it to use: {}. That is what they \
+                             expected, not permission — every one of them still goes through the \
+                             usual checks.\n",
+                            requires.join(", ")
+                        ));
+                    }
+                    if !bundled.is_empty() {
+                        text.push_str(&format!(
+                            "\nFiles shipped with this skill, which you can read if you need them: \
+                             {}\n",
+                            bundled
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                    text
+                }
+                LoadedCapability::Tool {
+                    call_name,
+                    input_schema,
+                } => format!(
+                    "Call this tool as `{call_name}` with these arguments:\n{}",
+                    serde_json::to_string_pretty(input_schema)
+                        .unwrap_or_else(|_| input_schema.to_string())
+                ),
+            };
+            Ok(ToolOutcome::plain(text))
+        }
         "list_folder" => {
             let path = arg_path(args, "path")?;
             gate(
@@ -1204,6 +1393,10 @@ mod tests {
             broker: broker.clone(),
             events: event_tx,
             journal: journal_tx,
+            // A skills directory under the temp root, so the harness picks up
+            // whatever a test puts there and nothing from the machine running
+            // it.
+            capabilities: Arc::new(build_registry(&[tmp.path().join("skills")]).0),
         });
         let handle = ToolServer::start(context).await.expect("server starts");
         Harness {
@@ -1249,6 +1442,290 @@ mod tests {
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": name, "arguments": arguments }
         })
+    }
+
+    #[tokio::test]
+    async fn the_capability_tools_are_offered_alongside_the_typed_ones() {
+        let h = harness().await;
+        let (_, response) = rpc(
+            &h,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            None,
+        )
+        .await;
+        let names: Vec<&str> = response["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"search_capabilities"), "{names:?}");
+        assert!(names.contains(&"load_capability"), "{names:?}");
+        // The typed tools stay listed. Putting the dozen tools the agent
+        // needs on nearly every task behind a search step would cost a round
+        // trip to learn what it already knew.
+        assert!(names.contains(&"create_document"), "{names:?}");
+        h.handle.expect("handle").shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_built_in_tool_can_be_loaded_back_out_of_the_registry() {
+        let h = harness().await;
+        let (_, response) = rpc(
+            &h,
+            call("load_capability", json!({"id": "builtin:read_spreadsheet"})),
+            None,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        // The name the model must call by, and the schema it must call with.
+        assert!(text.contains("read_spreadsheet"), "{text}");
+        assert!(text.contains("\"properties\""), "{text}");
+        h.handle.expect("handle").shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn loading_an_id_that_does_not_exist_says_so_instead_of_inventing_one() {
+        let h = harness().await;
+        let (_, response) = rpc(
+            &h,
+            call("load_capability", json!({"id": "skill:not-installed"})),
+            None,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("skill:not-installed"), "{text}");
+        h.handle.expect("handle").shutdown().await;
+    }
+
+    #[test]
+    fn the_words_a_person_uses_reach_the_tool_that_does_the_job() {
+        // Over the real tool definitions, not a fixture: this is the pairing
+        // that matters, and a wording change in a tool description that
+        // breaks it should fail here rather than in front of someone.
+        let (registry, _) = build_registry(&[]);
+        for (query, expected) in [
+            ("put this in the trash", "builtin:delete_to_trash"),
+            ("write it up as a word document", "builtin:create_document"),
+            ("what is in this folder", "builtin:list_folder"),
+            ("tidy up duplicate files", "builtin:find_duplicates"),
+        ] {
+            let matches = registry.search(query, 3);
+            let top = matches
+                .first()
+                .unwrap_or_else(|| panic!("nothing matched “{query}”"));
+            assert_eq!(
+                top.capability.id.0, expected,
+                "“{query}” ranked {:?} first, reasons {:?}",
+                top.capability.id.0, top.reasons
+            );
+            // The result has to be able to say why, or the explanation
+            // contract in the registry is decoration.
+            assert!(!top.reasons.is_empty(), "{query}");
+        }
+    }
+
+    /// Writes a skill directory and returns the root it lives under.
+    fn seed_skill(root: &std::path::Path, name: &str, frontmatter: &str, body: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("skill directory");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\n{frontmatter}---\n\n{body}"),
+        )
+        .expect("SKILL.md");
+    }
+
+    #[tokio::test]
+    async fn a_skill_on_disk_is_found_by_words_and_loaded_only_when_asked_for() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills = tmp.path().join("skills");
+        seed_skill(
+            &skills,
+            "board-pack",
+            "name: board-pack\n\
+             description: Assemble the quarterly board pack from the finance exports and \
+             last quarter's minutes.\n\
+             allowed-tools: read_spreadsheet create_document\n",
+            "# Board pack\n\n1. Read every export in Finance/Q3.\n2. Follow the house order.\n",
+        );
+        std::fs::write(skills.join("board-pack").join("TEMPLATE.md"), "# Template")
+            .expect("bundled file");
+
+        let (registry, report) = build_registry(std::slice::from_ref(&skills));
+        assert_eq!(report.loaded, 1, "{:?}", report.skipped);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+
+        // Level one: found by the words a person would actually use, with the
+        // reasons visible.
+        let matches = registry.search("put together the quarterly board pack", 5);
+        let top = matches.first().expect("the skill should match");
+        assert_eq!(top.capability.id.0, "skill:board-pack");
+        assert!(!top.reasons.is_empty());
+        // The instructions are *not* in the search result. That is the whole
+        // point of the split — if the body leaked into a match, every search
+        // would cost what loading costs.
+        let rendered = serde_json::to_string(&matches).expect("serialize");
+        assert!(!rendered.contains("house order"), "{rendered}");
+
+        // Level two: the body arrives only on request.
+        let loaded = registry
+            .load(&top.capability.id)
+            .expect("the match must be loadable");
+        let LoadedCapability::Instructions {
+            body,
+            bundled,
+            requires,
+        } = loaded
+        else {
+            panic!("a skill must load as instructions: {loaded:?}");
+        };
+        assert!(body.contains("house order"), "{body}");
+        assert_eq!(requires, &["read_spreadsheet", "create_document"]);
+        // Level three: the bundled file is named, and its contents are not
+        // here.
+        assert!(
+            bundled.iter().any(|p| p.ends_with("TEMPLATE.md")),
+            "{bundled:?}"
+        );
+        assert!(!body.contains("# Template"), "{body}");
+    }
+
+    #[test]
+    fn a_broken_skill_is_named_and_the_others_still_load() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills = tmp.path().join("skills");
+        seed_skill(
+            &skills,
+            "good",
+            "name: good\ndescription: A fine skill.\n",
+            "Body.",
+        );
+        seed_skill(&skills, "broken", "description: no name at all\n", "Body.");
+
+        let (registry, report) = build_registry(&[skills]);
+        assert_eq!(report.loaded, 1);
+        assert_eq!(report.skipped.len(), 1);
+        // The path has to point at something the person can go and open.
+        let skipped = &report.skipped[0];
+        assert!(
+            skipped.path().to_string_lossy().contains("broken"),
+            "{skipped}"
+        );
+        assert!(registry.get(&CapabilityId::new("skill", "good")).is_some());
+        assert!(registry
+            .get(&CapabilityId::new("skill", "broken"))
+            .is_none());
+    }
+
+    #[test]
+    fn a_skill_cannot_grant_itself_anything_by_declaring_it() {
+        // allowed-tools is recorded, and that is all it does. If this ever
+        // starts feeding a permission decision, this test is where it will
+        // be noticed.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills = tmp.path().join("skills");
+        seed_skill(
+            &skills,
+            "greedy",
+            "name: greedy\n\
+             description: Claims everything.\n\
+             allowed-tools: delete_to_trash overwrite_file Bash(rm:*)\n",
+            "Delete whatever you like.",
+        );
+        let (registry, _) = build_registry(&[skills]);
+        let loaded = registry
+            .load(&CapabilityId::new("skill", "greedy"))
+            .expect("loaded");
+        let LoadedCapability::Instructions { requires, .. } = loaded else {
+            panic!("{loaded:?}");
+        };
+        assert!(requires.iter().any(|r| r == "delete_to_trash"));
+        // Nothing about the policy engine, the broker, or this session's
+        // grants has changed. The declaration is text on a page.
+        let context_policy = PolicyEngine::new(
+            PathGuard::new([tmp.path()]),
+            commonspace_permissions::PolicySettings::default(),
+        );
+        let verdict = context_policy
+            .evaluate(&PolicyRequest {
+                class: OperationClass::Delete,
+                targets: vec![tmp.path().join("anything.txt")],
+                destination: None,
+                permanent: false,
+            })
+            .expect("the path is inside the guard");
+        assert!(
+            !matches!(verdict, PolicyVerdict::Allow),
+            "a skill's declaration must not have loosened anything: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_query_naming_a_format_finds_a_tool_that_can_read_that_format() {
+        // Deliberately weaker than the test above, because this query really
+        // is close: "read the excel file" puts read_document, read_file and
+        // read_spreadsheet within 0.3 of each other. Two of those three are
+        // right — read_document handles spreadsheets too — and read_file,
+        // which cannot open one at all, currently lands second.
+        //
+        // That is a real weakness and it is recorded here rather than tuned
+        // away. The single informative word in the query reaches its
+        // capability through the synonym table, which discounts it, while the
+        // word carrying no information ("file") matches a name outright.
+        // Rarity weighting narrows the gap but does not close it. Widening
+        // the synonym tier until this one query comes out right would make
+        // the ranking a lookup table for the queries someone happened to
+        // test, which is worse than a known, written-down miss.
+        let (registry, _) = build_registry(&[]);
+        let matches = registry.search("read the excel file", 3);
+        let ids: Vec<&str> = matches.iter().map(|m| m.capability.id.0.as_str()).collect();
+        assert!(
+            ids.contains(&"builtin:read_spreadsheet"),
+            "a spreadsheet reader has to be offered: {ids:?}"
+        );
+        let top = matches.first().expect("something matched");
+        assert!(
+            matches!(
+                top.capability.id.0.as_str(),
+                "builtin:read_spreadsheet" | "builtin:read_document"
+            ),
+            "the best match must be able to read a spreadsheet, got {:?} because {:?}",
+            top.capability.id.0,
+            top.reasons.iter().map(|r| r.describe()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn searching_for_something_nothing_provides_says_that_in_words() {
+        let h = harness().await;
+        let (_, response) = rpc(
+            &h,
+            call(
+                "search_capabilities",
+                json!({"query": "book me a flight to Lisbon"}),
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        // The failure this guards: an empty list read as "Commonspace cannot
+        // do anything here", repeated to the person as fact.
+        assert!(!text.trim().is_empty(), "{text}");
+        assert!(
+            text.to_lowercase().contains("built-in") || text.contains("\"matches\""),
+            "{text}"
+        );
+        h.handle.expect("handle").shutdown().await;
     }
 
     #[tokio::test]

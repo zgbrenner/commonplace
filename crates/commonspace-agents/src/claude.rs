@@ -285,6 +285,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
             Some(&SandboxPolicy::for_session(
                 &request.workspace_roots,
                 &[".claude"],
+                &path,
             )),
         ) {
             Ok(cli) => cli,

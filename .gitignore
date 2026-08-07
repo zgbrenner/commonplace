@@ -28,3 +28,6 @@ tests/fixtures/generated/
 
 # Crux plugin local session state
 .crux/
+
+# Agent worktrees, created by tooling and never part of the project.
+.claude/worktrees/

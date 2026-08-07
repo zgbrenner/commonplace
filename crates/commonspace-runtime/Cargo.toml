@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+commonspace-capabilities.workspace = true
 commonspace-core.workspace = true
 commonspace-permissions.workspace = true
 commonspace-documents.workspace = true

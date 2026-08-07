@@ -152,6 +152,7 @@ impl AgentAdapter for CodexCliAdapter {
             Some(&crate::sandbox::SandboxPolicy::for_session(
                 &request.workspace_roots,
                 &[".codex"],
+                &path,
             )),
         )
         .map_err(|source| AdapterError::Spawn {
