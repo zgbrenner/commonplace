@@ -41,12 +41,13 @@
 
 use std::path::PathBuf;
 
-pub mod builtin;
 pub mod search;
 pub mod skills;
+pub mod tools;
 
 pub use search::{Match, Reason};
 pub use skills::{LoadReport, SkillError};
+pub use tools::from_tool_definitions;
 
 /// A capability's stable identifier, namespaced by source so two sources can
 /// never collide: `builtin:create_document`, `skill:quarterly-deck`,
@@ -56,7 +57,9 @@ pub use skills::{LoadReport, SkillError};
 /// generated: the model may cite an id in one turn and load it in the next,
 /// and a conversation replayed from the timeline has to resolve the same ids
 /// it resolved the first time.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct CapabilityId(pub String);
 
 impl CapabilityId {

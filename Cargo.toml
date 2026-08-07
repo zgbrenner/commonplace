@@ -6,6 +6,7 @@ members = [
     "crates/commonspace-documents",
     "crates/commonspace-storage",
     "crates/commonspace-agents",
+    "crates/commonspace-capabilities",
     "crates/commonspace-runtime",
     "apps/desktop/src-tauri",
 ]
@@ -36,6 +37,7 @@ commonspace-permissions = { path = "crates/commonspace-permissions" }
 commonspace-documents = { path = "crates/commonspace-documents" }
 commonspace-storage = { path = "crates/commonspace-storage" }
 commonspace-agents = { path = "crates/commonspace-agents" }
+commonspace-capabilities = { path = "crates/commonspace-capabilities" }
 commonspace-runtime = { path = "crates/commonspace-runtime" }
 
 [workspace.lints.rust]
