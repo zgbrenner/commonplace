@@ -152,7 +152,7 @@ jobs:
       # The .app bundle is a directory and is already inside the DMG, so the
       # DMG alone is uploaded for macOS.
       - name: Upload installers
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commonspace-${{ matrix.os }}-pr
           retention-days: 7
