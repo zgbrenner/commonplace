@@ -29,7 +29,11 @@ use std::path::PathBuf;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
-#[cfg(target_os = "macos")]
+// Deliberately not gated to macOS. The profile generator is pure string
+// building over `std` types, and it is the entire security boundary on that
+// platform — the place an unescaped workspace path could inject a directive
+// and quietly widen the sandbox. Compiling it everywhere means its tests run
+// in CI, which is Linux, instead of only on a developer's Mac.
 pub mod macos;
 #[cfg(windows)]
 pub mod windows;
