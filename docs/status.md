@@ -114,6 +114,27 @@ shipped binary, but no one has yet clicked through them:
   locations still interrupt for a separate answer. "Change plan" sends
   feedback back into planning; Cancel ends the task. Covered by unit and
   orchestrator tests; nobody has yet approved a plan in a packaged build.
+- OS-level containment of the provider CLI subprocess. Beyond the flags and
+  MCP-only mutation path described elsewhere in this file, a spawn now asks
+  the OS for a kernel-enforced floor and reports exactly what it got rather
+  than assuming: `Containment::Enforced` names the mechanism,
+  `Unavailable` gives the plain-language reason, `NotImplemented` says so
+  outright. Linux attempts Landlock, scoped to the authorized workspace
+  roots; a kernel without the `landlock` LSM enabled, or too old for the
+  ABI Commonspace targets, degrades to `Unavailable` rather than failing
+  the spawn. macOS attempts a `sandbox-exec` profile scoped the same way.
+  Windows returns `NotImplemented`: AppContainer does not fit a
+  filesystem-heavy CLI, and the mechanism that would actually hold — a
+  restricted token bound to a dedicated lower-privilege local account —
+  needs administrator-approved account provisioning this product does not
+  perform; the full evaluation is in
+  `crates/commonspace-agents/src/sandbox/windows.rs`. Each platform module
+  is covered by its own tests, but none of this has been exercised in a
+  packaged build on any of the three operating systems, so whether
+  Landlock and `sandbox-exec` actually apply on a real machine — as
+  opposed to compiling and passing under test — is unverified. See
+  THREAT_MODEL.md's sandboxing table for the rating this does and does not
+  change.
 - Spreadsheets. Reading `.xlsx`, `.xlsm`, `.xls`, `.xlsb` and `.ods` through
   `calamine`, plus `.csv` and `.tsv` parsed directly, with row and sheet
   limits so a large workbook cannot swamp a model's context; and creating a

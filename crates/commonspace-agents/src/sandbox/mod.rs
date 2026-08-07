@@ -70,6 +70,10 @@ pub enum Containment {
     /// aspirational: see `THREAT_MODEL.md` for why, and who else has and has
     /// not solved it.
     NotImplemented { platform: &'static str },
+    /// The caller asked for no confinement. Distinct from the three above so
+    /// a spawn that was never meant to be confined — an internal probe, a
+    /// test — cannot be mistaken for one whose confinement failed.
+    NotRequested,
 }
 
 impl Containment {
@@ -90,6 +94,7 @@ impl Containment {
             Containment::NotImplemented { platform } => {
                 format!("Not confined: Commonspace has no containment for {platform} yet.")
             }
+            Containment::NotRequested => "Not confined: none was asked for.".to_string(),
         }
     }
 }

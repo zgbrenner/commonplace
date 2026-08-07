@@ -141,7 +141,7 @@ release builds happen from a clean checkout via `scripts/release-check`.
 |---|---|---|
 | Commonspace native tools (fs, documents) | **Strong** | Deterministic Rust path policy; no shell interpretation |
 | Provider CLI configured sandbox (e.g. Codex sandbox modes, Claude Code permission modes) | **Partial, inherited** | As strong as the provider's implementation and the flags we set; documented per adapter |
-| OS-level containment of child processes | **Partial** | v1 uses process-tree control, timeouts, and resource limits where feasible; not a security boundary against a determined malicious CLI |
+| OS-level containment of child processes | **Partial** | Kernel-enforced confinement (Landlock on Linux, a `sandbox-exec` profile on macOS) where the platform supports it; no mechanism implemented on Windows; every spawn reports which of the three it got, never assumed. See "Where the state of the art actually is" below. |
 | Network policy | **Partial** | Policy-gated at the tool layer; no OS firewall integration in v1 |
 
 Commonspace never markets partial sandboxing as complete sandboxing. The
@@ -199,12 +199,56 @@ actually be constrained:
   dontAsk` and its own mutating tools in `--disallowedTools`, so mutations
   can only travel through Commonspace's own MCP tools.
 
-The honest sentence is that this is defence in depth by a cooperating
-process, not a kernel boundary. A provider CLI that deliberately broke out
-of its own sandbox is outside what Commonspace can stop — which is why the
-table above rates OS-level containment *partial* instead of claiming a
-boundary, and why real containment sits in the roadmap's security theme
-rather than in this document's mitigations.
+That list is still the floor everywhere. On top of it, Commonspace now
+attempts a kernel-enforced boundary where the platform actually offers one:
+
+- **Linux** attempts to confine the child with
+  [`landlock`](https://docs.rs/landlock), scoped to the authorized
+  workspace roots for writes and the specific read-only paths the CLI
+  needs (interpreter, provider config, credential cache). Landlock needs
+  `landlock` present in the kernel's `CONFIG_LSM` and an ABI version the
+  running kernel supports; a distribution or kernel that lacks either is
+  not treated as an error, it is reported.
+- **macOS** attempts a `sandbox-exec` profile scoped the same way.
+  `sandbox-exec` has been formally deprecated since 2016, as the survey
+  above notes, and Apple could remove it in a future release; that is a
+  live risk to this layer, not a hypothetical one.
+- **Windows** has no containment mechanism implemented. AppContainer does
+  not fit a filesystem-heavy CLI and the mechanism that would actually
+  hold — a restricted token bound to a dedicated lower-privileged local
+  account, the shape both Codex and `sandbox-runtime` converged on — needs
+  administrator-approved account provisioning this product does not
+  perform. `crates/commonspace-agents/src/sandbox/windows.rs` documents
+  the evaluation in full.
+
+Every one of those three outcomes is a distinct, named value
+(`Containment::Enforced`, `Unavailable`, `NotImplemented` in
+`crates/commonspace-agents/src/sandbox/mod.rs`) surfaced in diagnostics and
+the connections screen. The mechanism never blocks a spawn from starting —
+a kernel too old or a profile the OS rejects degrades to running
+uncontained rather than refusing to run — but it also never claims
+containment it does not have. The rule this project holds itself to
+throughout applies here without exception: a security property the user
+believes they have and does not is worse than one they know they lack.
+
+The honest sentence is that this is defence in depth *underneath* the
+controls above, not a replacement for them. Where Landlock or
+`sandbox-exec` actually applies, a prompt-injected or misbehaving agent
+trying to write outside the authorized workspace hits a kernel denial, not
+just a flag the CLI chose to respect. Where neither applies — an
+unsupported kernel, a missing LSM, any Windows machine, a future macOS
+without `sandbox-exec` — the CLI's own flags are what stands, exactly as
+before, and the running agent says so rather than implying otherwise. A
+provider CLI that deliberately broke out of a kernel sandbox it was given
+is still outside what Commonspace can stop, and containment is not
+guaranteed on any given machine even where it is implemented. That is why
+the table above keeps OS-level containment at *Partial* rather than
+promoting it to *Strong*: landing this layer does not, on its own, change
+that rating. The precise claim, the only one this document or the
+product's UI is entitled to make, is: Commonspace adds kernel-enforced
+containment under the provider CLI where the platform allows it, and
+tells you when it does not. "Commonspace sandboxes the provider" is not
+that claim and must not appear as if it were.
 
 ## Non-goals (v1)
 
