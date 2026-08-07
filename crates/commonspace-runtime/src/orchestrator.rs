@@ -742,7 +742,7 @@ impl Orchestrator {
         let op = self.storage.get_file_operation(file_operation_id)?;
         match fs.undo(&op) {
             Ok((result, undone)) => {
-                self.storage.record_file_operation(None, &undone)?;
+                self.storage.mark_file_operation_undone(&undone)?;
                 Ok(result)
             }
             Err(error) => Ok(commonspace_core::OperationResult::failed(

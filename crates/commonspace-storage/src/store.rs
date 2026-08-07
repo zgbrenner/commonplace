@@ -969,6 +969,26 @@ impl Storage {
         })
     }
 
+    /// Record that an operation was undone, leaving its task association
+    /// alone.
+    ///
+    /// Deliberately an `UPDATE` rather than the `INSERT OR REPLACE` above:
+    /// re-inserting the row would rewrite `task_id`, and the caller has only
+    /// the operation in hand, not the task that produced it. A row whose
+    /// `task_id` was nulled out disappears from a task's change history and
+    /// from whole-task undo — the file would be quietly missing from the
+    /// record of what the task did.
+    pub fn mark_file_operation_undone(&self, op: &FileOperation) -> Result<()> {
+        let json = serde_json::to_string(op)?;
+        self.with(|c| {
+            c.execute(
+                "UPDATE file_operations SET op_json = ?1, undone = ?2 WHERE id = ?3",
+                params![json, op.undone, op.id.0],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn file_operations_for_task(&self, task: &TaskId) -> Result<Vec<FileOperation>> {
         self.with(|c| {
             let mut stmt = c.prepare(
@@ -1753,6 +1773,37 @@ mod tests {
 
         let ids = s.task_file_operation_ids_newest_first(&task.id).unwrap();
         assert_eq!(ids, vec![second.id.0.clone(), first.id.0.clone()]);
+    }
+
+    /// Undoing one file must not detach it from its task. It used to: the
+    /// undo path re-recorded the operation with no task, and `INSERT OR
+    /// REPLACE` rewrote `task_id` to NULL — so the file vanished from the
+    /// task's change history and from whole-task undo.
+    #[test]
+    fn undoing_one_operation_keeps_it_in_its_task() {
+        use commonspace_documents::{FileOpKind, FileOperation};
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let task = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "p")
+            .unwrap();
+        let first = FileOperation::new(FileOpKind::Create, PathBuf::from("/ws/a.txt"));
+        let second = FileOperation::new(FileOpKind::Create, PathBuf::from("/ws/b.txt"));
+        s.record_file_operation(Some(&task.id), &first).unwrap();
+        s.record_file_operation(Some(&task.id), &second).unwrap();
+
+        let mut undone = first.clone();
+        undone.undone = true;
+        s.mark_file_operation_undone(&undone).unwrap();
+
+        let ids = s.task_file_operation_ids_newest_first(&task.id).unwrap();
+        assert_eq!(ids.len(), 2, "both operations still belong to the task");
+        assert!(ids.contains(&first.id.0));
+
+        let ops = s.file_operations_for_task(&task.id).unwrap();
+        assert_eq!(ops.len(), 2);
+        let stored = ops.iter().find(|o| o.id == first.id).expect("first op");
+        assert!(stored.undone, "the undone flag is persisted");
     }
 
     // ---- attachments ----

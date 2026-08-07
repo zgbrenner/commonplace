@@ -79,9 +79,17 @@ struct PlanEnvelope {
     roots: Vec<PathBuf>,
 }
 
+/// A request the user has not answered yet, and the task it belongs to.
+struct PendingRequest {
+    task_id: TaskId,
+    responder: oneshot::Sender<PermissionDecision>,
+}
+
 #[derive(Default)]
 struct BrokerState {
-    pending: HashMap<PermissionRequestId, oneshot::Sender<PermissionDecision>>,
+    /// Requests awaiting an answer, each remembering the task that raised it
+    /// so one task's cancellation cannot abandon another's open dialog.
+    pending: HashMap<PermissionRequestId, PendingRequest>,
     /// Grants remembered for the lifetime of one task.
     task_grants: HashMap<TaskId, HashSet<Grant>>,
     /// Grants remembered for a workspace (in-memory; the storage layer
@@ -160,7 +168,13 @@ impl PermissionBroker {
         let (tx, rx) = oneshot::channel();
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.pending.insert(id.clone(), tx);
+            state.pending.insert(
+                id.clone(),
+                PendingRequest {
+                    task_id: task_id.clone(),
+                    responder: tx,
+                },
+            );
         }
 
         let request = PermissionRequest {
@@ -202,7 +216,7 @@ impl PermissionBroker {
             state.pending.remove(id)
         };
         match sender {
-            Some(tx) => tx.send(decision).is_ok(),
+            Some(entry) => entry.responder.send(decision).is_ok(),
             None => false,
         }
     }
@@ -235,8 +249,10 @@ impl PermissionBroker {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.task_grants.remove(task_id);
         state.plan_envelopes.remove(task_id);
-        // Dropping the senders resolves the waiters as `Abandoned`.
-        state.pending.retain(|_, _| false);
+        // Dropping a sender resolves its waiter as `Abandoned` — but only
+        // this task's. With more than one task in flight, clearing the whole
+        // map would silently abandon another task's open approval dialog.
+        state.pending.retain(|_, entry| &entry.task_id != task_id);
     }
 
     /// Number of requests currently awaiting an answer.
@@ -465,6 +481,71 @@ mod tests {
         )
         .await;
         assert_eq!(elsewhere, PermissionOutcome::Denied);
+    }
+
+    /// Cancelling one task must not abandon another task's open dialog.
+    ///
+    /// The pending map used to be cleared wholesale, which was invisible
+    /// while only one task could run at a time and would have become a
+    /// trust-destroying bug the moment a queue allowed two.
+    #[tokio::test]
+    async fn abandoning_one_task_leaves_another_tasks_question_standing() {
+        let broker = PermissionBroker::new();
+        let task_a = TaskId::generate();
+        let task_b = TaskId::generate();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Two questions in flight, one per task. Neither is answered.
+        let ask_of = |task: TaskId, path: &str| {
+            let broker = broker.clone();
+            let tx = tx.clone();
+            let path = PathBuf::from(path);
+            tokio::spawn(async move {
+                broker
+                    .request(
+                        Ask {
+                            task_id: task,
+                            operation: OperationClass::Delete,
+                            summary: "Delete a file".into(),
+                            paths: vec![path],
+                            items: vec![],
+                            risk: RiskLevel::High,
+                            irreversible: true,
+                        },
+                        &tx,
+                    )
+                    .await
+            })
+        };
+        let a = ask_of(task_a.clone(), "C:/ws/a.txt");
+        let b = ask_of(task_b.clone(), "C:/ws/b.txt");
+
+        // Both requests have reached the broker before either is abandoned.
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            if let Some(AgentEvent::PermissionRequested { request }) = rx.recv().await {
+                ids.push((request.task_id.clone(), request.id));
+            }
+        }
+        assert_eq!(broker.pending_count(), 2);
+
+        broker.abandon_task(&task_a);
+
+        assert_eq!(
+            broker.pending_count(),
+            1,
+            "only task A's question is withdrawn"
+        );
+        assert_eq!(a.await.expect("join"), PermissionOutcome::Abandoned);
+
+        // Task B's question is still answerable, and its answer lands.
+        let (_, b_id) = ids
+            .iter()
+            .find(|(task, _)| task == &task_b)
+            .cloned()
+            .expect("task B asked");
+        assert!(broker.respond(&b_id, PermissionDecision::Deny));
+        assert_eq!(b.await.expect("join"), PermissionOutcome::Denied);
     }
 
     #[tokio::test]
