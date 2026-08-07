@@ -712,6 +712,79 @@ mod tests {
             (output.status.success(), detail)
         }
 
+        /// Where the boundary actually is, when the control half fails.
+        ///
+        /// The first run of this test on real hardware came back with signal
+        /// 6 and *nothing* on either stream, which rules out reading the
+        /// answer off stderr: either the profile denies writing to the
+        /// inherited pipes, or the child died before libsystem could say
+        /// anything. A wait status survives both — it comes from `waitpid`,
+        /// not from the child's ability to produce output — so this walks a
+        /// ladder from "can any binary start at all" up to the real case and
+        /// reports each rung's status. The first rung that fails is the
+        /// boundary, and one CI round locates it instead of a guess per
+        /// round.
+        fn containment_ladder(policy: &SandboxPolicy, workspace: &Path) -> String {
+            let (sandbox_exec, _, _) = wrap(Path::new("/bin/sh"), &[], policy);
+            let rungs: [(&str, Vec<String>); 5] = [
+                // Does anything start under this profile?
+                ("/usr/bin/true", vec![]),
+                // Does the shell start, and can it set an exit code without
+                // writing anywhere?
+                ("/bin/sh exit 7", vec!["-c".into(), "exit 7".into()]),
+                // Can it write to the inherited stdout pipe?
+                (
+                    "/bin/sh echo to stdout",
+                    vec!["-c".into(), "echo hi".into()],
+                ),
+                // Can it read the directory it is allowed to write in?
+                (
+                    "/bin/sh ls workspace",
+                    vec![
+                        "-c".into(),
+                        format!("ls {} > /dev/null", workspace.display()),
+                    ],
+                ),
+                // The real case.
+                (
+                    "/bin/sh redirect into workspace",
+                    vec![
+                        "-c".into(),
+                        format!("echo hi > {}/ladder.txt", workspace.display()),
+                    ],
+                ),
+            ];
+
+            let mut report =
+                String::from("\ncontainment ladder (first failing rung is the boundary):\n");
+            for (label, script) in rungs {
+                let program: &Path = if script.is_empty() {
+                    Path::new("/usr/bin/true")
+                } else {
+                    Path::new("/bin/sh")
+                };
+                let (_, args, _) = wrap(program, &script, policy);
+                let status = std::process::Command::new(&sandbox_exec)
+                    .args(&args)
+                    .output()
+                    .map(|o| o.status.to_string())
+                    .unwrap_or_else(|e| format!("could not run: {e}"));
+                report.push_str(&format!("  {label}: {status}\n"));
+            }
+            // The same ladder with no profile at all, so a rung that fails
+            // both ways is the runner's problem rather than the sandbox's.
+            let unconfined = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &format!("echo hi > {}/unconfined.txt", workspace.display()),
+                ])
+                .output()
+                .map(|o| o.status.to_string())
+                .unwrap_or_else(|e| format!("could not run: {e}"));
+            report.push_str(&format!("  same redirect with no profile: {unconfined}\n"));
+            report
+        }
+
         #[test]
         fn wrap_actually_confines_the_child() {
             let workspace = std::env::temp_dir().join(format!(
@@ -731,7 +804,12 @@ mod tests {
                 &policy,
                 &format!("echo hi > {}/ok.txt", workspace.display()),
             );
-            assert!(ok, "a write inside the workspace was refused\n{detail}");
+            if !ok {
+                panic!(
+                    "a write inside the workspace was refused\n{detail}{}",
+                    containment_ladder(&policy, &workspace)
+                );
+            }
             assert!(workspace.join("ok.txt").exists(), "{detail}");
 
             // The half that matters. `$HOME` itself is outside every allow
