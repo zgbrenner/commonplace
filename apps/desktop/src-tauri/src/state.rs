@@ -31,10 +31,7 @@ impl AppState {
         let data_dir = app.path().app_data_dir()?;
         std::fs::create_dir_all(&data_dir)?;
         let storage = Arc::new(Storage::open(&data_dir.join("commonspace.db"))?);
-        let orchestrator = Arc::new(Orchestrator::new(
-            Arc::clone(&storage),
-            data_dir.join("backups"),
-        ));
+        let orchestrator = Arc::new(Orchestrator::new(Arc::clone(&storage), data_dir));
 
         Ok(Self {
             orchestrator,

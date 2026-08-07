@@ -16,6 +16,7 @@ pub mod inspect;
 pub mod journal;
 pub mod office;
 pub mod sheets;
+pub mod staging;
 pub mod textio;
 
 pub use backup::BackupStore;
@@ -31,3 +32,4 @@ pub use sheets::{
     create_xlsx, read_spreadsheet, CellValue, ColumnFormat, NewColumn, NewSheet, ReadLimits, Sheet,
     Workbook,
 };
+pub use staging::{StagedChange, StagedChangeId, StagedKind, StagingError, StagingStore};

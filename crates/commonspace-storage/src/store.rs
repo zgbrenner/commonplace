@@ -1,12 +1,12 @@
 //! Typed storage API. One `Storage` handle per app, internally synchronized.
 
 use crate::migrations::migrate_to_latest;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use commonspace_core::{
     AgentEvent, Artifact, ArtifactKind, ConversationId, MessageId, MessageRole, ProviderId,
     SessionId, TaskId, TaskPlan, TaskState, WorkspaceId,
 };
-use commonspace_documents::FileOperation;
+use commonspace_documents::{FileOperation, StagedChange, StagedChangeId, StagedKind};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -194,6 +194,21 @@ pub struct SessionRecord {
     pub provider: ProviderId,
     pub provider_session_id: Option<String>,
     pub resumable: bool,
+}
+
+/// A staged change plus how it was resolved. `applied_at` and
+/// `discarded_at` are mutually exclusive in practice — a change is at most
+/// one of applied or discarded — and both `None` means it is still pending.
+///
+/// This is what `all_staged_changes_for_task` returns rather than a bare
+/// `StagedChange`: the audit view's whole point is to show what became of a
+/// proposal, which is exactly the information `StagedChange` itself does not
+/// carry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagedChangeRecord {
+    pub change: StagedChange,
+    pub applied_at: Option<DateTime<Utc>>,
+    pub discarded_at: Option<DateTime<Utc>>,
 }
 
 /// The storage handle.
@@ -396,6 +411,30 @@ fn state_from(s: &str) -> Result<TaskState> {
     Ok(serde_json::from_value(serde_json::Value::String(
         s.to_owned(),
     ))?)
+}
+
+fn staged_kind_str(kind: StagedKind) -> Result<String> {
+    Ok(serde_json::to_value(kind)?
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_default())
+}
+
+fn staged_kind_from(s: &str) -> Result<StagedKind> {
+    Ok(serde_json::from_value(serde_json::Value::String(
+        s.to_owned(),
+    ))?)
+}
+
+/// Parse a stored RFC 3339 timestamp, degrading to "now" rather than failing
+/// the whole row. The same leniency `list_artifacts` already uses for
+/// `Artifact::created_at`: a timestamp this layer wrote itself should always
+/// parse, and a row that doesn't is not worth losing the rest of the query
+/// over.
+fn parse_stored_timestamp(raw: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
 }
 
 impl Storage {
@@ -1451,6 +1490,212 @@ impl Storage {
                 })
             })?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    // ---- staged changes ----
+
+    /// Persist a proposed change, replacing it if `change.id` was already
+    /// recorded — idempotent the same way `record_artifact` and
+    /// `record_file_operation` are, so an agent that restates a proposal
+    /// after a retry does not duplicate it.
+    ///
+    /// Replacing also resets `applied_at`/`discarded_at` to unset, which is
+    /// the right behavior for what this call means: re-staging the same id
+    /// is a fresh proposal, not yet resolved by anything.
+    pub fn record_staged_change(&self, task: &TaskId, change: &StagedChange) -> Result<()> {
+        let kind = staged_kind_str(change.kind)?;
+        self.with(|c| {
+            c.execute(
+                "INSERT OR REPLACE INTO staged_changes
+                 (id, task_id, kind, target, destination, staged_content,
+                  hash_before, hash_after, size_after, summary, staged_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    change.id.0,
+                    task.0,
+                    kind,
+                    change.target.to_string_lossy(),
+                    change
+                        .destination
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    change
+                        .staged_content
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    change.hash_before,
+                    change.hash_after,
+                    change.size_after.map(|s| s as i64),
+                    change.summary,
+                    change.staged_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// A task's proposed changes still awaiting a decision, oldest first —
+    /// what the staging panel renders.
+    pub fn staged_changes_for_task(&self, task: &TaskId) -> Result<Vec<StagedChange>> {
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, kind, target, destination, staged_content,
+                        hash_before, hash_after, size_after, summary, staged_at
+                 FROM staged_changes
+                 WHERE task_id = ?1 AND applied_at IS NULL AND discarded_at IS NULL
+                 ORDER BY staged_at, rowid",
+            )?;
+            let rows = stmt
+                .query_map([&task.0], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<i64>>(7)?,
+                        r.get::<_, String>(8)?,
+                        r.get::<_, String>(9)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(
+                    |(id, kind, target, dest, staged_content, hb, ha, size, summary, staged_at)| {
+                        Ok(StagedChange {
+                            id: StagedChangeId(id),
+                            kind: staged_kind_from(&kind)?,
+                            target: PathBuf::from(target),
+                            destination: dest.map(PathBuf::from),
+                            staged_content: staged_content.map(PathBuf::from),
+                            hash_before: hb,
+                            hash_after: ha,
+                            size_after: size.map(|s| s as u64),
+                            summary,
+                            staged_at: parse_stored_timestamp(&staged_at),
+                        })
+                    },
+                )
+                .collect()
+        })
+    }
+
+    /// Every change ever staged for a task, oldest first, each carrying
+    /// whatever it was resolved to — the audit trail the Changes view reads.
+    /// A resolved row stays in the table rather than being deleted, which is
+    /// what makes this different from `staged_changes_for_task` above.
+    pub fn all_staged_changes_for_task(&self, task: &TaskId) -> Result<Vec<StagedChangeRecord>> {
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, kind, target, destination, staged_content,
+                        hash_before, hash_after, size_after, summary, staged_at,
+                        applied_at, discarded_at
+                 FROM staged_changes WHERE task_id = ?1
+                 ORDER BY staged_at, rowid",
+            )?;
+            let rows = stmt
+                .query_map([&task.0], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<i64>>(7)?,
+                        r.get::<_, String>(8)?,
+                        r.get::<_, String>(9)?,
+                        r.get::<_, Option<String>>(10)?,
+                        r.get::<_, Option<String>>(11)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(
+                    |(
+                        id,
+                        kind,
+                        target,
+                        dest,
+                        staged_content,
+                        hb,
+                        ha,
+                        size,
+                        summary,
+                        staged_at,
+                        applied,
+                        discarded,
+                    )| {
+                        Ok(StagedChangeRecord {
+                            change: StagedChange {
+                                id: StagedChangeId(id),
+                                kind: staged_kind_from(&kind)?,
+                                target: PathBuf::from(target),
+                                destination: dest.map(PathBuf::from),
+                                staged_content: staged_content.map(PathBuf::from),
+                                hash_before: hb,
+                                hash_after: ha,
+                                size_after: size.map(|s| s as u64),
+                                summary,
+                                staged_at: parse_stored_timestamp(&staged_at),
+                            },
+                            applied_at: applied.as_deref().map(parse_stored_timestamp),
+                            discarded_at: discarded.as_deref().map(parse_stored_timestamp),
+                        })
+                    },
+                )
+                .collect()
+        })
+    }
+
+    /// Record that a staged change was applied to the user's files.
+    pub fn mark_staged_change_applied(&self, id: &StagedChangeId) -> Result<()> {
+        self.with(|c| {
+            let changed = c.execute(
+                "UPDATE staged_changes SET applied_at = ?1 WHERE id = ?2",
+                params![now(), id.0],
+            )?;
+            if changed == 0 {
+                return Err(StorageError::NotFound(format!("staged change {}", id.0)));
+            }
+            Ok(())
+        })
+    }
+
+    /// Record that a staged change was discarded without touching the
+    /// user's files.
+    pub fn mark_staged_change_discarded(&self, id: &StagedChangeId) -> Result<()> {
+        self.with(|c| {
+            let changed = c.execute(
+                "UPDATE staged_changes SET discarded_at = ?1 WHERE id = ?2",
+                params![now(), id.0],
+            )?;
+            if changed == 0 {
+                return Err(StorageError::NotFound(format!("staged change {}", id.0)));
+            }
+            Ok(())
+        })
+    }
+
+    /// Tasks with at least one change still awaiting a decision, ordered by
+    /// their oldest pending change — what a launch check reads to tell
+    /// someone work was left unresolved when the app last closed.
+    pub fn tasks_with_pending_changes(&self) -> Result<Vec<TaskId>> {
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT task_id FROM staged_changes
+                 WHERE applied_at IS NULL AND discarded_at IS NULL
+                 GROUP BY task_id
+                 ORDER BY MIN(staged_at)",
+            )?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows.into_iter().map(TaskId).collect())
         })
     }
 
@@ -2678,5 +2923,260 @@ mod tests {
         assert_eq!(message_hits[0].conversation_id, "conv_1");
         assert_eq!(message_hits[0].title, "Legacy penguin notes");
         assert!(message_hits[0].snippet.contains("walrus"));
+    }
+
+    // ---- staged changes ----
+
+    fn staged_change(id: &str, kind: StagedKind, staged_at: &str) -> StagedChange {
+        StagedChange {
+            id: StagedChangeId(id.into()),
+            kind,
+            target: PathBuf::from("/ws/a.txt"),
+            destination: None,
+            staged_content: None,
+            hash_before: None,
+            hash_after: None,
+            size_after: None,
+            summary: "did something".into(),
+            staged_at: chrono::DateTime::parse_from_rfc3339(staged_at)
+                .unwrap()
+                .with_timezone(&Utc),
+        }
+    }
+
+    #[test]
+    fn every_staged_kind_round_trips() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let task = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "p")
+            .unwrap();
+
+        let kinds = [
+            StagedKind::Create,
+            StagedKind::Modify,
+            StagedKind::Rename,
+            StagedKind::Move,
+            StagedKind::Delete,
+        ];
+        for (i, kind) in kinds.iter().enumerate() {
+            let change = staged_change(
+                &format!("staged_{i}"),
+                *kind,
+                &format!("2026-01-01T00:00:0{i}Z"),
+            );
+            s.record_staged_change(&task.id, &change).unwrap();
+        }
+
+        let pending = s.staged_changes_for_task(&task.id).unwrap();
+        assert_eq!(pending.len(), 5);
+        for (row, kind) in pending.iter().zip(kinds.iter()) {
+            assert_eq!(row.kind, *kind);
+        }
+    }
+
+    #[test]
+    fn nullable_staged_change_fields_stay_null() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let task = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "p")
+            .unwrap();
+        let change = staged_change("staged_1", StagedKind::Create, "2026-01-01T00:00:00Z");
+        s.record_staged_change(&task.id, &change).unwrap();
+
+        let pending = s.staged_changes_for_task(&task.id).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].destination, None);
+        assert_eq!(pending[0].staged_content, None);
+        assert_eq!(pending[0].hash_before, None);
+        assert_eq!(pending[0].hash_after, None);
+        assert_eq!(pending[0].size_after, None);
+
+        let all = s.all_staged_changes_for_task(&task.id).unwrap();
+        assert_eq!(all[0].applied_at, None);
+        assert_eq!(all[0].discarded_at, None);
+    }
+
+    #[test]
+    fn a_full_staged_change_round_trips_every_field() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let task = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "p")
+            .unwrap();
+        let change = StagedChange {
+            id: StagedChangeId("staged_1".into()),
+            kind: StagedKind::Rename,
+            target: PathBuf::from("/ws/old.txt"),
+            destination: Some(PathBuf::from("/ws/new.txt")),
+            staged_content: Some(PathBuf::from("/staging/blob_1")),
+            hash_before: Some("aa".into()),
+            hash_after: Some("bb".into()),
+            size_after: Some(4096),
+            summary: "Renamed old.txt to new.txt".into(),
+            staged_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        s.record_staged_change(&task.id, &change).unwrap();
+
+        let pending = s.staged_changes_for_task(&task.id).unwrap();
+        assert_eq!(pending, vec![change]);
+    }
+
+    #[test]
+    fn record_staged_change_is_idempotent_on_id() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let task = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "p")
+            .unwrap();
+        let mut change = staged_change("staged_1", StagedKind::Create, "2026-01-01T00:00:00Z");
+        s.record_staged_change(&task.id, &change).unwrap();
+        change.summary = "Created a.txt (updated)".into();
+        s.record_staged_change(&task.id, &change).unwrap();
+
+        let pending = s.staged_changes_for_task(&task.id).unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the second call replaced the row, not duplicated it"
+        );
+        assert_eq!(pending[0].summary, "Created a.txt (updated)");
+    }
+
+    #[test]
+    fn pending_and_resolved_changes_are_filtered_and_ordered() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let task = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "p")
+            .unwrap();
+        let first = staged_change("staged_1", StagedKind::Create, "2026-01-01T00:00:01Z");
+        let second = staged_change("staged_2", StagedKind::Modify, "2026-01-01T00:00:02Z");
+        let third = staged_change("staged_3", StagedKind::Delete, "2026-01-01T00:00:03Z");
+        // Recorded out of staged_at order, to prove ordering comes from the
+        // column and not from insertion order.
+        s.record_staged_change(&task.id, &third).unwrap();
+        s.record_staged_change(&task.id, &first).unwrap();
+        s.record_staged_change(&task.id, &second).unwrap();
+
+        s.mark_staged_change_applied(&second.id).unwrap();
+
+        let pending = s.staged_changes_for_task(&task.id).unwrap();
+        assert_eq!(
+            pending.iter().map(|c| c.id.0.clone()).collect::<Vec<_>>(),
+            vec!["staged_1".to_string(), "staged_3".to_string()],
+            "resolved changes are excluded and the rest stay oldest first"
+        );
+
+        let all = s.all_staged_changes_for_task(&task.id).unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|c| c.change.id.0.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "staged_1".to_string(),
+                "staged_2".to_string(),
+                "staged_3".to_string()
+            ],
+            "the audit view keeps every change, oldest first"
+        );
+        assert!(all[1].applied_at.is_some());
+        assert!(all[0].applied_at.is_none());
+        assert!(all[0].discarded_at.is_none());
+    }
+
+    #[test]
+    fn applying_and_discarding_mark_the_right_row_and_report_unknown_ids() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let task = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "p")
+            .unwrap();
+        let applied = staged_change("staged_1", StagedKind::Create, "2026-01-01T00:00:01Z");
+        let discarded = staged_change("staged_2", StagedKind::Create, "2026-01-01T00:00:02Z");
+        s.record_staged_change(&task.id, &applied).unwrap();
+        s.record_staged_change(&task.id, &discarded).unwrap();
+
+        s.mark_staged_change_applied(&applied.id).unwrap();
+        s.mark_staged_change_discarded(&discarded.id).unwrap();
+
+        let all = s.all_staged_changes_for_task(&task.id).unwrap();
+        let applied_row = all.iter().find(|c| c.change.id.0 == "staged_1").unwrap();
+        assert!(applied_row.applied_at.is_some());
+        assert!(applied_row.discarded_at.is_none());
+        let discarded_row = all.iter().find(|c| c.change.id.0 == "staged_2").unwrap();
+        assert!(discarded_row.discarded_at.is_some());
+        assert!(discarded_row.applied_at.is_none());
+
+        assert!(matches!(
+            s.mark_staged_change_applied(&StagedChangeId("staged_missing".into())),
+            Err(StorageError::NotFound(_))
+        ));
+        assert!(matches!(
+            s.mark_staged_change_discarded(&StagedChangeId("staged_missing".into())),
+            Err(StorageError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn staged_changes_are_dropped_when_their_task_is_deleted() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let task = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "p")
+            .unwrap();
+        let change = staged_change("staged_1", StagedKind::Create, "2026-01-01T00:00:00Z");
+        s.record_staged_change(&task.id, &change).unwrap();
+        assert_eq!(s.staged_changes_for_task(&task.id).unwrap().len(), 1);
+
+        s.with(|c| {
+            c.execute("DELETE FROM tasks WHERE id = ?1", [&task.id.0])?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(s.staged_changes_for_task(&task.id).unwrap().is_empty());
+        assert!(s.all_staged_changes_for_task(&task.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tasks_with_pending_changes_lists_only_unresolved_tasks_oldest_first() {
+        let s = storage();
+        let conv = s.create_conversation(None, "t").unwrap();
+        let quiet_task = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "quiet")
+            .unwrap();
+        let resolved_task = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "resolved")
+            .unwrap();
+        let pending_task_a = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "a")
+            .unwrap();
+        let pending_task_b = s
+            .create_task(&conv.id, None, ProviderId::ClaudeCode, "b")
+            .unwrap();
+
+        // A task with no staged changes at all does not show up.
+        let _ = &quiet_task;
+
+        let resolved = staged_change("staged_r", StagedKind::Create, "2026-01-01T00:00:01Z");
+        s.record_staged_change(&resolved_task.id, &resolved)
+            .unwrap();
+        s.mark_staged_change_discarded(&resolved.id).unwrap();
+
+        // pending_task_b's change was staged before pending_task_a's, so it
+        // must come first.
+        let b_change = staged_change("staged_b", StagedKind::Create, "2026-01-01T00:00:02Z");
+        let a_change = staged_change("staged_a", StagedKind::Create, "2026-01-01T00:00:03Z");
+        s.record_staged_change(&pending_task_b.id, &b_change)
+            .unwrap();
+        s.record_staged_change(&pending_task_a.id, &a_change)
+            .unwrap();
+
+        let pending_tasks = s.tasks_with_pending_changes().unwrap();
+        assert_eq!(pending_tasks, vec![pending_task_b.id, pending_task_a.id]);
     }
 }

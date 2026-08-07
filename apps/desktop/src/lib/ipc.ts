@@ -229,6 +229,90 @@ export const resumableSession = (conversationId: string): Promise<ResumableSessi
 export const undoTask = (workspaceId: string, taskId: string): Promise<OperationResult[]> =>
   call("undo_task", { workspaceId, taskId }, z.array(operationResultSchema));
 
+/* ---------------------------------------------------------------- staging */
+
+/**
+ * One change an agent has proposed and Commonspace is holding outside the
+ * user's files until they say yes.
+ *
+ * `staged_content` is deliberately absent from this shape: the bytes live on
+ * disk in the staging area and are fetched per change through `stagedDiff`,
+ * so opening a project does not drag every proposed file into the renderer.
+ */
+export const stagedChangeSchema = z.object({
+  id: z.string(),
+  task_id: z.string(),
+  kind: z.enum(["create", "modify", "rename", "move", "delete"]),
+  /** The user's file this would affect. */
+  target: z.string(),
+  /** Destination for a rename or move; null for every other kind. */
+  destination: z.string().nullish(),
+  /** Plain-language description of the change, e.g. "Update Q3-report.docx". */
+  summary: z.string(),
+  size_after: z.number().nullish(),
+  /** Set when the file changed on disk after this was staged. */
+  conflicted: z.boolean(),
+  staged_at: z.string(),
+});
+export type StagedChange = z.infer<typeof stagedChangeSchema>;
+
+export const listStagedChanges = (taskId: string): Promise<StagedChange[]> =>
+  call("list_staged_changes", { taskId }, z.array(stagedChangeSchema));
+
+/** One contiguous run of changed lines, as the diff engine produced it. */
+export const diffLineSchema = z.object({
+  kind: z.enum(["context", "removed", "added"]),
+  old_line: z.number().nullish(),
+  new_line: z.number().nullish(),
+  spans: z.array(z.object({ text: z.string(), emphasized: z.boolean() })),
+});
+export const changePreviewSchema = z.object({
+  added_lines: z.number(),
+  removed_lines: z.number(),
+  hunks: z.array(
+    z.object({
+      old_start: z.number(),
+      old_lines: z.number(),
+      new_start: z.number(),
+      new_lines: z.number(),
+      lines: z.array(diffLineSchema),
+    }),
+  ),
+  truncated: z.boolean(),
+  basis: z.enum(["full_text", "extracted_text"]),
+  /** Present when the change could not be shown as a diff. */
+  summary: z
+    .object({
+      reason: z.enum(["too_large", "not_text"]),
+      old_bytes: z.number(),
+      new_bytes: z.number(),
+      old_lines: z.number().nullish(),
+      new_lines: z.number().nullish(),
+    })
+    .nullish(),
+  /** Honest caveat to show alongside the diff, when one applies. */
+  caveat: z.string().nullish(),
+});
+export type ChangePreview = z.infer<typeof changePreviewSchema>;
+
+export const stagedDiff = (taskId: string, changeId: string): Promise<ChangePreview> =>
+  call("staged_diff", { taskId, changeId }, changePreviewSchema);
+
+/**
+ * Apply staged changes to the user's files. Each one goes through the same
+ * backed-up, verified, journalled path a direct write always took, so undo
+ * still works afterwards. Pass a subset of ids to apply only those.
+ */
+export const applyStagedChanges = (
+  taskId: string,
+  changeIds: string[],
+): Promise<OperationResult[]> =>
+  call("apply_staged_changes", { taskId, changeIds }, z.array(operationResultSchema));
+
+/** Throw staged changes away without touching the user's files. */
+export const discardStagedChanges = (taskId: string, changeIds: string[]) =>
+  call("discard_staged_changes", { taskId, changeIds }, z.void().or(z.null()));
+
 /* ------------------------------------------------------------ attachments */
 
 /** A persisted attachment: metadata only, never file contents. */

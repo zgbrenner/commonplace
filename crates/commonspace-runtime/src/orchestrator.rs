@@ -20,7 +20,7 @@ use commonspace_core::{
     titles, AgentErrorInfo, AgentEvent, ConversationId, MessageRole, PlanStep, ProviderId, TaskId,
     TaskPlan, TaskState, WorkspaceId,
 };
-use commonspace_documents::{BackupStore, SafeFs};
+use commonspace_documents::{BackupStore, SafeFs, StagedChange, StagedKind, StagingStore};
 use commonspace_permissions::{PathGuard, PolicyEngine, PolicySettings};
 use commonspace_storage::{Storage, StorageError};
 use std::collections::HashMap;
@@ -191,6 +191,11 @@ pub struct Orchestrator {
     storage: Arc<Storage>,
     broker: PermissionBroker,
     backup_root: PathBuf,
+    /// Where proposed changes wait until someone reviews them. Kept beside
+    /// the backups rather than inside a workspace: a staging area under the
+    /// user's own folders would be a place their files could appear without
+    /// them having asked for it.
+    staging_root: PathBuf,
     policy_settings: PolicySettings,
     /// Tasks holding in `AwaitingApproval`, keyed by task. In-memory only:
     /// after a restart the sessions are gone, and crash recovery fails these
@@ -199,11 +204,17 @@ pub struct Orchestrator {
 }
 
 impl Orchestrator {
-    pub fn new(storage: Arc<Storage>, backup_root: PathBuf) -> Self {
+    /// Build an orchestrator rooted at the application's data directory.
+    /// Backups and staged proposals are separate trees under it: a backup is
+    /// a copy of something that already happened, a staged change is
+    /// something that has not, and mixing them would make cleaning up either
+    /// one risk the other.
+    pub fn new(storage: Arc<Storage>, data_dir: PathBuf) -> Self {
         Self {
             storage,
             broker: PermissionBroker::new(),
-            backup_root,
+            backup_root: data_dir.join("backups"),
+            staging_root: data_dir.join("staged"),
             policy_settings: PolicySettings::default(),
             pending: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -495,11 +506,17 @@ impl Orchestrator {
 
         let guard = PathGuard::new(&roots);
         let backups = BackupStore::new(self.backup_root.join(request.workspace_id.as_ref()));
+        // Per task, not per workspace: a proposal belongs to the piece of
+        // work that offered it, and abandoning that work should take its
+        // unreviewed changes with it rather than leaving them for the next
+        // task to inherit.
+        let staging = StagingStore::new(self.staging_root.join(task_id.as_ref()));
         let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
         let context = Arc::new(ToolContext {
             task_id: task_id.clone(),
             policy: PolicyEngine::new(guard.clone(), self.policy_settings.clone()),
             fs: SafeFs::new(guard, backups),
+            staging,
             broker: self.broker.clone(),
             events: events.clone(),
             journal: journal_tx,
@@ -739,6 +756,106 @@ impl Orchestrator {
     }
 
     /// Undo one journaled file operation, verifying it is still safe.
+    /// Everything this task has proposed and nobody has answered yet, each
+    /// paired with whether it currently conflicts.
+    ///
+    /// Conflict is deliberately not a stored column: it is a fact about the
+    /// disk at the moment someone looks, not about the proposal. A file the
+    /// person edited five minutes ago makes a change conflicted without
+    /// anything about the change having altered.
+    pub fn staged_changes(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Vec<(StagedChange, bool)>, OrchestratorError> {
+        let store = self.staging_store(task_id);
+        Ok(self
+            .storage
+            .staged_changes_for_task(task_id)?
+            .into_iter()
+            .map(|change| {
+                let conflicted = store.is_conflicted(&change);
+                (change, conflicted)
+            })
+            .collect())
+    }
+
+    /// Compare a proposal against the file it would replace.
+    pub fn staged_diff(
+        &self,
+        task_id: &TaskId,
+        change_id: &str,
+    ) -> Result<commonspace_documents::ChangePreview, OrchestratorError> {
+        let change = self
+            .storage
+            .staged_changes_for_task(task_id)?
+            .into_iter()
+            .find(|change| change.id.as_ref() == change_id)
+            .ok_or_else(|| OrchestratorError::UnknownTask(change_id.to_string()))?;
+        let store = self.staging_store(task_id);
+        Ok(preview_of(&store, &change))
+    }
+
+    /// Turn accepted proposals into real writes, oldest first so a rename
+    /// that depends on an earlier create still finds its file.
+    ///
+    /// Each one goes through `SafeFs`, so a change applied here is backed up,
+    /// verified on disk and journalled exactly as a direct write always was —
+    /// undo keeps working afterwards. A conflicted change fails on its own
+    /// and leaves the rest of the set alone; one refusal is not a reason to
+    /// abandon the others.
+    pub fn apply_staged(
+        &self,
+        workspace_id: &WorkspaceId,
+        task_id: &TaskId,
+        change_ids: &[String],
+    ) -> Result<Vec<commonspace_core::OperationResult>, OrchestratorError> {
+        let roots = self.storage.workspace_roots(workspace_id)?;
+        let fs = SafeFs::new(
+            PathGuard::new(&roots),
+            BackupStore::new(self.backup_root.join(workspace_id.as_ref())),
+        );
+        let store = self.staging_store(task_id);
+        let mut results = Vec::new();
+        for change in self.storage.staged_changes_for_task(task_id)? {
+            if !change_ids.iter().any(|id| id == change.id.as_ref()) {
+                continue;
+            }
+            match commonspace_documents::staging::apply(&fs, &store, &change) {
+                Ok((result, op)) => {
+                    self.storage.record_file_operation(Some(task_id), &op)?;
+                    self.storage.mark_staged_change_applied(&change.id)?;
+                    let _ = store.discard(&change);
+                    results.push(result);
+                }
+                Err(error) => results.push(commonspace_core::OperationResult::failed(
+                    format!("{} was not applied.", display_target(&change)),
+                    error.to_string(),
+                )),
+            }
+        }
+        Ok(results)
+    }
+
+    /// Throw proposals away. The user's files are not touched.
+    pub fn discard_staged(
+        &self,
+        task_id: &TaskId,
+        change_ids: &[String],
+    ) -> Result<(), OrchestratorError> {
+        let store = self.staging_store(task_id);
+        for change in self.storage.staged_changes_for_task(task_id)? {
+            if change_ids.iter().any(|id| id == change.id.as_ref()) {
+                let _ = store.discard(&change);
+                self.storage.mark_staged_change_discarded(&change.id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn staging_store(&self, task_id: &TaskId) -> StagingStore {
+        StagingStore::new(self.staging_root.join(task_id.as_ref()))
+    }
+
     pub fn undo(
         &self,
         workspace_id: &WorkspaceId,
@@ -930,6 +1047,67 @@ pub fn user_facing_error(message: impl Into<String>, recovery: Option<String>) -
     }
 }
 
+/// A proposal's comparison against what is on disk today.
+///
+/// Office formats are compared through the text Commonspace can extract from
+/// them, which is honest but partial — a change to formatting alone produces
+/// an identical extraction. The preview carries that caveat so the screen can
+/// say so rather than showing an empty diff that reads as "nothing changed".
+fn preview_of(store: &StagingStore, change: &StagedChange) -> commonspace_documents::ChangePreview {
+    use commonspace_documents::{
+        extracted_text_diff, looks_binary, shape_summary, text_diff, ComparisonBasis, DiffBudget,
+        SummaryReason,
+    };
+
+    let budget = DiffBudget::default();
+    let old_bytes = std::fs::read(&change.target).unwrap_or_default();
+    let new_bytes = match change.kind {
+        // A deletion has no "after", and a relocation leaves the bytes alone;
+        // in both cases the file list already says what happens, and a diff
+        // of a file against itself would say nothing.
+        StagedKind::Delete | StagedKind::Rename | StagedKind::Move => Vec::new(),
+        _ => store.staged_bytes(change).unwrap_or_default(),
+    };
+
+    if matches!(change.kind, StagedKind::Delete) {
+        return shape_summary(
+            &old_bytes,
+            &[],
+            SummaryReason::NotText,
+            ComparisonBasis::FullText,
+        );
+    }
+    if looks_binary(&old_bytes) || looks_binary(&new_bytes) {
+        // Extraction belongs to the document readers, which need a path and a
+        // format; until the studio asks for that, say plainly that this one
+        // cannot be shown as text rather than rendering bytes as characters.
+        return shape_summary(
+            &old_bytes,
+            &new_bytes,
+            SummaryReason::NotText,
+            ComparisonBasis::ExtractedText,
+        );
+    }
+    let (old_text, new_text) = (
+        String::from_utf8_lossy(&old_bytes),
+        String::from_utf8_lossy(&new_bytes),
+    );
+    if matches!(change.kind, StagedKind::Create) {
+        return text_diff("", &new_text, budget);
+    }
+    let _ = extracted_text_diff;
+    text_diff(&old_text, &new_text, budget)
+}
+
+/// The file a proposal is about, named the way a person would name it.
+fn display_target(change: &StagedChange) -> String {
+    change
+        .target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| change.target.display().to_string())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -953,7 +1131,7 @@ mod tests {
         let workspace = storage
             .create_workspace("Test", std::slice::from_ref(&ws_dir))
             .expect("workspace row");
-        let orchestrator = Orchestrator::new(Arc::clone(&storage), tmp.path().join("backups"));
+        let orchestrator = Orchestrator::new(Arc::clone(&storage), tmp.path().to_path_buf());
         (tmp, orchestrator, workspace.id, ws_dir)
     }
 

@@ -671,6 +671,123 @@ pub fn list_conversation_attachments(
 /// any remaining error (say, an operation row that vanished mid-loop) is
 /// folded into a failed result too — one stubborn file must never stop the
 /// rest of the task from being rolled back.
+/// One proposed change, in the shape the studio validates.
+///
+/// `conflicted` is computed at read time rather than stored: whether a
+/// proposal still matches the file it was prepared against is a fact about
+/// the disk right now, and the person may have edited that file since.
+#[derive(Debug, Serialize)]
+pub struct StagedChangeInfo {
+    id: String,
+    task_id: String,
+    kind: &'static str,
+    target: String,
+    destination: Option<String>,
+    summary: String,
+    size_after: Option<u64>,
+    conflicted: bool,
+    staged_at: String,
+}
+
+#[tauri::command]
+pub fn list_staged_changes(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<Vec<StagedChangeInfo>> {
+    let task = TaskId(task_id);
+    Ok(state
+        .orchestrator()
+        .staged_changes(&task)?
+        .into_iter()
+        .map(|(change, conflicted)| StagedChangeInfo {
+            id: change.id.as_ref().to_string(),
+            task_id: task.0.clone(),
+            kind: staged_kind_name(change.kind),
+            target: change.target.display().to_string(),
+            destination: change.destination.as_ref().map(|p| p.display().to_string()),
+            summary: change.summary,
+            size_after: change.size_after,
+            conflicted,
+            staged_at: change.staged_at.to_rfc3339(),
+        })
+        .collect())
+}
+
+/// The wire name for a change's kind. Written out rather than derived so the
+/// frontend's union and this list cannot drift apart silently.
+fn staged_kind_name(kind: commonspace_documents::StagedKind) -> &'static str {
+    use commonspace_documents::StagedKind::*;
+    match kind {
+        Create => "create",
+        Modify => "modify",
+        Rename => "rename",
+        Move => "move",
+        Delete => "delete",
+    }
+}
+
+#[tauri::command]
+pub fn staged_diff(
+    state: State<'_, AppState>,
+    task_id: String,
+    change_id: String,
+) -> Result<serde_json::Value> {
+    let preview = state
+        .orchestrator()
+        .staged_diff(&TaskId(task_id), &change_id)?;
+    // The caveat is derived rather than stored, and the studio always shows
+    // it — for an Office file whose extracted text is unchanged it is the
+    // only thing separating "nothing happened" from "the formatting changed".
+    let caveat = preview.caveat();
+    let mut value = serde_json::to_value(&preview)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "caveat".into(),
+            caveat.map(Into::into).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    Ok(value)
+}
+
+#[tauri::command]
+pub fn apply_staged_changes(
+    state: State<'_, AppState>,
+    task_id: String,
+    change_ids: Vec<String>,
+) -> Result<Vec<OperationResult>> {
+    // The task already knows which project it belongs to, so the caller is
+    // not asked to carry a workspace id it could get wrong. Applying into
+    // the wrong project's authorized roots is exactly the mistake the path
+    // guard exists to stop, and not offering the chance is better than
+    // catching it.
+    let task = TaskId(task_id);
+    let workspace = state
+        .storage()
+        .get_task(&task)?
+        .workspace_id
+        .ok_or_else(|| {
+            CommandError::with_recovery(
+                "This task isn't attached to a project any more.",
+                "Open the project and try the change again.",
+            )
+        })?;
+    Ok(state
+        .orchestrator()
+        .apply_staged(&workspace, &task, &change_ids)?)
+}
+
+#[tauri::command]
+pub fn discard_staged_changes(
+    state: State<'_, AppState>,
+    task_id: String,
+    change_ids: Vec<String>,
+) -> Result<()> {
+    state
+        .orchestrator()
+        .discard_staged(&TaskId(task_id), &change_ids)?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn undo_task(
     state: State<'_, AppState>,
