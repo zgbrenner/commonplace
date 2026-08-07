@@ -32,7 +32,7 @@ async fn main() {
     let cwd = std::env::temp_dir();
 
     if mode == "fixed" {
-        let cli = commonspace_agents::process::spawn_cli(&program, &args, &cwd, &[])
+        let cli = commonspace_agents::process::spawn_cli(&program, &args, &cwd, &[], None)
             .expect("spawn via spawn_cli");
         let _ = cli.wait().await;
     } else {

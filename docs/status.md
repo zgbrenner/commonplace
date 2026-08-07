@@ -114,6 +114,27 @@ shipped binary, but no one has yet clicked through them:
   locations still interrupt for a separate answer. "Change plan" sends
   feedback back into planning; Cancel ends the task. Covered by unit and
   orchestrator tests; nobody has yet approved a plan in a packaged build.
+- OS-level containment of the provider CLI subprocess. Beyond the flags and
+  MCP-only mutation path described elsewhere in this file, a spawn now asks
+  the OS for a kernel-enforced floor and reports exactly what it got rather
+  than assuming: `Containment::Enforced` names the mechanism,
+  `Unavailable` gives the plain-language reason, `NotImplemented` says so
+  outright. Linux attempts Landlock, scoped to the authorized workspace
+  roots; a kernel without the `landlock` LSM enabled, or too old for the
+  ABI Commonspace targets, degrades to `Unavailable` rather than failing
+  the spawn. macOS attempts a `sandbox-exec` profile scoped the same way.
+  Windows returns `NotImplemented`: AppContainer does not fit a
+  filesystem-heavy CLI, and the mechanism that would actually hold — a
+  restricted token bound to a dedicated lower-privilege local account —
+  needs administrator-approved account provisioning this product does not
+  perform; the full evaluation is in
+  `crates/commonspace-agents/src/sandbox/windows.rs`, unit-tested and
+  verified to compile for real against the `x86_64-pc-windows-gnu` target.
+  None of the three platform modules has been exercised in a packaged
+  build on its own operating system, so whether Landlock and
+  `sandbox-exec` actually apply on a real machine — as opposed to
+  compiling and passing under test — is unverified. See THREAT_MODEL.md's
+  sandboxing table for the rating this does and does not change.
 - Spreadsheets. Reading `.xlsx`, `.xlsm`, `.xls`, `.xlsb` and `.ods` through
   `calamine`, plus `.csv` and `.tsv` parsed directly, with row and sheet
   limits so a large workbook cannot swamp a model's context; and creating a
@@ -146,11 +167,15 @@ Named here so the roadmap is not mistaken for the product:
 
 ## Known limitations
 
-- **Sandboxing is partial and inherited.** Commonspace's own tools are
-  strictly path-scoped in Rust. The provider CLI is configured with its most
-  restrictive suitable flags, but Commonspace does not add OS-level
-  containment of the child process in v1. See THREAT_MODEL.md for the
-  per-layer breakdown.
+- **Sandboxing is partial, inherited, and per-platform.** Commonspace's own
+  tools are strictly path-scoped in Rust, and the provider CLI is configured
+  with its most restrictive suitable flags everywhere. On top of that,
+  Linux and macOS spawns now attempt a kernel-enforced boundary (Landlock,
+  a `sandbox-exec` profile) that visibly degrades — never silently — to
+  running uncontained when the platform cannot provide it; Windows has no
+  containment mechanism at all — see
+  `crates/commonspace-agents/src/sandbox/windows.rs` for why. None of this
+  moves the rating in THREAT_MODEL.md's sandboxing table off *Partial*.
 - **Local data is not encrypted at rest.** Conversations, history, and backups
   rely on ordinary operating-system file permissions.
 - **Provider behaviour can change without notice.** Every CLI flag and event

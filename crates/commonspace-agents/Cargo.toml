@@ -26,3 +26,9 @@ workspace = true
 
 [target."cfg(windows)".dependencies]
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
+
+# Landlock is a Linux kernel feature, so its bindings are a Linux-only
+# dependency: macOS and Windows builds never see it in their graph. Maintained
+# by landlock-lsm, the same people as the kernel LSM, under MIT OR Apache-2.0.
+[target."cfg(target_os = \"linux\")".dependencies]
+landlock = "0.4.7"

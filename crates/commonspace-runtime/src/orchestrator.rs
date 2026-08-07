@@ -1329,7 +1329,7 @@ mod tests {
             PathBuf::from("/bin/sh"),
             vec!["-c".to_string(), "exit 0".to_string()],
         );
-        commonspace_agents::process::spawn_cli(&shell, &args, &std::env::temp_dir(), &[])
+        commonspace_agents::process::spawn_cli(&shell, &args, &std::env::temp_dir(), &[], None)
             .expect("spawn noop process")
             .kill
     }
