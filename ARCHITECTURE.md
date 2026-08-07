@@ -40,6 +40,8 @@ commonplace/                     # repo name; product name is Commonspace
 │   │                            #   (pure evaluation; no fs mutation)
 │   ├── commonspace-documents/   # document formats (Markdown/text/PDF/DOCX)
 │   │                            #   + safe file operations, backups, undo
+│   ├── commonspace-capabilities/# one neutral registry over tools, Agent
+│   │                            #   Skills, MCP tools; explainable search
 │   ├── commonspace-runtime/     # MCP tool server, permission broker,
 │   │                            #   task orchestrator
 │   └── commonspace-storage/     # SQLite (rusqlite) + migrations + repositories
@@ -55,8 +57,9 @@ commonplace/                     # repo name; product name is Commonspace
 
 Deliberately omitted: a separate `packages/ui` and `packages/shared`
 (components live in the app until a second consumer exists) and a
-`commonspace-workflows` crate (skills/workflows are post-MVP; the format is
-documented so the crate can be added without redesign). `commonspace-runtime`
+`commonspace-workflows` crate (saved workflows are still ahead; skills landed
+in `commonspace-capabilities` instead, because a skill is something the model
+retrieves rather than something the runtime executes). `commonspace-runtime`
 was added because the tool server, the permission broker, and the orchestrator
 are one cohesive layer: they are exactly the place where an agent's intent
 becomes an effect on disk.
@@ -250,6 +253,42 @@ follow. Every operation returns a structured result:
 ```
 
 Library choices and validation strategy: docs/document-tools.md.
+
+## Capabilities
+
+`commonspace-capabilities` holds one shape — `Capability` — for everything an
+agent can reach: Commonspace's own typed tools, Agent Skills the user
+installed, tools from a connected MCP server, and the browser lane when it
+lands. The model gets two tools over it, `search_capabilities` and
+`load_capability`, instead of every definition in every prompt.
+
+Why retrieval rather than enumeration: a few dozen schemas is thousands of
+tokens spent per turn on things irrelevant to the task, and selection
+accuracy falls as the list grows. Three levels, following the Agent Skills
+convention: name and description are indexed, the body or schema arrives when
+something matches, and bundled files are named but not read until asked for.
+
+The dozen built-in tools stay enumerated in `tools/list` anyway. They are few
+and relevant to nearly every task; hiding them behind a search would cost a
+round trip to learn what the agent already knew. What the registry keeps out
+of the prompt is the *unbounded* surfaces.
+
+Two properties are contracts rather than implementation details:
+
+- **Activation is explainable.** A search result carries the `Reason`s it
+  scored on, and the score is exactly their sum — no hidden term. This is why
+  ranking is deterministic lexical scoring: an embedding would rank better
+  and be unable to answer "why that one?" with anything but a distance. A
+  semantic ranker can be added later as another `Reason`, never as a term
+  that swallows them.
+- **A malformed skill is skipped, never fatal, never silent.** It is reported
+  with its path and reason, as a warning on the task.
+
+Built-in descriptors are derived from the same MCP `tools/list` entries the
+model calls against, so there is no second list to drift. Skills load from the
+user's own directory and from `<workspace>/.commonspace/skills`; `allowed-tools`
+grants nothing, and `.claude/skills` is not auto-loaded. Both of those are
+security decisions, argued in THREAT_MODEL.md §4b.
 
 ## IPC contract
 
