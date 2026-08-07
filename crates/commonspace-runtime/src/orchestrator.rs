@@ -631,14 +631,24 @@ impl Orchestrator {
         match decision {
             PlanDecision::Start => {
                 self.gate_transition(task_id, TaskState::Running)?;
-                // What the user approved is a plan that creates, changes, and
-                // arranges files inside the workspace — so exactly that stops
-                // re-asking. Deletes and anything out of root still ask, and
-                // the policy engine's hard denials remain unreachable.
+                // What the user approved is a plan that creates, changes and
+                // arranges *the files the plan named* — so exactly that stops
+                // re-asking. Anything else, including a file elsewhere in the
+                // same workspace, still asks; deletes always ask; and the
+                // policy engine's hard denials remain unreachable. The stored
+                // plan is the durable copy, so a revision the user accepted
+                // is the one that governs.
                 let roots = self
                     .storage
                     .workspace_roots(&pending.request.workspace_id)?;
-                self.broker.grant_plan_envelope(task_id, roots);
+                let declared = self
+                    .storage
+                    .get_task(task_id)
+                    .ok()
+                    .and_then(|task| task.plan)
+                    .map(|plan| plan.paths_likely_modified)
+                    .unwrap_or_default();
+                self.broker.grant_plan_envelope(task_id, roots, &declared);
                 self.execute_or_fail(
                     pending.adapter,
                     task_id,
@@ -1206,9 +1216,9 @@ mod tests {
         }
     }
 
-    const GATED_PLAN: &str = r#"{"steps":[{"title":"Rename the files"}],"paths_accessed":[],"paths_likely_modified":["/ws/a.txt"],"external_services":[],"consequential_actions":[],"deliverables":["Renamed files"],"requires_approval":true}"#;
-    const HARMLESS_PLAN: &str = r#"{"steps":[{"title":"Read and summarize"}],"paths_accessed":["/ws/a.txt"],"paths_likely_modified":[],"external_services":[],"consequential_actions":[],"deliverables":[],"requires_approval":false}"#;
-    const REVISED_PLAN: &str = r#"{"steps":[{"title":"Rename only the invoices"}],"paths_accessed":[],"paths_likely_modified":["/ws/b.txt"],"external_services":[],"consequential_actions":[],"deliverables":[],"requires_approval":true}"#;
+    const GATED_PLAN: &str = r#"{"steps":[{"title":"Rename the files"}],"paths_accessed":[],"paths_likely_modified":["a.txt"],"external_services":[],"consequential_actions":[],"deliverables":["Renamed files"],"requires_approval":true}"#;
+    const HARMLESS_PLAN: &str = r#"{"steps":[{"title":"Read and summarize"}],"paths_accessed":["a.txt"],"paths_likely_modified":[],"external_services":[],"consequential_actions":[],"deliverables":[],"requires_approval":false}"#;
+    const REVISED_PLAN: &str = r#"{"steps":[{"title":"Rename only the invoices"}],"paths_accessed":[],"paths_likely_modified":["b.txt"],"external_services":[],"consequential_actions":[],"deliverables":[],"requires_approval":true}"#;
 
     fn plan_reply(plan_json: &str) -> Vec<AgentEvent> {
         vec![

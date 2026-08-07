@@ -13,7 +13,7 @@ use commonspace_core::{
 };
 use commonspace_permissions::PathGuard;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
@@ -222,11 +222,29 @@ impl PermissionBroker {
     }
 
     /// Seed the plan-approval envelope for a task: creating, modifying,
-    /// renaming, and moving files inside `roots` stop re-asking, because the
-    /// user just approved a plan that says exactly that work will happen.
-    /// Delete stays out on purpose — even under an approved plan, sending
-    /// files to the trash is consequential enough to keep asking.
-    pub fn grant_plan_envelope(&self, task_id: &TaskId, roots: Vec<PathBuf>) {
+    /// renaming, and moving files stop re-asking, because the user just
+    /// approved a plan that says exactly that work will happen. Delete stays
+    /// out on purpose — even under an approved plan, sending files to the
+    /// trash is consequential enough to keep asking.
+    ///
+    /// The envelope covers **the paths the plan declared**, not the whole
+    /// workspace. That is the difference between the file list in the plan
+    /// card being decoration and being the thing the user is actually
+    /// approving: a plan that says it will rewrite two documents does not
+    /// silently authorize rewriting forty. Declared paths are resolved and
+    /// kept only where they land inside `roots`, so a plan cannot widen its
+    /// own reach beyond what the workspace already allows.
+    ///
+    /// Under-declaring is safe and over-narrowing is safe: work outside the
+    /// declared paths falls through to an ordinary permission question, so
+    /// the worst case is one more prompt, never a blocked task. A plan that
+    /// declares nothing gets no envelope at all — nothing specific was shown
+    /// to the user, so nothing specific was approved.
+    pub fn grant_plan_envelope(&self, task_id: &TaskId, roots: Vec<PathBuf>, declared: &[PathBuf]) {
+        let scopes = declared_scopes(&roots, declared);
+        if scopes.is_empty() {
+            return;
+        }
         let envelope = PlanEnvelope {
             classes: [
                 OperationClass::Create,
@@ -236,9 +254,7 @@ impl PermissionBroker {
             ]
             .into_iter()
             .collect(),
-            // Canonicalize through the guard so later containment checks
-            // compare like with like.
-            roots: PathGuard::new(&roots).roots().to_vec(),
+            roots: scopes,
         };
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.plan_envelopes.insert(task_id.clone(), envelope);
@@ -290,6 +306,42 @@ impl PermissionBroker {
 /// Whether every requested path resolves inside one of the envelope's roots.
 /// Unresolvable paths (relative, vanished ancestors, Windows hazards) are
 /// never covered — falling through to a real question is the safe direction.
+/// The paths an approved plan's envelope actually covers: each declared
+/// path, resolved, and kept only if it lands inside an authorized root.
+///
+/// A declared folder covers its subtree; a declared file covers itself,
+/// including one that does not exist yet, because "create the summary" is
+/// the most ordinary thing a plan can promise (`soft_canonicalize` resolves
+/// through existing ancestors and appends the missing tail lexically, so a
+/// symlinked parent still cannot smuggle the path out of scope).
+///
+/// Models write relative paths often enough that dropping them would leave
+/// most plans with an empty envelope, so a relative path is tried against
+/// each authorized root. Every candidate that survives is inside a root the
+/// user authorized and matches the name the plan card displayed.
+fn declared_scopes(roots: &[PathBuf], declared: &[PathBuf]) -> Vec<PathBuf> {
+    let authorized = PathGuard::new(roots);
+    let mut scopes: Vec<PathBuf> = Vec::new();
+    let mut keep = |candidate: &Path| {
+        if let Ok(resolved) = authorized.resolve(candidate) {
+            if resolved.in_scope() && !scopes.contains(&resolved.resolved) {
+                scopes.push(resolved.resolved);
+            }
+        }
+    };
+
+    for path in declared {
+        if path.is_absolute() {
+            keep(path);
+        } else {
+            for root in authorized.roots() {
+                keep(&root.join(path));
+            }
+        }
+    }
+    scopes
+}
+
 fn envelope_covers(envelope: &PlanEnvelope, paths: &[PathBuf]) -> bool {
     let guard = PathGuard::new(&envelope.roots);
     paths
@@ -636,7 +688,7 @@ mod tests {
 
         let broker = PermissionBroker::new();
         let task = TaskId::generate();
-        broker.grant_plan_envelope(&task, vec![root]);
+        broker.grant_plan_envelope(&task, vec![root.clone()], &[root]);
 
         let (tx, mut rx) = sink();
         let outcome = broker
@@ -667,7 +719,7 @@ mod tests {
 
         let broker = PermissionBroker::new();
         let task = TaskId::generate();
-        broker.grant_plan_envelope(&task, vec![root]);
+        broker.grant_plan_envelope(&task, vec![root.clone()], &[root]);
 
         let outcome = ask_class(
             &broker,
@@ -692,7 +744,7 @@ mod tests {
 
         let broker = PermissionBroker::new();
         let task = TaskId::generate();
-        broker.grant_plan_envelope(&task, vec![root]);
+        broker.grant_plan_envelope(&task, vec![root.clone()], &[root]);
 
         let outcome = ask_class(
             &broker,
@@ -715,7 +767,7 @@ mod tests {
 
         let broker = PermissionBroker::new();
         let task = TaskId::generate();
-        broker.grant_plan_envelope(&task, vec![root]);
+        broker.grant_plan_envelope(&task, vec![root.clone()], &[root]);
         broker.abandon_task(&task);
 
         let outcome = ask_class(
@@ -727,6 +779,185 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, PermissionOutcome::Denied, "envelope must be gone");
+    }
+
+    /// The point of the whole change: approving a plan that named two files
+    /// does not authorize rewriting a third one sitting beside them.
+    #[tokio::test]
+    async fn envelope_covers_only_the_paths_the_plan_declared() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(&root).expect("root");
+        let declared = root.join("report.docx");
+        let undeclared = root.join("payroll.xlsx");
+        std::fs::write(&declared, "x").expect("seed");
+        std::fs::write(&undeclared, "x").expect("seed");
+
+        let broker = PermissionBroker::new();
+        let task = TaskId::generate();
+        broker.grant_plan_envelope(&task, vec![root], std::slice::from_ref(&declared));
+
+        let (tx, mut rx) = sink();
+        let covered = broker
+            .request(
+                Ask {
+                    task_id: task.clone(),
+                    operation: OperationClass::Modify,
+                    summary: "Update the report".into(),
+                    paths: vec![declared],
+                    items: vec![],
+                    risk: RiskLevel::Medium,
+                    irreversible: false,
+                },
+                &tx,
+            )
+            .await;
+        assert_eq!(covered, PermissionOutcome::Approved);
+        assert!(rx.try_recv().is_err(), "a declared file is not re-asked");
+
+        // The file the plan never mentioned still asks, even though it sits
+        // in the same authorized folder.
+        let outcome = ask_class(
+            &broker,
+            &task,
+            OperationClass::Modify,
+            vec![undeclared],
+            Some(PermissionDecision::Deny),
+        )
+        .await;
+        assert_eq!(outcome, PermissionOutcome::Denied);
+    }
+
+    /// A declared folder covers what is inside it — otherwise "tidy this
+    /// folder" would ask once per file, which is the prompt fatigue the
+    /// envelope exists to prevent.
+    #[tokio::test]
+    async fn a_declared_folder_covers_its_contents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        let invoices = root.join("Invoices");
+        std::fs::create_dir_all(&invoices).expect("root");
+        let inside = invoices.join("2026-03.pdf");
+        std::fs::write(&inside, "x").expect("seed");
+        let outside = root.join("contract.pdf");
+        std::fs::write(&outside, "x").expect("seed");
+
+        let broker = PermissionBroker::new();
+        let task = TaskId::generate();
+        broker.grant_plan_envelope(&task, vec![root], &[invoices]);
+
+        let (tx, mut rx) = sink();
+        let covered = broker
+            .request(
+                Ask {
+                    task_id: task.clone(),
+                    operation: OperationClass::Rename,
+                    summary: "Rename an invoice".into(),
+                    paths: vec![inside],
+                    items: vec![],
+                    risk: RiskLevel::Medium,
+                    irreversible: false,
+                },
+                &tx,
+            )
+            .await;
+        assert_eq!(covered, PermissionOutcome::Approved);
+        assert!(rx.try_recv().is_err());
+
+        let sibling = ask_class(
+            &broker,
+            &task,
+            OperationClass::Rename,
+            vec![outside],
+            Some(PermissionDecision::Deny),
+        )
+        .await;
+        assert_eq!(sibling, PermissionOutcome::Denied);
+    }
+
+    /// A plan that names a file it is about to create still covers it — the
+    /// most ordinary promise a plan makes is "I will write you a summary".
+    #[tokio::test]
+    async fn a_declared_file_that_does_not_exist_yet_is_covered() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(&root).expect("root");
+        let target = root.join("summary.md");
+
+        let broker = PermissionBroker::new();
+        let task = TaskId::generate();
+        broker.grant_plan_envelope(&task, vec![root], std::slice::from_ref(&target));
+
+        let (tx, mut rx) = sink();
+        let outcome = broker
+            .request(
+                Ask {
+                    task_id: task,
+                    operation: OperationClass::Create,
+                    summary: "Write the summary".into(),
+                    paths: vec![target],
+                    items: vec![],
+                    risk: RiskLevel::Medium,
+                    irreversible: false,
+                },
+                &tx,
+            )
+            .await;
+        assert_eq!(outcome, PermissionOutcome::Approved);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A plan that declared nothing gets no envelope: nothing specific was
+    /// shown to the user, so nothing specific was approved.
+    #[tokio::test]
+    async fn a_plan_declaring_no_paths_grants_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(&root).expect("root");
+        let target = root.join("notes.md");
+        std::fs::write(&target, "x").expect("seed");
+
+        let broker = PermissionBroker::new();
+        let task = TaskId::generate();
+        broker.grant_plan_envelope(&task, vec![root], &[]);
+
+        let outcome = ask_class(
+            &broker,
+            &task,
+            OperationClass::Modify,
+            vec![target],
+            Some(PermissionDecision::Deny),
+        )
+        .await;
+        assert_eq!(outcome, PermissionOutcome::Denied);
+    }
+
+    /// A declared path outside the authorized roots is dropped rather than
+    /// honoured — a plan cannot widen its own reach past the workspace.
+    #[test]
+    fn declared_paths_outside_the_roots_are_dropped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(&root).expect("root");
+        let escape = tmp.path().join("elsewhere.txt");
+        std::fs::write(&escape, "x").expect("seed");
+
+        let scopes = declared_scopes(std::slice::from_ref(&root), &[escape, root.join("ok.md")]);
+        assert_eq!(scopes.len(), 1, "only the in-root path survives");
+        assert!(scopes[0].ends_with("ok.md"));
+    }
+
+    /// Models write relative paths often enough that dropping them would
+    /// leave most plans with an empty envelope.
+    #[test]
+    fn a_relative_declared_path_is_resolved_against_the_roots() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(&root).expect("root");
+
+        let scopes = declared_scopes(&[root], &[PathBuf::from("report.docx")]);
+        assert_eq!(scopes.len(), 1);
+        assert!(scopes[0].ends_with("report.docx"));
     }
 
     #[test]
