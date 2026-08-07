@@ -302,7 +302,13 @@ impl Orchestrator {
             .transition_task(&task.id, TaskState::Planning)?;
 
         let control = TaskControl::default();
-        let prompt = planning_prompt(&request.prompt);
+        // The planning session gets no MCP endpoint, so it cannot search the
+        // registry — which would leave it planning as though the person had
+        // installed nothing. Skills are named here instead, at the cost the
+        // format is designed around: a line each. Without this, a plan can
+        // reinvent, badly, work a skill already describes how to do.
+        let (registry, _) = crate::tools::build_registry(&self.skill_roots(&roots));
+        let prompt = planning_prompt(&request.prompt, &registry);
         let resume = request.resume.clone();
         self.start_planning_session(PlanPhase {
             adapter,
@@ -922,13 +928,14 @@ impl Orchestrator {
 
 /// The instruction wrapper around the user's request for the planning
 /// session. Kept in one place so tests can assert against the exact text.
-fn planning_prompt(user_request: &str) -> String {
+fn planning_prompt(user_request: &str, registry: &commonspace_capabilities::Registry) -> String {
     format!(
         "Before doing any work, write a short plan for the request below.\n\
          \n\
          You may investigate first — reading files and listing folders is fine — but do not \
          create, modify, move, or delete anything, and do not contact any external service \
          while planning.\n\
+         {}\
          \n\
          The request:\n\
          {user_request}\n\
@@ -947,8 +954,46 @@ fn planning_prompt(user_request: &str) -> String {
          delete anything, or contact anything beyond the model itself.\n\
          - Keep it to at most 6 steps, in plain language a non-technical person understands.\n\
          - \"detail\" is optional; leave it out when the title says enough.\n\
-         - Do not use markdown inside the JSON strings."
+         - Do not use markdown inside the JSON strings.",
+        installed_skills_note(registry)
     )
+}
+
+/// Names the skills this person has installed, for the planning prompt.
+///
+/// Level one of the format's own disclosure model: a name and a description
+/// each, and nothing else, until something actually needs the instructions.
+/// Capped, because a person with fifty skills should not have the planning
+/// prompt turn into a catalogue — the cap is stated in the prompt rather
+/// than hidden, so a plan built from a truncated list says so.
+fn installed_skills_note(registry: &commonspace_capabilities::Registry) -> String {
+    const SHOWN: usize = 20;
+    let skills: Vec<_> = registry
+        .capabilities()
+        .filter(|c| c.kind == commonspace_capabilities::CapabilityKind::Skill)
+        .collect();
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut note = String::from(
+        "\nThis person has installed skills — written instructions for particular kinds of \
+         work. If one of these fits the request, plan to use it, and say so in the step that \
+         does. Once the plan is approved you can read a skill in full with `load_capability`.\n",
+    );
+    for skill in skills.iter().take(SHOWN) {
+        note.push_str(&format!(
+            "- {} ({}): {}\n",
+            skill.name, skill.id, skill.summary
+        ));
+    }
+    if skills.len() > SHOWN {
+        note.push_str(&format!(
+            "…and {} more, which you can find with `search_capabilities` once the plan is \
+             approved.\n",
+            skills.len() - SHOWN
+        ));
+    }
+    note
 }
 
 /// Sent when the execution phase resumes the planning session.
@@ -1175,6 +1220,10 @@ mod tests {
     use super::*;
     use commonspace_agents::adapter::{AuthInstructions, EventSink, RunningSession};
     use commonspace_agents::AdapterError;
+    #[allow(unused_imports)]
+    use commonspace_capabilities::{
+        Capability, CapabilityId, CapabilityKind, CapabilitySource, LoadedCapability, Registry,
+    };
     use commonspace_core::{
         AdapterCapabilities, AuthStatus, HealthReport, InstallStatus, MessageId, OperationClass,
         RiskLevel, SessionId,
@@ -1194,6 +1243,73 @@ mod tests {
             .expect("workspace row");
         let orchestrator = Orchestrator::new(Arc::clone(&storage), tmp.path().to_path_buf());
         (tmp, orchestrator, workspace.id, ws_dir)
+    }
+
+    fn skill(name: &str) -> (Capability, LoadedCapability) {
+        (
+            Capability {
+                id: CapabilityId::new("skill", name),
+                kind: CapabilityKind::Skill,
+                name: name.to_string(),
+                summary: format!("Does the {name} thing."),
+                keywords: vec![],
+                source: CapabilitySource::File {
+                    path: PathBuf::from(format!("/skills/{name}/SKILL.md")),
+                },
+            },
+            LoadedCapability::Instructions {
+                body: "...".into(),
+                bundled: vec![],
+                requires: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn a_plan_is_told_which_skills_exist_since_it_cannot_search_for_them() {
+        let mut registry = Registry::new();
+        let (capability, loaded) = skill("quarterly-deck");
+        registry.insert(capability, loaded);
+
+        let prompt = planning_prompt("make the Q3 deck", &registry);
+        assert!(prompt.contains("quarterly-deck"), "{prompt}");
+        assert!(prompt.contains("skill:quarterly-deck"), "{prompt}");
+        assert!(
+            prompt.contains("Does the quarterly-deck thing."),
+            "{prompt}"
+        );
+        // The request itself must survive intact alongside the note.
+        assert!(prompt.contains("make the Q3 deck"), "{prompt}");
+    }
+
+    #[test]
+    fn a_plan_with_no_skills_installed_says_nothing_about_skills() {
+        let prompt = planning_prompt("tidy the invoices folder", &Registry::new());
+        assert!(!prompt.to_lowercase().contains("skill"), "{prompt}");
+    }
+
+    #[test]
+    fn built_in_tools_are_not_listed_as_skills_in_the_plan() {
+        // The registry holds the built-in tools too. Naming them here would
+        // spend the planning prompt describing what the agent already has.
+        let (registry, _) = crate::tools::build_registry(&[]);
+        assert!(registry.len() > 5, "the built-ins should be registered");
+        let prompt = planning_prompt("read the contract", &registry);
+        assert!(!prompt.contains("builtin:"), "{prompt}");
+    }
+
+    #[test]
+    fn a_long_skill_list_is_capped_and_says_that_it_was() {
+        let mut registry = Registry::new();
+        for i in 0..25 {
+            let (capability, loaded) = skill(&format!("skill-{i:02}"));
+            registry.insert(capability, loaded);
+        }
+        let prompt = planning_prompt("do a thing", &registry);
+        assert!(prompt.contains("skill-00"), "{prompt}");
+        assert!(!prompt.contains("skill-24"), "{prompt}");
+        // A plan built from a truncated list has to be able to say so.
+        assert!(prompt.contains("and 5 more"), "{prompt}");
     }
 
     #[test]
