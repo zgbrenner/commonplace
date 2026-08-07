@@ -285,8 +285,14 @@ export async function startTask(
       onEvent(parsed.data);
     } else {
       // An unrecognized event is a protocol drift bug, not a reason to break
-      // the session: log it and keep the timeline running.
+      // the session: log it and keep the timeline running. The backend copy
+      // is the one a user can actually retrieve afterwards.
       console.warn("Commonspace received an unrecognized event", raw, parsed.error);
+      void logFromWebview(
+        "warn",
+        "Commonspace received an unrecognized event from start_task",
+        parsed.error.message,
+      );
     }
   };
 
@@ -377,6 +383,32 @@ export async function installUpdate(
 
 export const openReleasePage = (url?: string) =>
   call("open_release_page", { url: url ?? null }, z.void().or(z.null()));
+
+/* ------------------------------------------------------------ diagnostics */
+
+/**
+ * Record a frontend message in the app's log file.
+ *
+ * `console.warn` in a packaged build reaches a console nobody has open — and
+ * on Windows a GUI build has no console at all. Never throws: a message about
+ * something that already went wrong must not become a second failure.
+ */
+export const logFromWebview = (
+  level: "warn" | "error",
+  message: string,
+  detail?: string,
+): Promise<void> =>
+  call("log_from_webview", { level, message, detail: detail ?? null }, z.void().or(z.null()))
+    .then(() => undefined)
+    .catch(() => undefined);
+
+/**
+ * Write the diagnostics file and reveal it in the file manager. Resolves to
+ * where it was written. Nothing is uploaded: the user reads the file and
+ * decides for themselves whether to share it.
+ */
+export const writeDiagnosticsReport = (): Promise<string> =>
+  call("write_diagnostics_report", {}, z.string());
 
 /* --------------------------------------------------------------- settings */
 

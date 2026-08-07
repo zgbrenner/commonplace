@@ -113,10 +113,11 @@ Rules:
 - `tool.*` events carry a human-readable `title`/`detail` ("Reading 12
   documents") computed by the adapter, plus machine fields for the developer
   view.
-- Provider-specific raw payloads are preserved as `raw` diagnostics attached to
-  the session log, never required by the UI.
 - The same events are persisted to `task_events` so a conversation can be
   replayed after restart.
+- Provider output that no adapter rule recognizes is **dropped**, not kept.
+  Preserving the raw payload per session is a plausible future addition and is
+  not implemented; the developer view shows the normalized event only.
 
 ## Agent adapter interface
 
@@ -135,7 +136,7 @@ Rules:
 | context limits        | `capabilities().context` (when known)            |
 | attachments           | `capabilities().attachments`                     |
 | health diagnostics    | `health() -> HealthReport`                       |
-| raw logs              | per-session rotating log file                    |
+| raw provider output   | not retained per session — see "Logging"         |
 
 `AuthStatus` is truthful and specific: `NotInstalled`, `SignedOut`,
 `Subscription { plan_hint }`, `ApiKey`, `LocalModel`, `Error { detail }`.
@@ -279,7 +280,63 @@ is persisted so conversations continue across restarts.
 - Cancellation kills the full child process tree and finalizes state.
 - Transient provider failures retry with backoff; permanent failures surface
   structured errors with recovery actions.
-- Logs rotate; backups have retention controls.
+- Backups have retention controls; logging is described below.
+
+## Logging and diagnostics
+
+There is one log, written by the desktop shell in
+`apps/desktop/src-tauri/src/diagnostics.rs` — not one per session, and not one
+per adapter.
+
+- `tracing` fans out to two layers: stdout, which is where a `cargo tauri dev`
+  run reads it, and a `tracing-appender` rolling file. A packaged Windows GUI
+  build has no console at all, so stdout there reaches nobody — the file is
+  the only durable record such a build produces.
+- The file rotates **daily** and keeps the **7 most recent** days, so it is
+  bounded without a cleanup job. Files are named `commonspace.<date>.log` in:
+
+  | OS      | Log directory                                  |
+  |---------|------------------------------------------------|
+  | Windows | `%LOCALAPPDATA%\dev.commonspace.app\logs`       |
+  | macOS   | `~/Library/Logs/dev.commonspace.app`           |
+  | Linux   | `~/.local/share/dev.commonspace.app/logs`      |
+
+- The directory can only be resolved once Tauri has an app handle, which is
+  later than the subscriber has to exist. Lines emitted in that window go to
+  stdout only; they are not buffered for a destination that may never open.
+- A `std::panic` hook writes the panic message, its location, and a forced
+  backtrace into the same file before the default hook runs. The workspace
+  denies `unsafe_code` and warns on `unwrap`/`expect`, so panics are rare by
+  construction — which is exactly why the rare one has to be captured.
+- The webview logs through the `log_from_webview` command rather than
+  `console.warn`, for the same reason: a packaged build has no devtools open.
+
+The **diagnostics file** (`write_diagnostics_report`) is how a user reports a
+bug. It is not telemetry and does not become telemetry: the command writes one
+Markdown file next to the logs, reveals it in the file manager, and stops.
+Nothing is uploaded, and PRIVACY.md's promise is unchanged. It contains the app
+version and build target, the system webview version, the OS type, version,
+edition and bitness, each provider's install status and `HealthReport`, the
+recorded database journal mode, non-secret configuration (theme, notification
+preference, project and authorized-folder *counts*), and the last 200 log
+lines. Authorized folder paths, workspace and conversation names, and provider
+auth status are deliberately left out: they describe the user, not the bug.
+
+Redaction runs over every value that came from outside the function and is
+unit-tested against fixtures for each class: the home directory (in both
+separator spellings, plus other users' home paths), the username, and
+credential shapes — named prefixes (`sk-`, `gh?_`, `github_pat_`, `xox?-`,
+`AKIA`, `AIza`, JWTs, `key=`/`token:`/`Bearer` assignments) plus a catch-all
+for any long mixed letter-and-digit run, so a provider nobody here has heard
+of is still covered. The rules over-redact deliberately. If the rules fail to
+compile, the command refuses to write a file rather than writing an unredacted
+one. What redaction cannot remove — the user's own file and folder names,
+where they appear in log lines — the file says so, at the top, in the same
+words the Settings screen uses.
+
+Redaction applies to the diagnostics file, not to the log itself. The log is
+written as the code emits it, and nothing in Commonspace logs a credential;
+that is a property of what the code chooses to log, not a filter over it.
 
 ## Sandboxing honesty
 

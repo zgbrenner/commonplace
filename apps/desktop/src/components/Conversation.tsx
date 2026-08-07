@@ -3,7 +3,7 @@ import Markdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Artifact, Message, OperationResult, TaskPlan } from "@commonspace/protocol";
 import type { ActivityItem, CalmProgress, ConversationState } from "../lib/activity";
-import { calmProgress, permissionHeadline } from "../lib/activity";
+import { announcement, calmProgress, permissionHeadline } from "../lib/activity";
 import type { TaskOutcome as TaskOutcomeModel } from "../lib/replay";
 import { openExternalUrl, type PlanDecision } from "../lib/ipc";
 import { TaskOutcome } from "./TaskOutcome";
@@ -50,6 +50,7 @@ export function Conversation({
   onUndoTask,
 }: ConversationProps) {
   const endRef = useRef<HTMLDivElement>(null);
+  const elapsed = useElapsedRun(running, outcome?.taskId);
 
   // Follow the newest content. Every dependency here is something that adds
   // a block above the anchor or changes one's height: `live.activity` by
@@ -71,12 +72,23 @@ export function Conversation({
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto flex max-w-3xl flex-col gap-5 px-6 py-6">
+        {/*
+          The conversation column's only live region, and the reason the rest
+          of the column is silent. It is mounted from the first render and
+          only its text changes: a region added to the page at the same
+          moment as its first sentence is frequently missed. `aria-atomic`
+          makes each new sentence read whole rather than diffed word by word.
+        */}
+        <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+          {announcement(live, running, awaitingPlanApproval)}
+        </p>
+
         {messages.map((message) => (
           <MessageBubble key={message.id} role={message.role} content={message.content} />
         ))}
 
         {live.assistantText ? (
-          <MessageBubble role="assistant" content={live.assistantText} />
+          <MessageBubble role="assistant" content={live.assistantText} streaming />
         ) : null}
 
         {live.plan ? (
@@ -110,14 +122,11 @@ export function Conversation({
         ) : null}
 
         {live.warnings.map((warning, index) => (
-          <p
-            key={`${warning}-${index}`}
-            className="text-sm text-[var(--color-warn)]"
-            role="status"
-          >
+          <p key={`${warning}-${index}`} className="text-sm text-[var(--color-warn)]">
             <span aria-hidden="true" className="mr-1.5">
               ⚠
             </span>
+            <span className="sr-only">Warning: </span>
             {warning}
           </p>
         ))}
@@ -125,13 +134,19 @@ export function Conversation({
         {live.error && !outcome ? (
           // Once the outcome card exists it owns the failure presentation,
           // so the raw notice would show the same error twice.
-          <ErrorNotice message={live.error.message} recovery={live.error.recovery} />
+          <ErrorNotice
+            message={live.error.message}
+            recovery={live.error.recovery}
+            announce={false}
+          />
         ) : null}
 
         {outcome ? (
           <TaskOutcome
             key={outcome.taskId}
             outcome={outcome}
+            elapsedMs={elapsed}
+            usage={live.usage}
             onOpen={onOpenArtifact}
             onReveal={onRevealArtifact}
             onUndoArtifact={onUndoArtifact}
@@ -143,6 +158,36 @@ export function Conversation({
       </div>
     </div>
   );
+}
+
+/**
+ * How long the task on screen spent running, measured here because the event
+ * stream carries no clock.
+ *
+ * The measurement restarts every time execution begins, so a plan parked on
+ * the user's decision is not counted as work, and it stops when the outcome
+ * card appears. A conversation reopened from history never ran here: its
+ * outcome carries no measurement, and the card omits the line rather than
+ * inventing a number.
+ */
+function useElapsedRun(running: boolean, outcomeTaskId: string | undefined): number | undefined {
+  const startedAt = useRef<number | undefined>(undefined);
+  const [measured, setMeasured] = useState<{ taskId: string; ms: number } | undefined>();
+
+  useEffect(() => {
+    if (running) startedAt.current = Date.now();
+  }, [running]);
+
+  useEffect(() => {
+    const started = startedAt.current;
+    if (started === undefined || outcomeTaskId === undefined) return;
+    startedAt.current = undefined;
+    setMeasured({ taskId: outcomeTaskId, ms: Date.now() - started });
+  }, [outcomeTaskId]);
+
+  // Keyed by task, so switching to another conversation cannot show one
+  // task's duration under another task's outcome.
+  return measured && measured.taskId === outcomeTaskId ? measured.ms : undefined;
 }
 
 /**
@@ -179,7 +224,15 @@ const markdownComponents: Components = {
   ),
 };
 
-function MessageBubble({ role, content }: { role: "user" | "assistant"; content: string }) {
+function MessageBubble({
+  role,
+  content,
+  streaming = false,
+}: {
+  role: "user" | "assistant";
+  content: string;
+  streaming?: boolean;
+}) {
   if (role === "user") {
     // User text stays plain: the person typed it literally, and rendering
     // their asterisks or brackets as markup would be surprising.
@@ -200,7 +253,13 @@ function MessageBubble({ role, content }: { role: "user" | "assistant"; content:
   // intentionally simple rather than incrementally parsed.
   return (
     <div>
-      <div className="selectable markdown max-w-full text-sm text-[var(--color-ink)]">
+      <div
+        // Said explicitly rather than left to the default: text arriving a
+        // token at a time must never be announced as it arrives. The hidden
+        // status line at the top of the column speaks for the task instead.
+        aria-live={streaming ? "off" : undefined}
+        className="selectable markdown max-w-full text-sm text-[var(--color-ink)]"
+      >
         <span className="sr-only">Commonspace replied:</span>
         <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
           {content}
@@ -289,9 +348,7 @@ function PlanCard({
 
       {awaiting ? (
         mode === "revising" ? (
-          <p className="mt-3 text-sm text-[var(--color-ink-muted)]" role="status" aria-live="polite">
-            Updating the plan…
-          </p>
+          <p className="mt-3 text-sm text-[var(--color-ink-muted)]">Updating the plan…</p>
         ) : mode === "editing" ? (
           <div className="mt-3">
             <label htmlFor="plan-feedback" className="text-sm font-medium text-[var(--color-ink)]">
@@ -363,11 +420,10 @@ function ProgressCard({
     <Card as="section" className="p-4">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          {/* The conversation's only live region: one voice, so a screen
-              reader hears the current step and nothing competing. */}
-          <p className="text-sm text-[var(--color-ink)]" role="status" aria-live="polite">
-            {progress.headline}
-          </p>
+          {/* Plain text, deliberately: this same sentence is what the column's
+              one live region announces, and a second region saying it would
+              double every step. */}
+          <p className="text-sm text-[var(--color-ink)]">{progress.headline}</p>
           {progress.progress ? (
             <p className="mt-0.5 text-xs text-[var(--color-ink-faint)]">{progress.progress}</p>
           ) : null}
@@ -445,8 +501,8 @@ function ActivityGlyph({ status }: { status: ActivityItem["status"] }) {
 
 /**
  * A permission request. Shows the resolved destination paths — what the user
- * is actually approving — and warns explicitly when an action is
- * irreversible.
+ * is actually approving — itemizes a batch so the individual operations are
+ * readable, and warns explicitly when an action is irreversible.
  */
 function PermissionCard({
   request,
@@ -455,6 +511,28 @@ function PermissionCard({
   request: NonNullable<ConversationState["pendingPermission"]>;
   onAnswer: (approve: boolean, scope?: "once" | "task" | "workspace") => void;
 }) {
+  const headingRef = useRef<HTMLHeadingElement>(null);
+
+  /*
+   * A question that appears mid-stream and does not take focus is, for
+   * someone driving by keyboard, a question they have to go hunting for
+   * while the page grows underneath them. So focus moves to the card's
+   * heading — the heading, not a button, because landing on "Allow once"
+   * puts approval one stray keypress away — and returns to wherever it came
+   * from once the question is answered.
+   */
+  useEffect(() => {
+    const previous = document.activeElement;
+    headingRef.current?.focus();
+    return () => {
+      // Only if that element is still on the page: the composer the user
+      // came from survives, a button inside a card that has since been
+      // replaced does not, and focusing a detached node silently drops
+      // focus to the body.
+      if (previous instanceof HTMLElement && previous.isConnected) previous.focus();
+    };
+  }, [request.id]);
+
   return (
     <Card
       as="section"
@@ -462,7 +540,7 @@ function PermissionCard({
       aria-labelledby="permission-heading"
     >
       <div className="flex items-start justify-between gap-3">
-        <h3 id="permission-heading" className="text-sm font-semibold">
+        <h3 id="permission-heading" ref={headingRef} tabIndex={-1} className="text-sm font-semibold">
           {permissionHeadline(request)}
         </h3>
         <StatusPill
@@ -488,14 +566,42 @@ function PermissionCard({
         </p>
       ) : null}
 
+      {request.items.length > 0 ? (
+        <div className="mt-3">
+          <h4 className="text-xs font-semibold tracking-wide text-[var(--color-ink-faint)] uppercase">
+            Item by item
+          </h4>
+          <ul className="selectable mt-1.5 max-h-40 space-y-0.5 overflow-y-auto rounded-md bg-[var(--color-surface-sunken)] p-2.5 text-xs text-[var(--color-ink-muted)]">
+            {/* An item can legitimately repeat — the same file touched twice
+                in one batch — so position is part of the key. */}
+            {request.items.map((item, index) => (
+              <li key={`${item}-${index}`}>{item}</li>
+            ))}
+          </ul>
+          {request.items.length > 1 ? (
+            // Said out loud because a list of items invites the assumption
+            // that you can pick among them, and you cannot: the answer goes
+            // back to the broker whole.
+            <p className="mt-1.5 text-xs text-[var(--color-ink-faint)]">
+              Your answer applies to all of these.
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+
       {request.paths.length > 0 ? (
-        <ul className="selectable mt-3 max-h-40 space-y-0.5 overflow-y-auto rounded-md bg-[var(--color-surface-sunken)] p-2.5 font-mono text-xs text-[var(--color-ink-muted)]">
-          {request.paths.map((path) => (
-            <li key={path} className="truncate" title={path}>
-              {path}
-            </li>
-          ))}
-        </ul>
+        <div className="mt-3">
+          <h4 className="text-xs font-semibold tracking-wide text-[var(--color-ink-faint)] uppercase">
+            Files involved
+          </h4>
+          <ul className="selectable mt-1.5 max-h-40 space-y-0.5 overflow-y-auto rounded-md bg-[var(--color-surface-sunken)] p-2.5 font-mono text-xs text-[var(--color-ink-muted)]">
+            {request.paths.map((path) => (
+              <li key={path} className="truncate" title={path}>
+                {path}
+              </li>
+            ))}
+          </ul>
+        </div>
       ) : null}
 
       <div className="mt-3 flex flex-wrap items-center gap-2">

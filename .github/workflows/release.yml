@@ -70,6 +70,16 @@ jobs:
     name: Build (${{ matrix.name }})
     needs: verify
     runs-on: ${{ matrix.os }}
+    # `contents: write` is for the draft release tauri-action creates. The
+    # other two belong to the provenance step below: `id-token` lets it mint
+    # the short-lived Sigstore signing certificate, `attestations` lets it
+    # store the signed statement against this repository. A job-level block
+    # replaces the workflow-level one outright rather than adding to it, so
+    # `contents: write` has to be repeated here.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -119,6 +129,7 @@ jobs:
       - run: npm ci
 
       - uses: tauri-apps/tauri-action@v0
+        id: tauri
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Optional. Set these repository secrets to have the updater's `.sig`
@@ -148,6 +159,51 @@ jobs:
           # version check plus a download-page link.
           includeUpdaterJson: true
           args: ${{ matrix.args }}
+
+      # `subject-path` wants one path per line; tauri-action reports what it
+      # built as a JSON array. Convert it rather than globbing at bundle
+      # directories by hand — those differ per OS, and the macOS universal
+      # build lands under a target-triple directory the others do not have.
+      #
+      # An empty list means the bundler produced nothing this job can attest,
+      # which is a broken release build, not a step to skip quietly.
+      - name: Collect built installer paths
+        id: artifacts
+        shell: bash
+        env:
+          ARTIFACT_PATHS: ${{ steps.tauri.outputs.artifactPaths }}
+        run: |
+          set -euo pipefail
+          paths="$(printf '%s' "${ARTIFACT_PATHS:-[]}" | jq -r '.[]')"
+          if [ -z "${paths}" ]; then
+            echo "::error::tauri-action reported no artifact paths; nothing to attest."
+            exit 1
+          fi
+          echo "${paths}"
+          {
+            echo 'paths<<ARTIFACT_PATHS_EOF'
+            echo "${paths}"
+            echo 'ARTIFACT_PATHS_EOF'
+          } >> "${GITHUB_OUTPUT}"
+
+      # Record where each installer came from. The action mints a short-lived
+      # keyless Sigstore certificate and signs a SLSA provenance statement
+      # binding the artifact's digest to this workflow, this commit and this
+      # runner. Anyone can check one afterwards:
+      #
+      #   gh attestation verify <file> --repo zgbrenner/commonplace
+      #
+      # Be clear about what this is not. An attestation is not code signing.
+      # It does nothing for macOS Gatekeeper or Windows SmartScreen, it is
+      # not an OS trust anchor, and it does not make installing any smoother
+      # — the unsigned-build warnings in the release body above stay exactly
+      # as they are. Its whole value is that a security-minded reader can
+      # verify a download's provenance themselves instead of trusting the
+      # release page. Code signing and notarization are separate work
+      # (docs/releasing.md, "Code signing").
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ steps.artifacts.outputs.paths }}
 
   # Automates the "download at least one installer and install it" half of the
   # release checklist for Windows: fetch the freshly drafted release's NSIS

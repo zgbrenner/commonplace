@@ -1006,6 +1006,7 @@ mod tests {
     struct Harness {
         _tmp: tempfile::TempDir,
         ws: PathBuf,
+        task_id: TaskId,
         url: String,
         token: String,
         events: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
@@ -1021,8 +1022,9 @@ mod tests {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (journal_tx, journal_rx) = tokio::sync::mpsc::unbounded_channel();
         let broker = PermissionBroker::new();
+        let task_id = TaskId::generate();
         let context = Arc::new(ToolContext {
-            task_id: TaskId::generate(),
+            task_id: task_id.clone(),
             policy: PolicyEngine::new(PathGuard::new([&ws]), PolicySettings::default()),
             fs: SafeFs::new(
                 PathGuard::new([&ws]),
@@ -1036,6 +1038,7 @@ mod tests {
         Harness {
             _tmp: tmp,
             ws,
+            task_id,
             url: handle.url.clone(),
             token: handle.token.clone(),
             events: event_rx,
@@ -1043,6 +1046,17 @@ mod tests {
             broker,
             handle: Some(handle),
         }
+    }
+
+    /// A harness for a task whose plan the user approved, covering the
+    /// workspace — which is how these tools actually run: nothing reaches the
+    /// tool server until a plan has been accepted. Tests about *asking* use
+    /// the plain `harness()` instead, so a prompt they expect still happens.
+    async fn approved_harness() -> Harness {
+        let h = harness().await;
+        h.broker
+            .grant_plan_envelope(&h.task_id, vec![h.ws.clone()], std::slice::from_ref(&h.ws));
+        h
     }
 
     async fn rpc(h: &Harness, body: Value, token: Option<&str>) -> (u16, Value) {
@@ -1117,7 +1131,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_in_scope_succeeds_and_journals() {
-        let mut h = harness().await;
+        let mut h = approved_harness().await;
         let target = h.ws.join("notes.md");
         let (_, response) = rpc(
             &h,
@@ -1506,7 +1520,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_sheets_fail_before_anything_is_written() {
-        let mut h = harness().await;
+        let mut h = approved_harness().await;
         let target = h.ws.join("broken.xlsx");
         for bad in [
             json!("Sheet1"),
@@ -1530,7 +1544,7 @@ mod tests {
     /// both the spreadsheet tool and `read_document` can read it back.
     #[tokio::test]
     async fn create_then_read_back_journals_and_routes() {
-        let mut h = harness().await;
+        let mut h = approved_harness().await;
         let target = h.ws.join("revenue.xlsx");
         let sheets = json!([{
             "name": "Q3",

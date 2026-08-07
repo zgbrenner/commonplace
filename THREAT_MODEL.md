@@ -55,6 +55,15 @@ by the provider CLI's sandbox and approval flags that Commonspace configures,
 not by Commonspace's engine. This is documented per adapter, and shell-style
 tools are treated as high-risk and permission-gated.
 
+On delimiting untrusted content: framing document text as data rather than
+instructions — delimiters, spotlighting, and similar prompt-level markup —
+reduces *accidental* instruction-following, and is worth doing wherever
+Commonspace controls the prompt. It is not a security boundary and is not
+counted as one here. Adaptive attacks broke eight published defences of this
+kind at over 50% attack success rate ([Zhan et al.,
+2025](https://arxiv.org/abs/2503.00061)). The boundary is the deterministic
+policy underneath the model, not the framing above it.
+
 ### 2. Malicious workspace content attacking the tooling
 Crafted DOCX/PDF/archive triggering parser bugs; zip bombs; deeply nested
 archives; files with hostile names (unicode tricks, path-like names).
@@ -137,6 +146,65 @@ release builds happen from a clean checkout via `scripts/release-check`.
 
 Commonspace never markets partial sandboxing as complete sandboxing. The
 Connections and permissions UI language matches this table.
+
+### Where the state of the art actually is
+
+That table is not a gap this project is behind on. Nobody has shipped
+default-on, cross-platform, native-Windows containment for an agent CLI —
+including teams with far more resources than this one. What ships today:
+
+- **VS Code** puts agent sandboxing behind
+  [`chat.agent.sandbox.enabled`](https://code.visualstudio.com/docs/agents/concepts/trust-and-safety),
+  which is off by default and supported on macOS and Linux/WSL2 only;
+  Windows users are told to run inside WSL2. It covers shell subprocesses
+  only — the agent's own read, edit and write tools are explicitly outside
+  the sandbox and go through VS Code's permission system instead.
+- **Claude Code** has a built-in Bash sandbox on macOS, Linux and WSL2.
+  [Its documentation](https://code.claude.com/docs/en/sandboxing) states
+  plainly: "Native Windows is not supported."
+- **`sandbox-runtime`** (Apache-2.0), the reference implementation behind
+  that sandbox, marks [Windows support
+  alpha](https://github.com/anthropic-experimental/sandbox-runtime): it
+  requires a one-time elevated install that provisions a dedicated local
+  user account, a local group, and machine-wide filtering rules.
+- **Codex** is the one project surveyed with real native Windows
+  containment, and it costs an administrator-approved setup — dedicated
+  lower-privilege local sandbox users, filesystem permission boundaries, and
+  a firewall rule for the offline case. Decline the UAC prompt and it falls
+  back to weaker environment-level controls
+  ([docs](https://learn.chatgpt.com/docs/windows/windows-sandbox)).
+- **Cline** ships path filtering and nothing else.
+  [`.clineignore`](https://docs.cline.bot/customization/clineignore) is
+  advisory by its own documentation — ignored files stay readable through
+  explicit mentions and shell commands — and is being deprecated. The agent
+  runs with the full privileges of the editor process.
+- **OpenHands** runs the agent in a [Docker
+  runtime](https://docs.openhands.dev/openhands/usage/architecture/runtime),
+  but its documented deployment mounts the host Docker socket into that
+  container, which is equivalent to handing the container host root.
+
+Given that, Commonspace spends its effort where a cooperating process can
+actually be constrained:
+
+- Path scoping enforced in Rust at the tool layer, on canonicalized paths,
+  before any filesystem call happens.
+- A policy engine that denies protected locations outright — system roots,
+  other users' data, credential stores — regardless of what the user
+  authorized.
+- Only the specific provider CLIs Commonspace has adapters for are spawned,
+  resolved to a real executable and launched with an argv array, never
+  through a shell.
+- Each provider CLI started with its most restrictive suitable flags: Codex
+  pinned to `--sandbox read-only`, Claude Code run with `--permission-mode
+  dontAsk` and its own mutating tools in `--disallowedTools`, so mutations
+  can only travel through Commonspace's own MCP tools.
+
+The honest sentence is that this is defence in depth by a cooperating
+process, not a kernel boundary. A provider CLI that deliberately broke out
+of its own sandbox is outside what Commonspace can stop — which is why the
+table above rates OS-level containment *partial* instead of claiming a
+boundary, and why real containment sits in the roadmap's security theme
+rather than in this document's mitigations.
 
 ## Non-goals (v1)
 

@@ -6,6 +6,7 @@
 //! and no provider-specific behaviour live here.
 
 mod commands;
+mod diagnostics;
 mod state;
 mod suggestions;
 mod updates;
@@ -14,12 +15,7 @@ pub use state::AppState;
 
 /// Build and run the application.
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "commonspace=info,warn".into()),
-        )
-        .init();
+    diagnostics::install();
 
     let mut builder = tauri::Builder::default();
 
@@ -45,6 +41,22 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             use tauri::Manager;
+            // The log directory can only be resolved once there is an app to
+            // ask, so this is the earliest point at which anything can be
+            // written down. A failure here is printed rather than logged,
+            // for the obvious reason.
+            match app
+                .path()
+                .app_log_dir()
+                .map_err(|error| error.to_string())
+                .and_then(|dir| diagnostics::open_log_file(&dir).map_err(|e| e.to_string()))
+            {
+                Ok(directory) => {
+                    tracing::info!(directory = %directory.display(), "logging to file")
+                }
+                Err(error) => eprintln!("Commonspace couldn't open its log file: {error}"),
+            }
+
             let state = AppState::initialize(app.handle())?;
             // Any task still marked live belongs to a previous process that
             // did not shut down cleanly; fail it with an explanation rather
@@ -87,16 +99,32 @@ pub fn run() {
             commands::get_setting,
             commands::set_setting,
             suggestions::suggest_tasks,
+            diagnostics::log_from_webview,
+            diagnostics::write_diagnostics_report,
             updates::check_for_update,
             updates::install_update,
             updates::open_release_page,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         // Nothing has a window yet at this point, so there is no UI to show an
         // error in; log it and exit non-zero rather than panicking silently.
         .unwrap_or_else(|error| {
             tracing::error!(%error, "Commonspace failed to start");
             eprintln!("Commonspace failed to start: {error}");
             std::process::exit(1);
+        })
+        .run(|app, event| {
+            // Tell the database this exit was orderly. Without it every launch
+            // treats the previous run as a crash and pays for a full integrity
+            // check on the startup path — and the write-ahead log ships as a
+            // stale sidecar instead of being folded back in.
+            if matches!(event, tauri::RunEvent::Exit) {
+                use tauri::Manager;
+                if let Some(state) = app.try_state::<AppState>() {
+                    if let Err(error) = state.storage().shutdown() {
+                        tracing::warn!(%error, "could not record a clean shutdown");
+                    }
+                }
+            }
         });
 }

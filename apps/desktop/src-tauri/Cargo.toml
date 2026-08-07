@@ -27,6 +27,16 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# A packaged Windows GUI build has no console, so stdout logging reaches
+# nobody; this writes the same lines to a bounded set of daily files. MIT,
+# and part of the `tracing` project itself rather than a third-party bridge.
+tracing-appender = "0.2"
+# The redaction rules for the diagnostics file. Already in the dependency
+# graph, so this makes a direct use of it rather than adding a new crate.
+regex = "1"
+# The OS name and version in the diagnostics file: the difference between
+# Windows 10 and 11, or between two distributions, is often the whole bug.
+os_info = { version = "3", default-features = false }
 tokio.workspace = true
 chrono.workspace = true
 # Content hashes for attachment metadata (sha256 of small attached files).

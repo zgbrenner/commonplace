@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Artifact, ArtifactKind, OperationResult } from "@commonspace/protocol";
+import { formatDateTime } from "../lib/format";
 import { Button, Card, PanelHeading, StatusPill } from "./primitives";
 
 interface ArtifactPanelProps {
@@ -53,6 +54,14 @@ function ArtifactCard({
   const [undoState, setUndoState] = useState<
     { kind: "idle" } | { kind: "working" } | { kind: "done"; result: OperationResult }
   >({ kind: "idle" });
+  const undoResultRef = useRef<HTMLParagraphElement>(null);
+
+  // The Undo button is replaced by its own result, so a keyboard user's
+  // focus would otherwise land back at the top of the page. Moving it onto
+  // the result both keeps their place and reads them the answer.
+  useEffect(() => {
+    if (undoState.kind === "done") undoResultRef.current?.focus();
+  }, [undoState.kind]);
 
   const undo = async () => {
     setUndoState({ kind: "working" });
@@ -61,6 +70,10 @@ function ArtifactCard({
   };
 
   const canUndo = Boolean(artifact.file_operation_id) && undoState.kind !== "done";
+  // The reader's date order and clock, not ours: 07/08 reads as two
+  // different days on two sides of an ocean, and this is the line someone
+  // checks to be sure they are looking at the right version of a file.
+  const when = formatDateTime(artifact.created_at);
 
   return (
     <Card as="li" className="p-3">
@@ -75,6 +88,14 @@ function ArtifactCard({
               {artifact.modified_existing ? "Changed" : "Created"}
             </StatusPill>
           </p>
+          {when ? (
+            <p className="mt-1 text-xs text-[var(--color-ink-faint)]">
+              <span className="sr-only">
+                {artifact.modified_existing ? "Changed on " : "Created on "}
+              </span>
+              {when}
+            </p>
+          ) : null}
         </div>
       </div>
 
@@ -104,7 +125,8 @@ function ArtifactCard({
 
       {undoState.kind === "done" ? (
         <p
-          role="status"
+          ref={undoResultRef}
+          tabIndex={-1}
           className={`mt-2 text-xs ${
             undoState.result.success ? "text-[var(--color-ok)]" : "text-[var(--color-danger)]"
           }`}

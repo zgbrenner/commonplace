@@ -64,8 +64,11 @@ export function StatusPill({
     neutral: "bg-[var(--color-surface-sunken)] text-[var(--color-ink-muted)]",
   } as const;
   return (
+    // The `status-pill` class carries no styling of its own; it is the hook
+    // styles.css needs to draw a boundary under Windows High Contrast, where
+    // the OS replaces the tone background with its own.
     <span
-      className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${tones[tone]}`}
+      className={`status-pill inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${tones[tone]}`}
     >
       {glyph ? <span aria-hidden="true">{glyph}</span> : null}
       {children}
@@ -83,8 +86,10 @@ export function Card({
   as?: "div" | "section" | "article" | "li";
 }) {
   return (
+    // `card` is the same kind of hook as `status-pill`: no styling here, a
+    // forced-colors boundary in styles.css.
     <Tag
-      className={`rounded-[var(--radius-card)] border border-[var(--color-line)] bg-[var(--color-surface-raised)] ${className}`}
+      className={`card rounded-[var(--radius-card)] border border-[var(--color-line)] bg-[var(--color-surface-raised)] ${className}`}
     >
       {children}
     </Tag>
@@ -160,20 +165,30 @@ export function ErrorNotice({
   message,
   recovery,
   onRetry,
+  announce = true,
 }: {
   message: string;
   recovery?: string | undefined;
   onRetry?: (() => void) | undefined;
+  /**
+   * Whether this notice speaks for itself. True everywhere an error arrives
+   * out of nowhere and interrupting is the right thing. The conversation
+   * column passes false: it has one live region of its own, which already
+   * says the task didn't finish, and two voices reading the same failure is
+   * worse than one.
+   */
+  announce?: boolean;
 }) {
   return (
     <div
-      role="alert"
+      role={announce ? "alert" : undefined}
       className="rounded-[var(--radius-card)] border border-[var(--color-danger)] bg-[var(--color-danger-soft)] p-3"
     >
       <p className="text-sm font-medium text-[var(--color-danger)]">
         <span aria-hidden="true" className="mr-1.5">
           ⚠
         </span>
+        <span className="sr-only">Error: </span>
         {message}
       </p>
       {recovery ? (

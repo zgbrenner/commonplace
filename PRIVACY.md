@@ -23,7 +23,7 @@
 | Backups of modified/deleted files | App data backup store, per workspace, with retention controls |
 | Audit history (permissions, file operations) | SQLite database |
 | Preferences and workspace configuration | SQLite database |
-| Diagnostic logs (rotated) | App data log directory, secrets redacted |
+| Diagnostic logs (rotated) | App data log directory. Nothing in Commonspace logs a credential, but the log is written as the code emits it — there is no filter over it. The diagnostics report you can produce from Settings *is* redacted before it is written. |
 
 Secrets are never stored in the database or logs. If a provider requires
 Commonspace to hold an API key, it is kept in your operating system's

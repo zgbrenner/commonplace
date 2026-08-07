@@ -12,6 +12,15 @@
 //! `--permission-mode dontAsk` makes non-allowed tool use fail fast instead
 //! of hanging on a prompt nobody can see.
 //!
+//! Configuration comes from Commonspace, never from the workspace. The
+//! working directory is a folder the user may have received from anyone —
+//! Dropbox, a colleague, a zip — and Claude Code reads `.claude/settings.json`
+//! out of it, hooks included, with trust verification off under `-p`. Hooks
+//! are shell commands, so a workspace could otherwise run code without ever
+//! passing the policy engine. `--setting-sources user` stops project and local
+//! settings being discovered at all, and the session settings file this
+//! adapter writes turns hooks off outright.
+//!
 //! Auth: owned entirely by the Claude Code CLI. Commonspace only inspects
 //! status non-destructively and, for sign-in, tells the user to run the
 //! official `claude` login flow.
@@ -62,6 +71,16 @@ const ALLOWED_TOOLS: &str = "Read,Glob,Grep,LS,TodoWrite,Task,mcp__commonspace";
 /// explicit and robust (deny wins in Claude Code's evaluation order).
 const DISALLOWED_TOOLS: &str =
     "Bash,PowerShell,Edit,Write,NotebookEdit,WebFetch,WebSearch,KillShell";
+
+/// The only settings tier Claude Code may discover for itself.
+///
+/// The other two — `project` (`<cwd>/.claude/settings.json`) and `local`
+/// (`<cwd>/.claude/settings.local.json`) — are read out of the workspace,
+/// which is untrusted content. `user` is the CLI's own `~/.claude/settings.json`,
+/// which the person at the keyboard owns; taking it away would silently
+/// override choices they made in Anthropic's tool, and it is not reachable by
+/// a folder someone sent them.
+const SETTING_SOURCES: &str = "user";
 
 pub struct ClaudeCodeAdapter;
 
@@ -196,6 +215,8 @@ impl AgentAdapter for ClaudeCodeAdapter {
             "--include-partial-messages".into(),
             "--permission-mode".into(),
             "dontAsk".into(),
+            "--setting-sources".into(),
+            SETTING_SOURCES.into(),
             "--allowedTools".into(),
             ALLOWED_TOOLS.into(),
             "--disallowedTools".into(),
@@ -217,42 +238,56 @@ impl AgentAdapter for ClaudeCodeAdapter {
             args.push("--resume".into());
             args.push(resume.clone());
         }
-        // The MCP configuration goes in a file rather than on the command
-        // line: JSON does not survive Windows `.cmd` argument quoting, and a
-        // file keeps the session token out of the process list. The file is
-        // removed as soon as the session ends.
-        let mcp_config_file = match &request.mcp {
-            Some(mcp) => {
-                let config = json!({
-                    "mcpServers": {
-                        "commonspace": {
-                            "type": "http",
-                            "url": mcp.url,
-                            "headers": { "Authorization": format!("Bearer {}", mcp.token) }
-                        }
-                    }
-                });
-                let path = std::env::temp_dir().join(format!(
-                    "commonspace-mcp-{}.json",
-                    uuid::Uuid::new_v4().simple()
-                ));
-                std::fs::write(&path, config.to_string())?;
-                restrict_to_owner(&path);
-                args.push("--mcp-config".into());
-                args.push(path.to_string_lossy().into_owned());
-                args.push("--strict-mcp-config".into());
-                Some(path)
-            }
-            None => None,
-        };
+        // Everything Commonspace configures for this run goes in one file
+        // rather than on the command line: JSON does not survive Windows
+        // `.cmd` argument quoting, and a file keeps the session token out of
+        // the process list. Claude Code accepts the same path for both
+        // `--settings` and `--mcp-config` — each reads the keys it knows —
+        // so there is one file to protect and one file to remove when the
+        // session ends.
+        let mut config = json!({
+            // Hooks are shell commands. `--setting-sources user` already
+            // keeps the workspace's own from being discovered; this also
+            // covers a hook reaching the CLI by any route Commonspace has
+            // not accounted for.
+            "disableAllHooks": true,
+            "permissions": { "deny": protected_deny_rules() },
+        });
+        if let Some(mcp) = &request.mcp {
+            config["mcpServers"] = json!({
+                "commonspace": {
+                    "type": "http",
+                    "url": mcp.url,
+                    "headers": { "Authorization": format!("Bearer {}", mcp.token) }
+                }
+            });
+        }
+        let session_config_file = std::env::temp_dir().join(format!(
+            "commonspace-claude-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&session_config_file, config.to_string())?;
+        restrict_to_owner(&session_config_file);
+        args.push("--settings".into());
+        args.push(session_config_file.to_string_lossy().into_owned());
+        if request.mcp.is_some() {
+            args.push("--mcp-config".into());
+            args.push(session_config_file.to_string_lossy().into_owned());
+            args.push("--strict-mcp-config".into());
+        }
 
-        let mut cli =
-            spawn_cli(&path, &args, &request.cwd, &cli_quiet_env()).map_err(|source| {
-                AdapterError::Spawn {
+        let mut cli = match spawn_cli(&path, &args, &request.cwd, &cli_quiet_env()) {
+            Ok(cli) => cli,
+            Err(source) => {
+                // Nothing is going to consume the file, and it holds the
+                // session token.
+                let _ = std::fs::remove_file(&session_config_file);
+                return Err(AdapterError::Spawn {
                     cli: "Claude Code",
                     source,
-                }
-            })?;
+                });
+            }
+        };
 
         // The prompt goes via stdin as a stream-json user message; closing
         // stdin afterwards makes the CLI exit after its result.
@@ -273,7 +308,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
             let mut saw_result = false;
             while let Some(line) = cli.stdout_lines.recv().await {
                 let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                    continue; // non-JSON noise is ignored, kept in raw logs
+                    continue; // non-JSON noise is dropped; nothing retains it
                 };
                 if let Some(sid) = value.get("session_id").and_then(Value::as_str) {
                     let _ = psid_tx.send_if_modified(|cur| {
@@ -288,9 +323,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
                 saw_result |= normalizer.handle(&value);
             }
             let code = cli.wait().await.ok().flatten();
-            if let Some(path) = &mcp_config_file {
-                let _ = std::fs::remove_file(path);
-            }
+            let _ = std::fs::remove_file(&session_config_file);
             if !saw_result {
                 let tail: Vec<String> = {
                     let t = stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
@@ -348,6 +381,43 @@ impl AgentAdapter for ClaudeCodeAdapter {
     }
 }
 
+/// Claude Code deny rules mirroring the credential stores that
+/// `commonspace-permissions` protects.
+///
+/// Commonspace's policy engine only sees calls to Commonspace's own MCP
+/// tools. Claude Code's `Read` and `Grep` go straight to disk, so "read my
+/// SSH key and summarise it" is otherwise held back by nothing but the CLI's
+/// working-directory rules — and `--add-dir` widens those. Mirroring the same
+/// list into the CLI's own configuration closes that route.
+///
+/// What this is worth, stated plainly: it is enforcement by a cooperating
+/// process. It holds for exactly as long as Claude Code keeps honouring its
+/// own settings file, which Commonspace cannot verify and the kernel does not
+/// help with. It is a second lock on a door that is already locked, not a
+/// boundary. Codex has no counterpart at all — `-s read-only` constrains
+/// writes, not reads — so this is not something the two adapters share.
+///
+/// Its reach also stops at file *contents*. Verified against v2.1.224: a
+/// `Read(...)` rule blocks `Read` and `Grep`, but `Glob` still returns the
+/// names of files inside a denied directory.
+///
+/// Each store yields four rules, because one name deserves denying in more
+/// than one place and in more than one shape: `~/<path>` for the user's real
+/// store and `//**/<path>` for a copy that arrives inside a workspace, each
+/// as a bare path (`.netrc` is a file) and with `/**` (`.ssh` is a
+/// directory). `//` anchors a pattern at the filesystem root; a single
+/// leading `/` would be read as relative to the settings file.
+fn protected_deny_rules() -> Vec<String> {
+    let mut rules = Vec::new();
+    for store in commonspace_permissions::credential_store_paths() {
+        for anchor in ["~", "//**"] {
+            rules.push(format!("Read({anchor}/{store})"));
+            rules.push(format!("Read({anchor}/{store}/**)"));
+        }
+    }
+    rules
+}
+
 /// Best-effort tightening of a temporary credential file's permissions. On
 /// Unix this is owner-only; on Windows the file inherits the user profile's
 /// ACL, which is the closest equivalent without shelling out to `icacls`.
@@ -374,6 +444,16 @@ fn dirs_home() -> Option<std::path::PathBuf> {
     }
 }
 
+/// Quota state carried by a Claude Code `rate_limit_event` line.
+struct RateLimit {
+    /// `allowed`, `allowed_warning`, or `rejected`.
+    status: String,
+    /// Which window is filling up — `five_hour`, `seven_day`, …
+    window: String,
+    /// Unix seconds at which that window rolls over, when the CLI says.
+    resets_at: Option<i64>,
+}
+
 /// Translates Claude Code stream-json lines into normalized [`AgentEvent`]s.
 struct Normalizer {
     events: EventSink,
@@ -381,6 +461,14 @@ struct Normalizer {
     /// Set when partial deltas stream in, so full assistant text blocks are
     /// not emitted twice.
     saw_deltas: bool,
+    /// Latest quota state the CLI reported. Claude Code sends this out of
+    /// band, ahead of any failure, so holding on to it is what lets a
+    /// terminal error say why the run stopped.
+    rate_limit: Option<RateLimit>,
+    /// Which warning the user has already been given. The CLI repeats the
+    /// same quota line while a window stays over its threshold, and the same
+    /// sentence four times is noise, not information.
+    warned: Option<(String, Option<i64>)>,
 }
 
 impl Normalizer {
@@ -389,6 +477,8 @@ impl Normalizer {
             events,
             current_message: None,
             saw_deltas: false,
+            rate_limit: None,
+            warned: None,
         }
     }
 
@@ -412,6 +502,10 @@ impl Normalizer {
                 self.handle_tool_results(value.get("message").unwrap_or(&Value::Null));
                 false
             }
+            Some("rate_limit_event") => {
+                self.handle_rate_limit(value.get("rate_limit_info").unwrap_or(&Value::Null));
+                false
+            }
             Some("result") => {
                 let summary = value
                     .get("result")
@@ -427,20 +521,109 @@ impl Normalizer {
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
                 {
-                    self.send(AgentEvent::Error {
-                        error: AgentErrorInfo {
-                            code: "provider_error".into(),
-                            message: summary,
-                            recovery: None,
-                            transient: false,
-                        },
-                    });
+                    let error = self.classify_failure(summary);
+                    self.send(AgentEvent::Error { error });
                 } else {
                     self.send(AgentEvent::TaskCompleted { summary, usage });
                 }
                 true
             }
-            _ => false,
+            other => {
+                // Permissive on purpose: a line type Commonspace has never
+                // seen must not end a session. Recording it is what keeps
+                // "never seen" from also meaning "never noticed" — this arm
+                // is where a new provider event would otherwise vanish.
+                tracing::debug!(
+                    line_type = other.unwrap_or("<untyped>"),
+                    "unhandled Claude Code line type"
+                );
+                false
+            }
+        }
+    }
+
+    /// Claude Code reports quota on its own line type, whether or not the run
+    /// is in trouble. Two things come of that: the user hears a window is
+    /// filling up while there is still time to act on it, and a run that
+    /// later dies of quota can say so instead of failing anonymously.
+    fn handle_rate_limit(&mut self, info: &Value) {
+        let str_field = |key: &str| {
+            info.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let status = str_field("status");
+        let window = str_field("rateLimitType");
+        let resets_at = info.get("resetsAt").and_then(Value::as_i64);
+
+        if status == "allowed_warning" {
+            let key = (window.clone(), resets_at);
+            if self.warned.as_ref() != Some(&key) {
+                self.warned = Some(key);
+                let limit = window_phrase(&window);
+                self.send(AgentEvent::Warning {
+                    message: match reset_phrase(resets_at) {
+                        Some(when) => format!("Claude is close to its {limit}. It resets {when}."),
+                        None => format!("Claude is close to its {limit}."),
+                    },
+                });
+            }
+        }
+
+        self.rate_limit = Some(RateLimit {
+            status,
+            window,
+            resets_at,
+        });
+    }
+
+    /// Distinguishes a run that ran out of quota from one that failed on its
+    /// own merits. Both arrive as the same opaque terminal line, so without
+    /// this the user is told the same unhelpful thing either way — and told
+    /// it is not worth retrying, which for a quota failure is wrong.
+    fn classify_failure(&self, message: String) -> AgentErrorInfo {
+        let out_of_quota = self
+            .rate_limit
+            .as_ref()
+            .is_some_and(|limit| limit.status == "rejected")
+            || {
+                // A run can also stop on quota without a `rejected` line
+                // preceding it, in which case the CLI's own wording is the
+                // only evidence there is.
+                let lower = message.to_lowercase();
+                lower.contains("usage limit") || lower.contains("rate limit")
+            };
+        if !out_of_quota {
+            return AgentErrorInfo {
+                code: "provider_error".into(),
+                message,
+                recovery: None,
+                transient: false,
+            };
+        }
+        let resets_at = self.rate_limit.as_ref().and_then(|limit| limit.resets_at);
+        let limit = self
+            .rate_limit
+            .as_ref()
+            .map(|limit| window_phrase(&limit.window))
+            .unwrap_or_else(|| "usage limit".to_string());
+        AgentErrorInfo {
+            code: "provider_rate_limited".into(),
+            message,
+            recovery: Some(match reset_phrase(resets_at) {
+                Some(when) => format!(
+                    "This is a {limit}, not a problem with the task. It resets {when} — \
+                     the same request should work after that."
+                ),
+                // Claude Code does not always say when the window rolls over.
+                // Naming a time it never gave would be worse than saying so.
+                None => format!(
+                    "This is a {limit}, not a problem with the task. The same request should \
+                     work once it resets."
+                ),
+            }),
+            transient: true,
         }
     }
 
@@ -562,6 +745,23 @@ impl Normalizer {
             }
         }
     }
+}
+
+/// Names the quota window the way a person would say it. The CLI's own
+/// values (`five_hour`, `seven_day`) read as identifiers; an unfamiliar one
+/// still comes out as a sentence rather than as nothing.
+fn window_phrase(window: &str) -> String {
+    match window.trim() {
+        "" => "usage limit".to_string(),
+        named => format!("{} usage limit", named.replace('_', "-")),
+    }
+}
+
+/// The reset moment in the reader's own clock terms. Claude Code gives Unix
+/// seconds; "resets at 1786474800" tells a user nothing they can plan around.
+fn reset_phrase(resets_at: Option<i64>) -> Option<String> {
+    let moment = chrono::DateTime::from_timestamp(resets_at?, 0)?.with_timezone(&chrono::Local);
+    Some(moment.format("at %-I:%M %p on %a %-d %b").to_string())
 }
 
 /// Human-readable activity line for a tool call, plus involved paths.
@@ -718,9 +918,82 @@ mod tests {
         let events = collect(&[
             r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"credit exhausted"}"#,
         ]);
-        assert!(
-            matches!(&events[0], AgentEvent::Error { error } if error.message == "credit exhausted")
-        );
+        let AgentEvent::Error { error } = &events[0] else {
+            panic!("unexpected {:?}", events[0]);
+        };
+        assert_eq!(error.message, "credit exhausted");
+        // A failure with no quota evidence behind it must not be advertised
+        // as worth retrying.
+        assert!(!error.transient);
+        assert_eq!(error.code, "provider_error");
+        assert!(error.recovery.is_none());
+    }
+
+    /// Transcribed verbatim from a live `claude -p` run (v2.1.224), not
+    /// invented — the field set differs from the docs in docs/research.md §A.
+    const RATE_LIMIT_WARNING: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1786474800,"rateLimitType":"seven_day","utilization":0.8,"isUsingOverage":false,"surpassedThreshold":0.75},"uuid":"a9da9cb2-dca5-45bf-bff0-6e4f01125a78","session_id":"s1"}"#;
+
+    #[test]
+    fn approaching_a_limit_warns_once_in_local_terms() {
+        let events = collect(&[RATE_LIMIT_WARNING, RATE_LIMIT_WARNING]);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let AgentEvent::Warning { message } = &events[0] else {
+            panic!("unexpected {:?}", events[0]);
+        };
+        assert!(message.contains("seven-day usage limit"), "{message}");
+        // The timezone decides the digits, so only the shape is asserted.
+        assert!(message.contains("It resets at "), "{message}");
+        assert!(!message.contains("1786474800"), "{message}");
+    }
+
+    #[test]
+    fn a_run_that_stops_on_quota_says_so_and_says_when() {
+        let events = collect(&[
+            r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","resetsAt":1771606800,"status":"rejected","isUsingOverage":false,"overageStatus":"rejected"}}"#,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Request failed"}"#,
+        ]);
+        // `rejected` is not the warning threshold; the terminal error carries it.
+        let AgentEvent::Error { error } = &events[0] else {
+            panic!("unexpected {:?}", events[0]);
+        };
+        assert_eq!(error.code, "provider_rate_limited");
+        assert!(error.transient);
+        let recovery = error.recovery.as_deref().unwrap_or_default();
+        assert!(recovery.contains("five-hour usage limit"), "{recovery}");
+        assert!(recovery.contains("It resets at "), "{recovery}");
+    }
+
+    /// A quota failure the CLI reports only in prose, with no preceding
+    /// `rate_limit_event` to read a reset time out of.
+    #[test]
+    fn quota_wording_alone_is_enough_to_mark_a_failure_retryable() {
+        let events = collect(&[
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Claude AI usage limit reached"}"#,
+        ]);
+        let AgentEvent::Error { error } = &events[0] else {
+            panic!("unexpected {:?}", events[0]);
+        };
+        assert_eq!(error.code, "provider_rate_limited");
+        assert!(error.transient);
+        let recovery = error.recovery.as_deref().unwrap_or_default();
+        assert!(recovery.contains("once it resets"), "{recovery}");
+    }
+
+    #[test]
+    fn deny_rules_mirror_every_protected_credential_store() {
+        let rules = protected_deny_rules();
+        for store in commonspace_permissions::credential_store_paths() {
+            for expected in [
+                format!("Read(~/{store})"),
+                format!("Read(~/{store}/**)"),
+                format!("Read(//**/{store})"),
+                format!("Read(//**/{store}/**)"),
+            ] {
+                assert!(rules.contains(&expected), "missing {expected}");
+            }
+        }
+        assert!(rules.contains(&"Read(~/.ssh/**)".to_string()));
+        assert!(rules.contains(&"Read(//**/.claude/**)".to_string()));
     }
 
     #[test]

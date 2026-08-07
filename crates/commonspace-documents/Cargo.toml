@@ -31,6 +31,11 @@ lopdf = "0.44.0"
 # `calamine`, so a malformed workbook is caught before success is reported.
 calamine = "0.36.1"
 rust_xlsxwriter = "0.97.1"
+# `inline` gives word-level highlighting inside a changed line, which is the
+# difference between a readable and an unreadable diff of reflowed prose;
+# `unicode` makes that tokenization word-aware for scripts that are not
+# space-separated. Apache-2.0, on deny.toml's allow-list.
+similar = { version = "3.1.2", features = ["inline", "unicode"] }
 
 [dev-dependencies]
 tempfile = "3"

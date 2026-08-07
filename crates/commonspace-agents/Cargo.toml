@@ -11,6 +11,7 @@ rust-version.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 commonspace-core.workspace = true
+commonspace-permissions.workspace = true
 process-wrap = { version = "9.1.0", features = ["tokio1"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -292,7 +292,16 @@ impl Normalizer {
                 });
                 true
             }
-            _ => false,
+            other => {
+                // Permissive on purpose: a line type Commonspace has never
+                // seen must not end a session. Recording it is what keeps
+                // "never seen" from also meaning "never noticed".
+                tracing::debug!(
+                    line_type = other.unwrap_or("<untyped>"),
+                    "unhandled Codex line type"
+                );
+                false
+            }
         }
     }
 

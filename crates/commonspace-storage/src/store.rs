@@ -10,7 +10,35 @@ use commonspace_documents::FileOperation;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 use thiserror::Error;
+
+/// How long a writer waits for a lock before giving up. SQLite's own default
+/// is zero — the first overlap between a UI command and a task's event stream
+/// would fail outright — and rusqlite installs a timeout of its own that is
+/// not part of its documented contract, so the value this app wants is set
+/// here explicitly.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ceiling the WAL sidecar is truncated back to after a checkpoint. Without
+/// it the file keeps whatever high-water mark one long import produced, for
+/// the life of the install.
+const JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
+/// Settings key written by `shutdown` and cleared by `init`. Present at open
+/// means the previous session ended on purpose.
+const CLEAN_SHUTDOWN_KEY: &str = "storage.clean_shutdown";
+
+/// Settings key holding the journal mode the last open actually got.
+const JOURNAL_MODE_KEY: &str = "storage.journal_mode";
+
+/// Filename marker for the copy taken before a migration, and how many are
+/// kept. Two: the one from this upgrade and the one from the upgrade before
+/// it, which is as far back as a restore is plausibly useful — the older a
+/// copy is, the more of the user's work it is missing.
+const PRE_MIGRATION_PREFIX: &str = ".pre-migration-";
+const PRE_MIGRATION_SUFFIX: &str = ".backup";
+const PRE_MIGRATION_BACKUPS_KEPT: usize = 2;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -171,6 +199,7 @@ pub struct SessionRecord {
 /// The storage handle.
 pub struct Storage {
     conn: Mutex<Connection>,
+    journal_mode: String,
 }
 
 fn now() -> String {
@@ -195,12 +224,143 @@ fn capped_title(trimmed: &str) -> String {
 /// `NEAR(`, `*`, or an unbalanced quote reaches the index as literal text to
 /// tokenize rather than as query grammar. Quoted phrases joined by spaces are
 /// an implicit AND. Returns an empty string for whitespace-only input.
+///
+/// The final term also gets a trailing `*`: it is the one the user may still
+/// be typing, so `flam` should find `flamingo`. Only the final one — a prefix
+/// on every term makes short common words match nearly everything and flattens
+/// the ranking that makes the results worth reading. The `*` sits outside the
+/// quotes, where FTS5 reads it as the prefix operator applied to the phrase
+/// and never as part of the phrase's text, so the property above survives: a
+/// term of pure punctuation tokenizes to nothing and matches nothing instead
+/// of erroring.
 fn fts_match_expression(query: &str) -> String {
-    query
-        .split_whitespace()
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+    let terms: Vec<&str> = query.split_whitespace().collect();
+    let last = terms.len().saturating_sub(1);
+    terms
+        .iter()
+        .enumerate()
+        .map(|(index, term)| {
+            let phrase = format!("\"{}\"", term.replace('"', "\"\""));
+            if index == last {
+                format!("{phrase}*")
+            } else {
+                phrase
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The file backing this connection, or `None` for the in-memory database
+/// tests use — which has no directory to write a copy into and nothing that
+/// outlives the process to protect.
+fn database_path(conn: &Connection) -> Option<PathBuf> {
+    conn.path()
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The one place `VACUUM INTO` is spelled. It reads the whole database inside
+/// a single transaction, so the copy is a coherent snapshot even with writes
+/// in flight, and it writes only live pages, so the copy is compact rather
+/// than carrying the original's free space. SQLite refuses to overwrite, so
+/// `path` must not exist.
+fn vacuum_into(conn: &Connection, path: &Path) -> Result<()> {
+    conn.execute("VACUUM INTO ?1", params![path.to_string_lossy()])?;
+    Ok(())
+}
+
+/// Whether the previous session shut itself down deliberately.
+///
+/// Read straight out of `settings` rather than through `get_setting`, because
+/// this runs before migrations, when that table may not exist yet — and an
+/// install that has never been migrated has no data worth checking anyway.
+fn had_clean_shutdown(conn: &Connection) -> Result<bool> {
+    let has_settings: bool = conn.query_row(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'settings'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_settings {
+        return Ok(false);
+    }
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value_json FROM settings WHERE key = ?1",
+            [CLEAN_SHUTDOWN_KEY],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(stored.as_deref() == Some("true"))
+}
+
+/// Copy the database beside itself before a migration rewrites it, then drop
+/// all but the newest few copies.
+///
+/// Failure is logged rather than fatal. The copy is a second line of defence
+/// — each migration already runs in its own transaction, so a failed
+/// migration rolls back — and a full disk or a read-only directory is not a
+/// good reason to leave someone unable to open their own history.
+fn back_up_before_migration(conn: &Connection, from_version: i64) {
+    let Some(database) = database_path(conn) else {
+        return;
+    };
+    let Some(name) = database.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    // Timestamp first in the suffix so plain name order is also age order,
+    // which is what the pruning below relies on.
+    let stamp = Utc::now().format("%Y%m%dT%H%M%S%3f");
+    let copy = database.with_file_name(format!(
+        "{name}{PRE_MIGRATION_PREFIX}{stamp}-from-v{from_version}{PRE_MIGRATION_SUFFIX}"
+    ));
+    match vacuum_into(conn, &copy) {
+        Ok(()) => {
+            tracing::info!(
+                backup = %copy.display(),
+                from_version,
+                "copied the database before migrating it"
+            );
+            prune_pre_migration_backups(&database);
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            backup = %copy.display(),
+            "could not copy the database before migrating; migrating anyway"
+        ),
+    }
+}
+
+/// Delete the oldest pre-migration copies, keeping the newest
+/// `PRE_MIGRATION_BACKUPS_KEPT`. Only files this module named are considered,
+/// so nothing else a user has parked next to the database is at risk.
+fn prune_pre_migration_backups(database: &Path) {
+    let (Some(dir), Some(name)) = (
+        database.parent(),
+        database.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return;
+    };
+    let prefix = format!("{name}{PRE_MIGRATION_PREFIX}");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut copies: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(PRE_MIGRATION_SUFFIX))
+        })
+        .collect();
+    copies.sort();
+    let excess = copies.len().saturating_sub(PRE_MIGRATION_BACKUPS_KEPT);
+    for stale in copies.into_iter().take(excess) {
+        if let Err(error) = std::fs::remove_file(&stale) {
+            tracing::warn!(%error, backup = %stale.display(), "could not delete an old backup");
+        }
+    }
 }
 
 /// Pull the human `message` out of a stored `error_json` blob (a serialized
@@ -254,32 +414,142 @@ impl Storage {
     }
 
     fn init(mut conn: Connection) -> Result<Self> {
+        // First, before anything that can meet a lock.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+
         // WAL keeps readers unblocked while task-event writes stream in, and
         // its append-only journal survives crashes better than rollback mode.
+        // It also needs shared memory and working file locks, which SQLite
+        // documents as absent on network filesystems — a redirected or
+        // roaming %APPDATA% on an SMB share is an ordinary corporate setup,
+        // not an exotic one. So the request is best-effort: rollback journal
+        // mode is slower and lets writers block readers, but it is a working
+        // app, and refusing to launch would be the worse answer. What is not
+        // acceptable is degrading quietly, so the mode actually in force is
+        // read back, kept on the handle, recorded in settings, and warned
+        // about.
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+        // Only a database that is actually a file can be degraded by this:
+        // the in-memory one tests use reports "memory", which is simply what
+        // it is.
+        if database_path(&conn).is_some() && !journal_mode.eq_ignore_ascii_case("wal") {
+            tracing::warn!(
+                journal_mode = %journal_mode,
+                "SQLite would not enable WAL for this database; writes will \
+                 block readers. This is expected on a network filesystem."
+            );
+        }
         // synchronous=NORMAL is the documented safe pairing with WAL: it can
         // never corrupt the database, only lose the last few commits after an
         // OS-level crash, and it avoids an fsync on every transaction.
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT_BYTES)?;
+
         // Surface on-disk corruption at open, where a descriptive error is
         // possible, instead of proceeding and failing confusingly mid-write.
-        // quick_check returns the single row "ok" on a healthy database and
-        // one description per problem otherwise; the first row is enough to
-        // tell the difference and name the fault.
-        let verdict: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-        if verdict != "ok" {
-            return Err(StorageError::Corrupt(verdict));
+        // The check reads every page, so it is spent where there is a reason
+        // to suspect damage rather than on every launch: a session that never
+        // got to record its own shutdown is that reason. quick_check(1) stops
+        // at the first fault, which is all that is needed to name one — and
+        // `check_integrity` stays available for the other case.
+        if !had_clean_shutdown(&conn)? {
+            let verdict: String = conn.query_row("PRAGMA quick_check(1)", [], |r| r.get(0))?;
+            if verdict != "ok" {
+                return Err(StorageError::Corrupt(verdict));
+            }
+        }
+
+        // A migration is the one moment this app rewrites data it cannot
+        // reconstruct, so the state before it is worth a copy. Version 0 is
+        // the exception: there is no schema yet, so there is nothing a copy
+        // could give back.
+        let from_version = crate::migrations::current_version(&conn)?;
+        if from_version > 0 && from_version < crate::migrations::latest_version() {
+            back_up_before_migration(&conn, from_version);
         }
         migrate_to_latest(&mut conn)?;
-        Ok(Self {
+
+        let storage = Self {
             conn: Mutex::new(conn),
-        })
+            journal_mode,
+        };
+        storage.set_setting(JOURNAL_MODE_KEY, &storage.journal_mode)?;
+        // Cleared now, written again only by `shutdown`: from here on, an
+        // ending that is not `shutdown` leaves nothing behind and the next
+        // open checks the database.
+        storage.with(|c| {
+            c.execute("DELETE FROM settings WHERE key = ?1", [CLEAN_SHUTDOWN_KEY])?;
+            Ok(())
+        })?;
+        Ok(storage)
     }
 
     fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         f(&conn)
+    }
+
+    /// The journal mode this database is actually running in, lowercase as
+    /// SQLite reports it: `"wal"` normally, or whatever the filesystem
+    /// allowed instead. Exposed so a degraded mode can be shown or logged
+    /// rather than inferred from the app feeling slow.
+    pub fn journal_mode(&self) -> &str {
+        &self.journal_mode
+    }
+
+    /// Run the full integrity check — the one the open path skips after a
+    /// clean shutdown. It reads every page and every index, so it belongs
+    /// behind a deliberate action ("check my data", a support request), not
+    /// on the startup path.
+    pub fn check_integrity(&self) -> Result<()> {
+        self.with(|c| {
+            // The first row is "ok" on a healthy database and a description
+            // of the first fault otherwise; the argument stops the check
+            // there instead of enumerating damage nobody reads.
+            let verdict: String = c.query_row("PRAGMA integrity_check(1)", [], |r| r.get(0))?;
+            if verdict != "ok" {
+                return Err(StorageError::Corrupt(verdict));
+            }
+            Ok(())
+        })
+    }
+
+    /// Write a consistent, compact copy of the database to `path`, which must
+    /// not already exist.
+    ///
+    /// The copy is an ordinary SQLite file taken from a single read
+    /// transaction: it can be opened directly, moved to another machine, or
+    /// put back over the original to restore, and it is safe to take while
+    /// tasks are writing.
+    pub fn backup_to(&self, path: &Path) -> Result<()> {
+        self.with(|c| vacuum_into(c, path))
+    }
+
+    /// Close the database down deliberately: record that this shutdown was
+    /// orderly, let SQLite refresh the statistics its query planner uses, and
+    /// fold the WAL back into the main file.
+    ///
+    /// The marker is written first, so that failing housekeeping cannot cost
+    /// the next launch its fast start. Not calling this is safe — nothing is
+    /// lost and the database stays consistent — it only means the next open
+    /// pays for an integrity check it did not need.
+    pub fn shutdown(&self) -> Result<()> {
+        self.set_setting(CLEAN_SHUTDOWN_KEY, &true)?;
+        self.with(|c| {
+            // The documented "just before closing" call: it re-analyzes only
+            // the indexes whose statistics have gone stale, so a session that
+            // changed little pays almost nothing.
+            c.execute_batch("PRAGMA optimize")?;
+            if self.journal_mode.eq_ignore_ascii_case("wal") {
+                // TRUNCATE rather than the default PASSIVE: it folds the
+                // whole sidecar back into the database and leaves it empty,
+                // which is the state the next open wants to start from.
+                c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+            }
+            Ok(())
+        })
     }
 
     // ---- workspaces ----
@@ -525,6 +795,12 @@ impl Storage {
             // conversation_id is their own id. The snippet is taken from the
             // column the row kind actually indexes (title for conversations,
             // body for messages) — the other column is always empty.
+            //
+            // Explicit bm25 weights rather than `ORDER BY rank`, which is
+            // bm25 with every column weighted alike: the conversation someone
+            // named for a topic should come above a rambling message that
+            // mentions it once. The four unindexed columns carry no terms and
+            // are given no weight.
             let mut stmt = c.prepare(
                 "SELECT f.kind,
                         f.conversation_id,
@@ -537,7 +813,7 @@ impl Storage {
                  FROM history_fts AS f
                  LEFT JOIN conversations AS conv ON conv.id = f.conversation_id
                  WHERE history_fts MATCH ?1
-                 ORDER BY rank
+                 ORDER BY bm25(history_fts, 10.0, 1.0, 0.0, 0.0, 0.0, 0.0)
                  LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![expression, limit as i64], |r| {
@@ -950,8 +1226,22 @@ impl Storage {
 
     // ---- file operations (undo journal) ----
 
+    /// Journal an operation, and mirror the backup it took (when it took one)
+    /// into `backups`.
+    ///
+    /// The mirror is what keeps that table a live account of what is on disk
+    /// rather than a fossil of the rows v7 backfilled. Its id is derived from
+    /// the operation's, so re-recording the same operation updates the same
+    /// row instead of counting the backup twice, and so a row written here
+    /// and a row written by the v7 backfill for the same operation are the
+    /// same row. `size_bytes` is left to whoever measures the file: this
+    /// layer does not touch the filesystem.
     pub fn record_file_operation(&self, task: Option<&TaskId>, op: &FileOperation) -> Result<()> {
         let json = serde_json::to_string(op)?;
+        let backup = op
+            .backup
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
         self.with(|c| {
             c.execute(
                 "INSERT OR REPLACE INTO file_operations
@@ -965,7 +1255,52 @@ impl Storage {
                     op.performed_at.to_rfc3339()
                 ],
             )?;
+            if let Some(backup_path) = backup {
+                c.execute(
+                    "INSERT INTO backups
+                     (id, workspace_id, file_operation_id, source_path, backup_path,
+                      content_hash, created_at)
+                     VALUES (?1, (SELECT workspace_id FROM tasks WHERE id = ?2), ?3, ?4, ?5,
+                             ?6, ?7)
+                     ON CONFLICT(id) DO UPDATE SET
+                         -- COALESCE, because a later record without a task
+                         -- must not strip the backup of the workspace whose
+                         -- disk budget it counts against.
+                         workspace_id      = COALESCE(excluded.workspace_id, workspace_id),
+                         file_operation_id = excluded.file_operation_id,
+                         source_path       = excluded.source_path,
+                         backup_path       = excluded.backup_path,
+                         content_hash      = excluded.content_hash",
+                    params![
+                        format!("bak_{}", op.id.0),
+                        task.map(|t| &t.0),
+                        op.id.0,
+                        op.source.to_string_lossy(),
+                        backup_path,
+                        op.hash_before,
+                        op.performed_at.to_rfc3339(),
+                    ],
+                )?;
+            }
             Ok(())
+        })
+    }
+
+    /// What the backups taken for `workspace` are costing: how many are still
+    /// on disk, and how many bytes they account for.
+    ///
+    /// Pruned backups are excluded — the row survives as history, the file
+    /// does not. The byte figure covers the rows whose size has been
+    /// measured, so for history inherited from before the `backups` table it
+    /// reads as a floor rather than a total; the count is exact either way.
+    pub fn backup_usage(&self, workspace: &WorkspaceId) -> Result<(i64, i64)> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT count(*), COALESCE(sum(size_bytes), 0) FROM backups
+                 WHERE workspace_id = ?1 AND pruned_at IS NULL",
+                [&workspace.0],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
         })
     }
 
@@ -1211,6 +1546,149 @@ mod tests {
         assert_eq!(ws.len(), 1);
         assert_eq!(ws[0].name, "Test");
         assert_eq!(ws[0].roots.len(), 1);
+    }
+
+    /// Every pre-migration copy sitting next to `db`, oldest first.
+    fn pre_migration_copies(db: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(db.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(PRE_MIGRATION_SUFFIX))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn an_on_disk_database_runs_in_wal_and_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("commonspace.db");
+        let s = Storage::open(&db).unwrap();
+        assert_eq!(s.journal_mode(), "wal");
+        // Recorded where a support question can read it back without the app.
+        assert_eq!(
+            s.get_setting::<String>(JOURNAL_MODE_KEY).unwrap().unwrap(),
+            "wal"
+        );
+    }
+
+    #[test]
+    fn a_clean_shutdown_is_marked_and_the_next_open_clears_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("commonspace.db");
+        {
+            let s = Storage::open(&db).unwrap();
+            assert!(
+                s.get_setting::<bool>(CLEAN_SHUTDOWN_KEY).unwrap().is_none(),
+                "an open session must not look like a closed one"
+            );
+            s.shutdown().unwrap();
+            assert_eq!(
+                s.get_setting::<bool>(CLEAN_SHUTDOWN_KEY).unwrap(),
+                Some(true)
+            );
+        }
+        // Reopening consumes the marker, so a crash from here on is visible
+        // to the open after it.
+        let s = Storage::open(&db).unwrap();
+        assert!(s.get_setting::<bool>(CLEAN_SHUTDOWN_KEY).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_database_that_never_shut_down_still_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("commonspace.db");
+        {
+            let s = Storage::open(&db).unwrap();
+            s.create_conversation(None, "Interrupted").unwrap();
+            // Dropped without shutdown: the next open runs the quick check.
+        }
+        let s = Storage::open(&db).unwrap();
+        assert_eq!(s.list_conversations(10).unwrap().len(), 1);
+        s.check_integrity().unwrap();
+    }
+
+    #[test]
+    fn backup_to_writes_an_openable_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("commonspace.db");
+        let s = Storage::open(&db).unwrap();
+        s.create_conversation(None, "Trip planning").unwrap();
+
+        let copy = tmp.path().join("copy.db");
+        s.backup_to(&copy).unwrap();
+        assert!(copy.exists());
+
+        let restored = Storage::open(&copy).unwrap();
+        assert_eq!(
+            restored.list_conversations(10).unwrap()[0].title,
+            "Trip planning"
+        );
+        // SQLite will not write over an existing file, and neither should
+        // this: a backup that silently replaces another is not a backup.
+        assert!(s.backup_to(&copy).is_err());
+    }
+
+    #[test]
+    fn a_migration_copies_the_database_first_and_keeps_only_the_newest_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("commonspace.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            crate::migrations::migrate_to(&mut conn, 1).unwrap();
+            conn.execute_batch(
+                "INSERT INTO conversations (id, title, created_at, updated_at)
+                 VALUES ('conv_1', 'Legacy notes',
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+        // Two copies from imagined earlier upgrades, named as this module
+        // names them and older than the one about to be taken.
+        for stamp in ["20250101T000000000", "20250102T000000000"] {
+            std::fs::write(
+                db.with_file_name(format!(
+                    "commonspace.db{PRE_MIGRATION_PREFIX}{stamp}-from-v1{PRE_MIGRATION_SUFFIX}"
+                )),
+                b"stale",
+            )
+            .unwrap();
+        }
+
+        let s = Storage::open(&db).unwrap();
+        let copies = pre_migration_copies(&db);
+        assert_eq!(copies.len(), PRE_MIGRATION_BACKUPS_KEPT);
+        // The oldest went; the newest is the one this migration wrote, and it
+        // holds the schema and rows from before the upgrade.
+        assert!(!copies[0].to_string_lossy().contains("20250101"));
+        let before = rusqlite::Connection::open(&copies[PRE_MIGRATION_BACKUPS_KEPT - 1]).unwrap();
+        let version: i64 = before
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        let title: String = before
+            .query_row("SELECT title FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "Legacy notes");
+
+        // And the database itself came through the upgrade with its rows.
+        assert_eq!(s.list_conversations(10).unwrap()[0].title, "Legacy notes");
+    }
+
+    #[test]
+    fn a_fresh_install_and_a_current_database_are_copied_at_neither_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("commonspace.db");
+        // Nothing existed to protect at the first open, and nothing migrates
+        // at the second.
+        drop(Storage::open(&db).unwrap());
+        assert!(pre_migration_copies(&db).is_empty());
+        drop(Storage::open(&db).unwrap());
+        assert!(pre_migration_copies(&db).is_empty());
     }
 
     #[test]
@@ -1515,6 +1993,9 @@ mod tests {
         let conv = s.create_conversation(None, "t").unwrap();
         s.append_message(&conv.id, MessageRole::User, "hello world")
             .unwrap();
+        // The trailing `*` the last term now carries is the riskiest part of
+        // the expression, so every case here ends on the character most
+        // likely to combine with it into something FTS5 would parse.
         for hostile in [
             "unbalanced ( NEAR",
             "\"",
@@ -1523,6 +2004,19 @@ mod tests {
             "hello* -world",
             "term\" OR \"",
             "col:value ^caret",
+            "*",
+            "**",
+            "hello *",
+            "hello \"",
+            "hello (",
+            "hello ^",
+            "hello -",
+            "hello :",
+            "hello AND",
+            "hello NEAR",
+            "\"\"\"",
+            "a\"*",
+            "{col}",
         ] {
             assert!(
                 s.search_history(hostile, 10).is_ok(),
@@ -1532,6 +2026,53 @@ mod tests {
         // Whitespace-only queries do not even reach the index.
         assert!(s.search_history("", 10).unwrap().is_empty());
         assert!(s.search_history("   \t  ", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_matches_a_prefix_of_the_last_word() {
+        let s = storage();
+        let conv = s.create_conversation(None, "Trip planning").unwrap();
+        s.append_message(&conv.id, MessageRole::User, "book the flamingo hotel")
+            .unwrap();
+
+        // The word the user is still typing.
+        assert_eq!(s.search_history("flam", 10).unwrap().len(), 1);
+        assert_eq!(s.search_history("book the flam", 10).unwrap().len(), 1);
+        // Earlier terms stay exact, so a prefix of one of them finds nothing
+        // and cannot drag unrelated conversations into the results.
+        assert!(s.search_history("boo flamingo", 10).unwrap().is_empty());
+        // A prefix of nothing indexed is still no match.
+        assert!(s.search_history("zebr", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_ignores_diacritics_in_both_directions() {
+        let s = storage();
+        let conv = s.create_conversation(None, "Notes").unwrap();
+        s.append_message(&conv.id, MessageRole::User, "meet at the café on Wednesday")
+            .unwrap();
+
+        assert_eq!(s.search_history("cafe", 10).unwrap().len(), 1);
+        assert_eq!(s.search_history("café", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_title_match_outranks_a_passing_mention() {
+        let s = storage();
+        let titled = s.create_conversation(None, "Flamingo research").unwrap();
+        let rambling = s.create_conversation(None, "Assorted notes").unwrap();
+        s.append_message(
+            &rambling.id,
+            MessageRole::User,
+            "we talked about a flamingo once, and then about hotels, beaches, \
+             trains, the weather, three restaurants and the parking situation",
+        )
+        .unwrap();
+
+        let hits = s.search_history("flamingo", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].kind, "conversation");
+        assert_eq!(hits[0].conversation_id, titled.id.0);
     }
 
     #[test]
@@ -1947,6 +2488,156 @@ mod tests {
             s.list_conversations(1).unwrap()[0].title,
             "Renamed 42 aardvark scans by date"
         );
+    }
+
+    // ---- backups ----
+
+    #[test]
+    fn recording_an_operation_with_a_backup_registers_it() {
+        use commonspace_documents::{FileOpKind, FileOperation};
+        let s = storage();
+        let ws = s.create_workspace("Test", &[]).unwrap();
+        let conv = s.create_conversation(Some(&ws.id), "t").unwrap();
+        let task = s
+            .create_task(&conv.id, Some(&ws.id), ProviderId::ClaudeCode, "p")
+            .unwrap();
+
+        let mut edited = FileOperation::new(FileOpKind::Modify, PathBuf::from("C:/ws/a.txt"));
+        edited.backup = Some(PathBuf::from("C:/backups/a.txt"));
+        edited.hash_before = Some("aa".into());
+        let created = FileOperation::new(FileOpKind::Create, PathBuf::from("C:/ws/b.txt"));
+        s.record_file_operation(Some(&task.id), &edited).unwrap();
+        // A new file has no previous content, so no backup and no row.
+        s.record_file_operation(Some(&task.id), &created).unwrap();
+
+        assert_eq!(s.backup_usage(&ws.id).unwrap(), (1, 0));
+
+        // Re-recording the same operation (the undo path rewrites it) counts
+        // the one backup once.
+        s.record_file_operation(Some(&task.id), &edited).unwrap();
+        assert_eq!(s.backup_usage(&ws.id).unwrap(), (1, 0));
+
+        let (path, hash): (String, Option<String>) = {
+            let conn = s.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT backup_path, content_hash FROM backups WHERE file_operation_id = ?1",
+                [&edited.id.0],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(path, "C:/backups/a.txt");
+        assert_eq!(hash.as_deref(), Some("aa"));
+    }
+
+    #[test]
+    fn backup_usage_counts_only_live_backups_of_one_workspace() {
+        use commonspace_documents::{FileOpKind, FileOperation};
+        let s = storage();
+        let mine = s.create_workspace("Mine", &[]).unwrap();
+        let theirs = s.create_workspace("Theirs", &[]).unwrap();
+        for (ws, file) in [
+            (&mine.id, "a.txt"),
+            (&mine.id, "b.txt"),
+            (&theirs.id, "c.txt"),
+        ] {
+            let conv = s.create_conversation(Some(ws), "t").unwrap();
+            let task = s
+                .create_task(&conv.id, Some(ws), ProviderId::ClaudeCode, "p")
+                .unwrap();
+            let mut op = FileOperation::new(FileOpKind::Modify, PathBuf::from(file));
+            op.backup = Some(PathBuf::from(format!("C:/backups/{file}")));
+            s.record_file_operation(Some(&task.id), &op).unwrap();
+        }
+        // Sizes are measured by whoever writes the files; fill them in here
+        // the way that slice would, and mark one backup as already reclaimed.
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute("UPDATE backups SET size_bytes = 1000", [])
+                .unwrap();
+            conn.execute(
+                "UPDATE backups SET pruned_at = '2026-02-01T00:00:00Z'
+                 WHERE source_path = 'b.txt'",
+                [],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(s.backup_usage(&mine.id).unwrap(), (1, 1000));
+        assert_eq!(s.backup_usage(&theirs.id).unwrap(), (1, 1000));
+        assert_eq!(
+            s.backup_usage(&WorkspaceId("ws_missing".into())).unwrap(),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn v6_database_upgrades_to_v7_with_backups_backfilled_from_the_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("commonspace.db");
+        {
+            // Freeze a populated database at v6 — the state an install that
+            // has been taking backups all along is in.
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            crate::migrations::migrate_to(&mut conn, 6).unwrap();
+            conn.execute_batch(
+                r#"INSERT INTO workspaces (id, name, created_at)
+                   VALUES ('ws_1', 'Test', '2026-01-01T00:00:00Z');
+                   INSERT INTO conversations (id, workspace_id, title, created_at, updated_at)
+                   VALUES ('conv_1', 'ws_1', 't', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                   INSERT INTO tasks (id, conversation_id, workspace_id, provider, state,
+                                      prompt, created_at, updated_at)
+                   VALUES ('task_1', 'conv_1', 'ws_1', 'claude_code', 'completed', 'p',
+                           '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+
+                   INSERT INTO file_operations (id, task_id, op_json, undone, performed_at)
+                   VALUES ('fop_1', 'task_1',
+                     '{"id":"fop_1","kind":"modify","source":"C:/ws/a.txt",
+                       "backup":"C:/backups/a.txt","hash_before":"aa",
+                       "performed_at":"2026-01-01T00:00:05Z","undone":false}',
+                     0, '2026-01-01T00:00:05Z');
+
+                   -- A created file: no previous content, so no backup.
+                   INSERT INTO file_operations (id, task_id, op_json, undone, performed_at)
+                   VALUES ('fop_2', 'task_1',
+                     '{"id":"fop_2","kind":"create","source":"C:/ws/b.txt",
+                       "performed_at":"2026-01-01T00:00:06Z","undone":false}',
+                     0, '2026-01-01T00:00:06Z');
+
+                   -- A row written by some build that no longer parses. One
+                   -- of these must not fail the upgrade for everything else.
+                   INSERT INTO file_operations (id, task_id, op_json, undone, performed_at)
+                   VALUES ('fop_3', 'task_1', 'not json at all', 0, '2026-01-01T00:00:07Z');"#,
+            )
+            .unwrap();
+        }
+
+        let s = Storage::open(&db).unwrap();
+        let ws = WorkspaceId("ws_1".into());
+        // The one operation that took a backup is now an enumerable row,
+        // attributed to the workspace whose task took it.
+        assert_eq!(s.backup_usage(&ws).unwrap(), (1, 0));
+
+        let conn = s.conn.lock().unwrap();
+        let (source, backup, hash, created, size): (
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT source_path, backup_path, content_hash, created_at, size_bytes
+                 FROM backups WHERE file_operation_id = 'fop_1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(source, "C:/ws/a.txt");
+        assert_eq!(backup, "C:/backups/a.txt");
+        assert_eq!(hash.as_deref(), Some("aa"));
+        assert_eq!(created, "2026-01-01T00:00:05Z");
+        assert_eq!(size, None, "a migration must not go and stat the files");
     }
 
     #[test]

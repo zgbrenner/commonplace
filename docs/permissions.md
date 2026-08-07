@@ -75,7 +75,11 @@ level for everything else. Per-provider details: docs/provider-adapters.md.
 - Dialogs state the operation in plain language, show resolved paths and
   counts ("Rename 14 files in Documents/Contracts"), and mark irreversible
   actions with an explicit warning.
-- Batch operations are itemized and individually deselectable where feasible.
+- Batch operations name the individual items they affect, so "Rename 14 files
+  in Documents/Contracts" can be read as fourteen resolved paths rather than
+  taken on trust as a count. Approving a *subset* is not built: the answer to
+  a batch is approve all or deny all. Per-item deselection is wanted, not
+  shipped, and nothing in the UI should suggest otherwise.
 - Denying is always safe: the task pauses or continues without the operation;
   it never errors into an unrecoverable state.
 - Dialogs are keyboard-navigable and screen-reader labelled; approval is never
