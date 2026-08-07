@@ -72,7 +72,7 @@ jobs:
       # The desktop crate is part of the cargo workspace, so `cargo test
       # --workspace` compiles Tauri and therefore needs Node and the installed
       # frontend dependencies present.
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
@@ -95,7 +95,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
@@ -130,7 +130,7 @@ jobs:
         with:
           tool: cargo-audit,cargo-deny
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
