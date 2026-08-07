@@ -21,6 +21,12 @@ export interface ActivityItem {
   technical?: string | undefined;
 }
 
+/** Token counts a provider reported when the task ended, if it reported any. */
+export interface TaskUsage {
+  inputTokens: number | undefined;
+  outputTokens: number | undefined;
+}
+
 export interface ConversationState {
   /** Streaming assistant text, keyed by message id and concatenated in order. */
   assistantText: string;
@@ -40,6 +46,7 @@ export interface ConversationState {
   error: { message: string; recovery?: string | undefined } | undefined;
   finished: boolean;
   summary: string | undefined;
+  usage: TaskUsage | undefined;
 }
 
 export function emptyConversationState(): ConversationState {
@@ -55,6 +62,7 @@ export function emptyConversationState(): ConversationState {
     error: undefined,
     finished: false,
     summary: undefined,
+    usage: undefined,
   };
 }
 
@@ -189,7 +197,20 @@ function reduceEvent(state: ConversationState, event: AgentEvent): ConversationS
       };
 
     case "task.completed":
-      return { ...state, finished: true, summary: event.summary };
+      return {
+        ...state,
+        finished: true,
+        summary: event.summary,
+        // Providers report usage inconsistently: some send neither count,
+        // some only one. Nulls become undefined here so the card can ask a
+        // single question — is there a number? — rather than three.
+        usage: event.usage
+          ? {
+              inputTokens: event.usage.input_tokens ?? undefined,
+              outputTokens: event.usage.output_tokens ?? undefined,
+            }
+          : undefined,
+      };
 
     default:
       // Exhaustiveness: if a new event type is added without a case above,
@@ -259,6 +280,30 @@ export function calmProgress(state: ConversationState, running: boolean): CalmPr
       total === 0 ? undefined : `${done} of ${total} ${total === 1 ? "step" : "steps"} done`,
     notices: notices.slice(-MAX_NOTICES),
   };
+}
+
+/**
+ * The one sentence the conversation says out loud.
+ *
+ * A task runs for minutes, and a screen reader hears none of it: the
+ * timeline is ordinary text. Marking the timeline live instead would read
+ * the reply out token by token, which is worse than silence. So the same
+ * sentence the calm progress view already shows is what gets announced —
+ * plus the two moments that outrank it, a question waiting on the user and
+ * a task that ended badly, because those are what a person needs to hear
+ * before deciding whether to look.
+ */
+export function announcement(
+  state: ConversationState,
+  running: boolean,
+  awaitingPlanApproval: boolean,
+): string {
+  if (state.pendingPermission) {
+    return `Waiting for your answer: ${permissionHeadline(state.pendingPermission)}`;
+  }
+  if (awaitingPlanApproval) return "Waiting for your decision on the plan.";
+  if (state.error) return `This task didn't finish. ${state.error.message}`;
+  return calmProgress(state, running).headline;
 }
 
 /** Plain-language sentence describing a permission request's operation. */

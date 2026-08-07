@@ -10,14 +10,24 @@
 //! out-of-scope or protected paths.
 
 pub mod backup;
+pub mod diff;
 pub mod fsops;
 pub mod inspect;
 pub mod journal;
 pub mod office;
+pub mod sheets;
 pub mod textio;
 
 pub use backup::BackupStore;
+pub use diff::{
+    extracted_text_diff, looks_binary, shape_summary, text_diff, ChangePreview, ChangeShape,
+    ComparisonBasis, DiffBudget, DiffLine, Hunk, LineKind, LineSpan, SummaryReason,
+};
 pub use fsops::{FsToolError, SafeFs};
 pub use inspect::{DirEntryInfo, DirListing};
 pub use journal::{FileOpKind, FileOperation};
 pub use office::{DocBlock, DocumentError, ExtractedDocument};
+pub use sheets::{
+    create_xlsx, read_spreadsheet, CellValue, ColumnFormat, NewColumn, NewSheet, ReadLimits, Sheet,
+    Workbook,
+};

@@ -100,6 +100,57 @@ call into a human-readable `title`/`detail` pair
 (`humanize_tool` in `claude.rs`, the `item_type` match in `codex.rs`'s
 `handle_item`).
 
+## Unknown lines, and quota
+
+A normalizer's `handle` matches on the line's `type` and its default arm
+returns `false`. That permissiveness is deliberate and must stay: a line
+type a provider adds next month has to be ignored, not treated as a
+terminal event that kills the session. What it must not also be is
+*invisible* — both normalizers log the unrecognized type at `debug`, so a
+schema drift shows up in the session log instead of being silently
+dropped. An exhaustive match here would be the wrong fix.
+
+That arm was quietly eating something real. Claude Code emits quota state
+out of band, on its own line type, whether or not the run is in trouble
+(docs/research.md §A). Observed live from v2.1.224:
+
+```json
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning",
+ "resetsAt":1786474800,"rateLimitType":"seven_day","utilization":0.8,
+ "isUsingOverage":false,"surpassedThreshold":0.75}}
+```
+
+`status` is `allowed` / `allowed_warning` / `rejected`; `rateLimitType`
+names the window (`five_hour`, `seven_day`); `resetsAt` is Unix seconds.
+
+`AgentEvent` gains no variant for this — a normalized event is a contract
+the whole app implements, and quota does not need one. Two existing
+channels carry it instead:
+
+- `allowed_warning` becomes an `AgentEvent::Warning` naming the window and
+  the reset moment in the reader's own clock terms, emitted once per
+  window/reset pair. The CLI repeats the same line while a window stays
+  over threshold, and the same sentence four times is noise.
+- A run that *stops* on quota now produces an `AgentErrorInfo` that says
+  so: `code: "provider_rate_limited"`, `transient: true`, and a `recovery`
+  string naming when it resets. Previously a usage-limit failure and a
+  bad-input failure were indistinguishable — both arrived as
+  `provider_error` / `transient: false` / `recovery: None`, telling the
+  user the one thing that is wrong for a quota failure, which is that
+  retrying will not help. A failure with no quota evidence behind it is
+  still classified exactly as before.
+
+Evidence for "stopped on quota" is the last `rejected` line, or failing
+that the CLI's own wording in the terminal message. When Claude Code gives
+no reset timestamp, the recovery string says the limit will reset without
+naming a time — an invented time would be worse than an absent one.
+
+**Codex has nothing equivalent.** `codex exec --json` reports
+`"rate_limits": null`; the field is only populated in `app-server` mode
+(docs/research.md §A). Codex quota failures therefore still surface as
+plain `turn.failed` errors, with no window, no reset time, and no honest
+basis for calling them transient.
+
 ## Permission posture (v1)
 
 In v1, **no provider's own mutating tools are enabled.** Every adapter
@@ -118,7 +169,8 @@ happened to be convenient:
   version. Denying Claude's mutating tools outright via
   `--disallowedTools`, and only allowlisting read tools plus
   `mcp__commonspace`, sidesteps the missing bridge entirely rather than
-  working around it.
+  working around it. What the CLI *reads* is bounded separately — see
+  "Configuration comes from Commonspace, not from the workspace" below.
 - **Codex CLI:** `codex exec` — the headless mode Commonspace uses —
   never prompts for approval at all, at any sandbox level. There is no
   interactive hook to bridge even if Commonspace wanted one; the sandbox
@@ -175,14 +227,15 @@ against the installed CLI at least once by the person making the change.
 claude -p --input-format stream-json --output-format stream-json
   --verbose --include-partial-messages
   --permission-mode dontAsk
+  --setting-sources user
   --allowedTools "Read,Glob,Grep,LS,TodoWrite,Task,mcp__commonspace"
   --disallowedTools "Bash,PowerShell,Edit,Write,NotebookEdit,WebFetch,WebSearch,KillShell"
   [--add-dir <root>]...      # every workspace root except cwd
   [--model <model>]          # omitted for "default"
   [--resume <id>]            # when continuing a session
-  [--mcp-config '{"mcpServers":{"commonspace":{"type":"http","url":...,
-                   "headers":{"Authorization":"Bearer <token>"}}}}'
-   --strict-mcp-config]
+  --settings <session file>
+  [--mcp-config <the same session file> --strict-mcp-config]
+                             # only when an MCP endpoint is configured
 ```
 
 `--permission-mode dontAsk` makes any tool use outside the allow list fail
@@ -191,6 +244,29 @@ prompt itself is never passed on the command line — it goes over stdin as
 a `stream-json` user message, both because Windows has command-line
 length limits and because prompts are user data that shouldn't appear in
 a process listing.
+
+The *session file* is one temporary JSON file per run, written to the
+system temp directory, tightened to owner-only where the OS supports it,
+and removed when the session ends (or immediately, if the spawn fails):
+
+```jsonc
+{
+  "disableAllHooks": true,
+  "permissions": { "deny": ["Read(~/.ssh)", "Read(~/.ssh/**)",
+                            "Read(//**/.ssh)", "Read(//**/.ssh/**)", …] },
+  // present only when Commonspace has an MCP endpoint for this session
+  "mcpServers": { "commonspace": { "type": "http", "url": "…",
+                    "headers": { "Authorization": "Bearer <token>" } } }
+}
+```
+
+The Claude bearer token is **not** on argv. Claude Code reads the keys it
+recognizes from whichever flag points at a file, so the same path serves
+both `--settings` and `--mcp-config`: one file to restrict, one file to
+delete. Verified against v2.1.224 — the MCP server registers from the
+combined file and the deny rules apply in the same run. Passing the JSON
+inline on `--mcp-config` would put the session token in the process list
+and would not survive Windows `.cmd` argument quoting.
 
 **Codex CLI** (`crates/commonspace-agents/src/codex.rs`):
 
@@ -210,6 +286,79 @@ The MCP bearer token travels through an environment variable
 (`COMMONSPACE_MCP_TOKEN`), not argv — argv is visible to other processes
 on the same machine via the process list; environment variables passed
 this way are not.
+
+## Configuration comes from Commonspace, not from the workspace
+
+A workspace folder is untrusted content. It can arrive from Dropbox, from
+a colleague, from a zip — nobody vets it, and the whole point of the app
+is that a user can point it at a folder they were sent.
+
+Claude Code loads `.claude/settings.json` from its working directory, and
+that file can define **hooks**, which are shell commands. Anthropic's own
+documentation states trust verification is disabled under `-p`. Since
+Commonspace spawns `claude -p` with the workspace root as cwd, a folder
+could therefore run arbitrary commands — outside the policy engine,
+outside the approval UI, before the agent does anything at all.
+
+**This was verified, not assumed.** Against `claude` v2.1.224 on Linux, a
+temp workspace containing a `.claude/settings.json` with `SessionStart`
+and `PreToolUse` hooks, run under the adapter's exact argv as it stood
+before this was fixed: both hooks fired and wrote their canary file.
+
+Two flags close it, and either one is sufficient on its own — both were
+confirmed independently:
+
+- `--setting-sources user` restricts discovery to the CLI's own
+  `~/.claude/settings.json`, dropping the `project`
+  (`<cwd>/.claude/settings.json`) and `local` tiers that are read out of
+  the workspace. The `user` tier stays because the person at the keyboard
+  owns it and a folder someone sent them cannot reach it; taking it away
+  would silently override choices they made in Anthropic's own tool.
+- `disableAllHooks: true` in the session file turns hooks off outright,
+  covering any route to a hook that the source restriction does not.
+
+### Mirroring the protected locations
+
+`commonspace-permissions`'s `protected.rs` hard-denies `~/.ssh`, `~/.aws`,
+`~/.claude` and the rest of the credential stores — but only for calls
+that reach the policy engine, which means only Commonspace's own MCP
+tools. Claude Code's `Read` goes straight to disk. Without a mirror, "read
+my SSH key and summarise it" is bounded by nothing but the CLI's
+working-directory rules, which `--add-dir` widens.
+
+So the same list is rendered into the session file's deny rules.
+`protected.rs` exports it as `credential_store_paths()` — home-relative
+paths, no pattern syntax — and `claude.rs` renders it, because
+provider-specific syntax never leaks into the permissions crate. Each
+store yields four rules: `~/<path>` and `~/<path>/**` for the user's real
+store, `//**/<path>` and `//**/<path>/**` for a copy that turns up inside
+a workspace. A bare form and a `/**` form because `.netrc` is a file and
+`.ssh` is a directory; `//` because a single leading `/` is read as
+relative to the settings file, not to the filesystem root. Fourteen
+stores, fifty-six rules. All four pattern forms were confirmed to be
+enforced against v2.1.224.
+
+Three limits, stated plainly rather than left to be discovered:
+
+1. **This is enforcement by a cooperating process, not by the kernel.** It
+   holds for exactly as long as Claude Code keeps honouring its own
+   settings file. Commonspace cannot verify that and gets no help from the
+   OS. It is a second lock on a door that is already locked — worth
+   fitting, not worth trusting alone. It belongs in the "partial,
+   inherited" row of THREAT_MODEL.md's sandboxing table, not above it.
+2. **It stops at file contents.** A `Read(...)` rule blocks `Read` and
+   `Grep`; `Glob` still returns the *names* of files inside a denied
+   directory. Observed directly, not inferred.
+3. **Codex has no equivalent, and this is not parity.** `-s read-only`
+   constrains writes, not reads — it does nothing to stop Codex reading
+   `~/.ssh`. `codex exec` has no deny-by-path configuration Commonspace
+   can set. The two adapters are not equally covered here and the UI must
+   not imply they are.
+
+Nothing is added to the deny list beyond what `protected.rs` already
+protects — not `.env`, not anything else. One list, mirrored; two lists
+would drift, and a rule Commonspace's own tools do not honour would be a
+promise only one half of the app keeps.
 
 ## Per-provider status
 

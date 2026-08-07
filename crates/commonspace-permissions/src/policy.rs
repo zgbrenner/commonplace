@@ -123,7 +123,17 @@ impl PolicyEngine {
         }
 
         let class_verdict = match request.class {
-            OperationClass::Read | OperationClass::Create => PolicyVerdict::Allow,
+            OperationClass::Read => PolicyVerdict::Allow,
+            // Creating a file destroys nothing and undo removes it, so this
+            // is the mildest write there is — but it was allowed outright,
+            // which meant it never reached the broker and so was never
+            // covered by an approved plan's envelope. That inverted the
+            // incentive: a plan that declared no writes ran with *more*
+            // freedom to write than one that declared them honestly. Asking
+            // costs an approved plan nothing (its envelope answers straight
+            // away) and costs an undeclared write one question, which is the
+            // question the user was never given the chance to answer.
+            OperationClass::Create => approval("Creating a new file needs your approval."),
             OperationClass::Modify => match self.settings.modify {
                 ModifyPolicy::RequireApproval => {
                     approval("Changing an existing file needs your review.")
@@ -236,13 +246,21 @@ mod tests {
         assert_eq!(v, PolicyVerdict::Allow);
     }
 
+    /// A path that does not exist yet still resolves and stays in scope, so
+    /// the verdict is the ordinary one for creating a file rather than an
+    /// out-of-scope refusal. What the user is then asked is answered
+    /// immediately by an approved plan's envelope; the question only reaches
+    /// them for a file no plan mentioned.
     #[test]
-    fn create_in_scope_allowed_even_if_missing() {
+    fn create_in_scope_asks_rather_than_failing_as_out_of_scope() {
         let dir = tempfile::tempdir().unwrap();
         let v = engine_for(dir.path())
             .evaluate(&req(Create, vec![dir.path().join("new/report.md")]))
             .unwrap();
-        assert_eq!(v, PolicyVerdict::Allow);
+        assert!(
+            matches!(v, PolicyVerdict::RequireApproval { .. }),
+            "expected an approval, got {v:?}"
+        );
     }
 
     #[test]

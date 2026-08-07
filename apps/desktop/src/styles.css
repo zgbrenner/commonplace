@@ -138,6 +138,24 @@ body {
   }
 }
 
+/*
+ * Windows High Contrast, and any other forced-colours mode.
+ *
+ * The OS replaces our backgrounds with its own palette, which the design
+ * survives: every status pill carries a glyph and a word, so losing its tone
+ * loses decoration, not meaning. What does get lost is the edge — a card and
+ * a pill both become the same flat surface as the page. These two borders
+ * give them their shape back, in the system's own text colour so it stays
+ * legible in whichever scheme the user chose. Answering the OS setting, not
+ * building a second theme.
+ */
+@media (forced-colors: active) {
+  .card,
+  .status-pill {
+    border: 1px solid CanvasText;
+  }
+}
+
 /* Screen-reader-only text for labels that would be visual noise. */
 .sr-only {
   position: absolute;

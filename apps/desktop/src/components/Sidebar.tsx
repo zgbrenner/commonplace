@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { Conversation, Workspace } from "@commonspace/protocol";
 import * as ipc from "../lib/ipc";
+import { formatListTimestamp } from "../lib/format";
 import { createLatestGuard } from "../lib/search";
 import { Button } from "./primitives";
 
@@ -64,6 +65,7 @@ export function Sidebar({
   }, [query]);
 
   const searching = query.trim().length > 0;
+  const now = new Date();
 
   return (
     <nav
@@ -120,6 +122,9 @@ export function Sidebar({
                   <ConversationRow
                     key={conversation.id}
                     conversation={conversation}
+                    // Read once per render rather than per row, so every row
+                    // in a list decides "today" against the same moment.
+                    now={now}
                     active={view === "task" && conversation.id === activeConversationId}
                     onOpen={() => onOpenConversation(conversation.id)}
                     onRename={(title) => onRenameConversation(conversation.id, title)}
@@ -202,11 +207,13 @@ function SearchResults({
 /** One recent conversation: open on click, rename via the pencil. */
 function ConversationRow({
   conversation,
+  now,
   active,
   onOpen,
   onRename,
 }: {
   conversation: Conversation;
+  now: Date;
   active: boolean;
   onOpen: () => void;
   onRename: (title: string) => Promise<void>;
@@ -262,19 +269,30 @@ function ConversationRow({
     );
   }
 
+  // Written in the reader's own conventions: 07/08 is not the same day
+  // everywhere, and this list is how someone finds work again by when it
+  // happened.
+  const when = formatListTimestamp(conversation.updated_at, now);
+
   return (
     <li className="group flex items-center gap-0.5">
       <button
         type="button"
         onClick={onOpen}
         aria-current={active ? "page" : undefined}
-        className={`min-w-0 flex-1 truncate rounded-md px-2 py-1.5 text-left text-sm transition-colors ${
+        className={`min-w-0 flex-1 rounded-md px-2 py-1.5 text-left text-sm transition-colors ${
           active
             ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
             : "text-[var(--color-ink-muted)] hover:bg-[var(--color-surface-raised)] hover:text-[var(--color-ink)]"
         }`}
       >
-        {conversation.title || "Untitled task"}
+        <span className="block truncate">{conversation.title || "Untitled task"}</span>
+        {when ? (
+          <span className="block truncate text-xs text-[var(--color-ink-faint)]">
+            <span className="sr-only">Last worked on </span>
+            {when}
+          </span>
+        ) : null}
       </button>
       <button
         type="button"

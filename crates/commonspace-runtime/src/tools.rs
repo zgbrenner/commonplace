@@ -22,7 +22,7 @@ use commonspace_core::{
     AgentEvent, Artifact, ArtifactId, ArtifactKind, OperationClass, PolicyVerdict, RiskLevel,
     TaskId, ToolCallId, ToolStatus,
 };
-use commonspace_documents::{inspect, office, textio, FileOperation, SafeFs};
+use commonspace_documents::{inspect, office, sheets, textio, FileOperation, SafeFs};
 use commonspace_permissions::{PolicyEngine, PolicyRequest};
 use serde_json::{json, Value};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -35,6 +35,17 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// Maximum bytes returned by `read_file` in one call.
 const MAX_READ_BYTES: usize = 400_000;
+
+/// Spreadsheet formats the reader accepts. One list, quoted by both the
+/// router and the "unsupported format" messages, so what an agent is told is
+/// supported can never drift from what actually is.
+const SPREADSHEET_EXTENSIONS: [&str; 7] = ["xlsx", "xlsm", "xls", "xlsb", "ods", "csv", "tsv"];
+
+/// Ceilings on what a `read_spreadsheet` caller may raise its limits to.
+/// See `read_workbook` for why the overrides are clamped rather than obeyed.
+const MAX_SHEETS_CEILING: usize = 64;
+const MAX_ROWS_CEILING: usize = 50_000;
+const MAX_COLS_CEILING: usize = 1_024;
 
 /// Everything a running task's tools need.
 pub struct ToolContext {
@@ -247,11 +258,132 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "read_document",
-            "description": "Extract the text of a PDF or Word document, including its paragraphs.",
+            "description": format!(
+                "Extract the contents of a document: the text and paragraphs of a PDF or Word file, \
+                 or the sheets, headers and typed cell values of a spreadsheet. \
+                 Handles .pdf, .docx, {}.",
+                english_list(&SPREADSHEET_EXTENSIONS)
+            ),
             "inputSchema": {
                 "type": "object",
-                "properties": { "path": path_prop("Absolute path of the .pdf or .docx file.") },
+                "properties": { "path": path_prop("Absolute path of the document to read.") },
                 "required": ["path"]
+            }
+        }),
+        json!({
+            "name": "read_spreadsheet",
+            "description": format!(
+                "Read a spreadsheet as structured data: every sheet, its header row, and its cells \
+                 with their types intact, so numbers stay numbers and a formula reports both its \
+                 text and its cached result. Handles {}. Use this when the question is about \
+                 figures, columns or rows rather than prose.",
+                english_list(&SPREADSHEET_EXTENSIONS)
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": path_prop("Absolute path of the spreadsheet to read."),
+                    "max_sheets": {
+                        "type": "integer",
+                        "description": "Most sheets to read. Omit for Commonspace's default."
+                    },
+                    "max_rows_per_sheet": {
+                        "type": "integer",
+                        "description": "Most data rows to read from each sheet. Omit for Commonspace's default; raise it only when a sheet came back truncated and you need the rest."
+                    },
+                    "max_cols": {
+                        "type": "integer",
+                        "description": "Most columns to read from each sheet. Omit for Commonspace's default."
+                    }
+                },
+                "required": ["path"]
+            }
+        }),
+        json!({
+            "name": "create_spreadsheet",
+            "description": "Create a spreadsheet (.xlsx) by describing its sheets, columns and rows. \
+                            Send every figure as a number cell — {\"kind\": \"number\", \"value\": 1240} — and never as \
+                            text: the person receiving this file needs to sort, total and chart these values, and a \
+                            number stored as text does none of those. Use a column 'format' to control how a number \
+                            looks (currency, percent, decimal places); formatting is display only and leaves the \
+                            underlying value computable. Commonspace builds and validates the file; never write \
+                            spreadsheet bytes yourself.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": path_prop("Absolute path of the .xlsx file to create."),
+                    "sheets": {
+                        "type": "array",
+                        "description": "One entry per sheet, in tab order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "description": "Name shown on the sheet's tab." },
+                                "columns": {
+                                    "type": "array",
+                                    "description": "Columns left to right. Every row's cells line up with this list.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "header": { "type": "string", "description": "Header text for this column." },
+                                            "format": {
+                                                "type": "object",
+                                                "description": "How this column is displayed. Exactly one of {\"kind\": \"text\"}, {\"kind\": \"number\", \"decimals\": 0}, {\"kind\": \"currency\", \"symbol\": \"$\", \"decimals\": 2}, {\"kind\": \"percent\", \"decimals\": 1}, {\"kind\": \"date\"}. Defaults to text.",
+                                                "properties": {
+                                                    "kind": {
+                                                        "type": "string",
+                                                        "enum": ["text", "number", "currency", "percent", "date"]
+                                                    },
+                                                    "decimals": {
+                                                        "type": "integer",
+                                                        "description": "Decimal places, for number, currency and percent."
+                                                    },
+                                                    "symbol": {
+                                                        "type": "string",
+                                                        "description": "Currency symbol written as given, e.g. \"$\", \"€\", \"£\". Only for currency."
+                                                    }
+                                                },
+                                                "required": ["kind"]
+                                            },
+                                            "width": {
+                                                "type": "number",
+                                                "description": "Width in characters. Omit to fit the content, which is almost always right."
+                                            }
+                                        },
+                                        "required": ["header"]
+                                    }
+                                },
+                                "rows": {
+                                    "type": "array",
+                                    "description": "Data rows only — the header row comes from 'columns', so do not repeat it here. Each row is an array of cells in the same order as 'columns'. A short row leaves the rest of the line blank; a row with more cells than there are columns is refused rather than silently trimmed.",
+                                    "items": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "description": "One cell, tagged by 'kind': {\"kind\": \"text\", \"value\": \"Acme Ltd\"}, {\"kind\": \"number\", \"value\": 1240.5}, {\"kind\": \"bool\", \"value\": true}, {\"kind\": \"date\", \"value\": \"2026-08-07\"} (ISO-8601, optionally \"2026-08-07T14:30:00\"), {\"kind\": \"formula\", \"formula\": \"=SUM(B2:B40)\", \"value\": \"1240\"}, or {\"kind\": \"empty\"} for a blank cell.",
+                                            "properties": {
+                                                "kind": {
+                                                    "type": "string",
+                                                    "enum": ["empty", "text", "number", "bool", "date", "formula"]
+                                                },
+                                                "value": {
+                                                    "description": "The cell's value: a string for text and date, a JSON number for number, a boolean for bool, the formula's expected result as a string for formula. Omitted for empty."
+                                                },
+                                                "formula": {
+                                                    "type": "string",
+                                                    "description": "The formula including its leading '='. Only for kind 'formula'."
+                                                }
+                                            },
+                                            "required": ["kind"]
+                                        }
+                                    }
+                                }
+                            },
+                            "required": ["name", "columns", "rows"]
+                        }
+                    }
+                },
+                "required": ["path", "sheets"]
             }
         }),
         json!({
@@ -357,6 +489,80 @@ fn arg_str(args: &Value, key: &str) -> Result<String, ToolFailure> {
         .ok_or_else(|| ToolFailure::Protocol(RpcError::invalid_params(format!("missing {key}"))))
 }
 
+/// An optional whole-number argument. Absent and `null` both mean "use the
+/// default"; anything that is not a non-negative integer is rejected rather
+/// than coerced, so a nonsense limit never silently becomes a real one.
+fn arg_usize_opt(args: &Value, key: &str) -> Result<Option<usize>, ToolFailure> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(|n| Some(n as usize)).ok_or_else(|| {
+            ToolFailure::Protocol(RpcError::invalid_params(format!(
+                "{key} must be a whole number of zero or more"
+            )))
+        }),
+    }
+}
+
+/// A structured argument deserialized into its own type. A payload that does
+/// not fit the shape is a protocol error here, so malformed input never
+/// reaches the code that writes a file.
+fn arg_typed<T: serde::de::DeserializeOwned>(args: &Value, key: &str) -> Result<T, ToolFailure> {
+    let raw = args
+        .get(key)
+        .ok_or_else(|| ToolFailure::Protocol(RpcError::invalid_params(format!("missing {key}"))))?;
+    serde_json::from_value(raw.clone()).map_err(|error| {
+        ToolFailure::Protocol(RpcError::invalid_params(format!(
+            "{key} is not in the expected shape: {error}"
+        )))
+    })
+}
+
+fn extension_of(path: &std::path::Path) -> String {
+    path.extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+/// Render a list of extensions the way a sentence would: `.a, .b and .c`.
+fn english_list(extensions: &[&str]) -> String {
+    let dotted: Vec<String> = extensions.iter().map(|e| format!(".{e}")).collect();
+    match dotted.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Read a spreadsheet into a workbook, honouring the caller's optional limit
+/// overrides.
+fn read_workbook(path: &std::path::Path, args: &Value) -> Result<sheets::Workbook, ToolFailure> {
+    let extension = extension_of(path);
+    if !SPREADSHEET_EXTENSIONS.contains(&extension.as_str()) {
+        return Err(ToolFailure::Failed(format!(
+            "Commonspace can't read .{extension} spreadsheets yet. Supported here: {}.",
+            english_list(&SPREADSHEET_EXTENSIONS)
+        )));
+    }
+    // The overrides let an agent ask for more of a sheet it saw truncated,
+    // but they are clamped rather than trusted. The defaults exist so a
+    // workbook cannot swamp the agent's own context, and an unbounded
+    // override would defeat that — a request for ten million rows would
+    // build the whole thing in memory and then serialize it. The ceilings
+    // are generous enough that no honest request meets them, and a clamped
+    // read still reports `truncated`, so the answer stays true.
+    let mut limits = sheets::ReadLimits::default();
+    if let Some(value) = arg_usize_opt(args, "max_sheets")? {
+        limits.max_sheets = value.min(MAX_SHEETS_CEILING);
+    }
+    if let Some(value) = arg_usize_opt(args, "max_rows_per_sheet")? {
+        limits.max_rows_per_sheet = value.min(MAX_ROWS_CEILING);
+    }
+    if let Some(value) = arg_usize_opt(args, "max_cols")? {
+        limits.max_cols = value.min(MAX_COLS_CEILING);
+    }
+    sheets::read_spreadsheet(path, limits).map_err(|e| ToolFailure::Failed(e.to_string()))
+}
+
 async fn dispatch(
     context: &ToolContext,
     name: &str,
@@ -443,22 +649,92 @@ async fn dispatch(
                 &format!("Reading {}", display_name(&path)),
                 None,
             );
-            let extension = path
-                .extension()
-                .map(|e| e.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
+            let extension = extension_of(&path);
+            // Nobody asking Commonspace to "read this file" should have to
+            // know which tool owns which format, so spreadsheets are answered
+            // here too. They come back as the workbook JSON rather than a text
+            // rendering: flattening a sheet to text throws away the sheet
+            // boundaries, the header row, and — worst — the difference between
+            // the number 1240 and the string "1240", which is precisely what a
+            // caller reading a spreadsheet is after. The response stays
+            // coherent because every arm returns the pretty JSON of whatever
+            // structured extraction that format supports. The limit overrides
+            // are honoured here as well, so an agent that lands on the general
+            // tool is not stuck with a truncated sheet it cannot widen.
+            if SPREADSHEET_EXTENSIONS.contains(&extension.as_str()) {
+                let workbook = read_workbook(&path, args)?;
+                return serde_json::to_string_pretty(&workbook)
+                    .map_err(|e| ToolFailure::Failed(e.to_string()));
+            }
             let extracted = match extension.as_str() {
                 "pdf" => office::read_pdf(&path, MAX_READ_BYTES),
                 "docx" => office::read_docx(&path, MAX_READ_BYTES),
                 other => {
                     return Err(ToolFailure::Failed(format!(
                         "Commonspace can't read .{other} documents yet. \
-                         Supported here: .pdf and .docx."
+                         Supported here: .pdf, .docx and spreadsheets ({}).",
+                        english_list(&SPREADSHEET_EXTENSIONS)
                     )))
                 }
             }
             .map_err(|e| ToolFailure::Failed(e.to_string()))?;
             serde_json::to_string_pretty(&extracted).map_err(|e| ToolFailure::Failed(e.to_string()))
+        }
+        "read_spreadsheet" => {
+            let path = arg_path(args, "path")?;
+            gate(
+                context,
+                OperationClass::Read,
+                std::slice::from_ref(&path),
+                None,
+                &format!("Read {}", display_name(&path)),
+            )
+            .await?;
+            started(
+                context,
+                call_id,
+                &format!("Reading {}", display_name(&path)),
+                None,
+            );
+            let workbook = read_workbook(&path, args)?;
+            serde_json::to_string_pretty(&workbook).map_err(|e| ToolFailure::Failed(e.to_string()))
+        }
+        "create_spreadsheet" => {
+            let path = arg_path(args, "path")?;
+            let new_sheets: Vec<sheets::NewSheet> = arg_typed(args, "sheets")?;
+            gate(
+                context,
+                OperationClass::Create,
+                std::slice::from_ref(&path),
+                None,
+                &format!("Create {}", display_name(&path)),
+            )
+            .await?;
+            started(
+                context,
+                call_id,
+                &format!("Writing {}", display_name(&path)),
+                None,
+            );
+            if path.exists() {
+                return Err(ToolFailure::Failed(format!(
+                    "{} already exists; ask before replacing it.",
+                    display_name(&path)
+                )));
+            }
+            if new_sheets.is_empty() {
+                return Err(ToolFailure::Failed(
+                    "A spreadsheet needs at least one sheet.".into(),
+                ));
+            }
+            let result = sheets::create_xlsx(&path, &new_sheets)
+                .map_err(|e| ToolFailure::Failed(e.to_string()))?;
+            // Journaled as a create so the artifact card can offer undo.
+            let mut op =
+                FileOperation::new(commonspace_documents::FileOpKind::Create, path.clone());
+            op.hash_after = inspect::hash_file(&path).ok();
+            record(context, &op, &path, false, None);
+            Ok(result.user_summary)
         }
         "create_document" => {
             let path = arg_path(args, "path")?;
@@ -730,6 +1006,7 @@ mod tests {
     struct Harness {
         _tmp: tempfile::TempDir,
         ws: PathBuf,
+        task_id: TaskId,
         url: String,
         token: String,
         events: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
@@ -745,8 +1022,9 @@ mod tests {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (journal_tx, journal_rx) = tokio::sync::mpsc::unbounded_channel();
         let broker = PermissionBroker::new();
+        let task_id = TaskId::generate();
         let context = Arc::new(ToolContext {
-            task_id: TaskId::generate(),
+            task_id: task_id.clone(),
             policy: PolicyEngine::new(PathGuard::new([&ws]), PolicySettings::default()),
             fs: SafeFs::new(
                 PathGuard::new([&ws]),
@@ -760,6 +1038,7 @@ mod tests {
         Harness {
             _tmp: tmp,
             ws,
+            task_id,
             url: handle.url.clone(),
             token: handle.token.clone(),
             events: event_rx,
@@ -767,6 +1046,17 @@ mod tests {
             broker,
             handle: Some(handle),
         }
+    }
+
+    /// A harness for a task whose plan the user approved, covering the
+    /// workspace — which is how these tools actually run: nothing reaches the
+    /// tool server until a plan has been accepted. Tests about *asking* use
+    /// the plain `harness()` instead, so a prompt they expect still happens.
+    async fn approved_harness() -> Harness {
+        let h = harness().await;
+        h.broker
+            .grant_plan_envelope(&h.task_id, vec![h.ws.clone()], std::slice::from_ref(&h.ws));
+        h
     }
 
     async fn rpc(h: &Harness, body: Value, token: Option<&str>) -> (u16, Value) {
@@ -841,7 +1131,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_in_scope_succeeds_and_journals() {
-        let mut h = harness().await;
+        let mut h = approved_harness().await;
         let target = h.ws.join("notes.md");
         let (_, response) = rpc(
             &h,
@@ -1083,6 +1373,246 @@ mod tests {
         )
         .await;
         assert_eq!(read["result"]["content"][0]["text"], "contents");
+        h.handle.expect("handle").shutdown().await;
+    }
+
+    /// The spreadsheet schema is prompt engineering: an agent that gets the
+    /// cell shape wrong produces a file nobody can compute with, so the two
+    /// instructions that prevent it are asserted rather than trusted.
+    #[tokio::test]
+    async fn spreadsheet_tools_are_listed_with_the_rules_that_matter() {
+        let h = harness().await;
+        let (_, list) = rpc(
+            &h,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            None,
+        )
+        .await;
+        let tools = list["result"]["tools"].as_array().expect("tools array");
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"read_spreadsheet"));
+        assert!(names.contains(&"create_spreadsheet"));
+
+        let create = tools
+            .iter()
+            .find(|t| t["name"] == "create_spreadsheet")
+            .expect("create_spreadsheet is advertised");
+        let description = create["description"].as_str().unwrap_or_default();
+        assert!(
+            description.contains("\"kind\": \"number\""),
+            "the number-cell form must be spelled out: {description}"
+        );
+        assert!(
+            description.contains("never write spreadsheet bytes yourself"),
+            "the agent must be told Commonspace builds the file: {description}"
+        );
+        let cell = &create["inputSchema"]["properties"]["sheets"]["items"]["properties"]["rows"]
+            ["items"]["items"];
+        let kinds = cell["properties"]["kind"]["enum"]
+            .as_array()
+            .expect("cell kinds are enumerated");
+        for kind in ["empty", "text", "number", "bool", "date", "formula"] {
+            assert!(kinds.iter().any(|k| k == kind), "missing cell kind {kind}");
+        }
+        h.handle.expect("handle").shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unsupported_spreadsheet_extension_names_what_works() {
+        let h = harness().await;
+        let (_, response) = rpc(
+            &h,
+            call("read_spreadsheet", json!({"path": h.ws.join("notes.txt")})),
+            None,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains(".txt"), "unexpected message: {text}");
+        for extension in SPREADSHEET_EXTENSIONS {
+            assert!(
+                text.contains(&format!(".{extension}")),
+                "the message must name .{extension}: {text}"
+            );
+        }
+        h.handle.expect("handle").shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn read_document_points_at_spreadsheets_for_formats_it_cannot_open() {
+        let h = harness().await;
+        let (_, response) = rpc(
+            &h,
+            call("read_document", json!({"path": h.ws.join("memo.rtf")})),
+            None,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains(".pdf") && text.contains(".docx"), "{text}");
+        assert!(text.contains(".xlsx") && text.contains(".csv"), "{text}");
+        h.handle.expect("handle").shutdown().await;
+    }
+
+    /// A limit that is not a whole number is a malformed request, not a
+    /// silently-ignored one.
+    #[tokio::test]
+    async fn nonsense_read_limits_are_rejected_cleanly() {
+        let h = harness().await;
+        for bad in [json!("lots"), json!(-4), json!(2.5)] {
+            let (_, response) = rpc(
+                &h,
+                call(
+                    "read_spreadsheet",
+                    json!({"path": h.ws.join("book.xlsx"), "max_rows_per_sheet": bad}),
+                ),
+                None,
+            )
+            .await;
+            assert!(response["error"].is_object(), "{bad} -> {response}");
+        }
+        h.handle.expect("handle").shutdown().await;
+    }
+
+    /// A limit far above the ceiling is clamped, not obeyed. The point of
+    /// the defaults is that a workbook cannot swamp the agent's context;
+    /// an override that could ask for ten million rows would undo that.
+    #[test]
+    fn read_limit_overrides_are_clamped_to_their_ceilings() {
+        // `ToolFailure` carries no `Debug` on purpose, so a parse failure is
+        // turned into a panic here rather than unwrapped.
+        let clamped = |args: &Value, key: &str, ceiling: usize| match arg_usize_opt(args, key) {
+            Ok(value) => value.map(|v| v.min(ceiling)),
+            Err(_) => panic!("{key} should have parsed"),
+        };
+
+        let huge = json!({
+            "max_sheets": u64::MAX,
+            "max_rows_per_sheet": 10_000_000u64,
+            "max_cols": 1_000_000u64,
+        });
+        assert_eq!(
+            clamped(&huge, "max_sheets", MAX_SHEETS_CEILING),
+            Some(MAX_SHEETS_CEILING)
+        );
+        assert_eq!(
+            clamped(&huge, "max_rows_per_sheet", MAX_ROWS_CEILING),
+            Some(MAX_ROWS_CEILING)
+        );
+        assert_eq!(
+            clamped(&huge, "max_cols", MAX_COLS_CEILING),
+            Some(MAX_COLS_CEILING)
+        );
+
+        // A modest request passes through untouched, and an absent one
+        // leaves the default in place.
+        let modest = json!({ "max_rows_per_sheet": 5_000 });
+        assert_eq!(
+            clamped(&modest, "max_rows_per_sheet", MAX_ROWS_CEILING),
+            Some(5_000)
+        );
+        assert_eq!(clamped(&modest, "max_sheets", MAX_SHEETS_CEILING), None);
+    }
+
+    #[tokio::test]
+    async fn malformed_sheets_fail_before_anything_is_written() {
+        let mut h = approved_harness().await;
+        let target = h.ws.join("broken.xlsx");
+        for bad in [
+            json!("Sheet1"),
+            json!([{"name": "Q3"}]),
+            json!([{"name": "Q3", "columns": [], "rows": [[{"kind": "quantum"}]]}]),
+        ] {
+            let (_, response) = rpc(
+                &h,
+                call("create_spreadsheet", json!({"path": target, "sheets": bad})),
+                None,
+            )
+            .await;
+            assert!(response["error"].is_object(), "{bad} -> {response}");
+            assert!(!target.exists(), "a malformed request must write nothing");
+        }
+        assert!(h.journal.try_recv().is_err(), "nothing may be journaled");
+        h.handle.expect("handle").shutdown().await;
+    }
+
+    /// The wiring end to end: a written workbook is journaled for undo, and
+    /// both the spreadsheet tool and `read_document` can read it back.
+    #[tokio::test]
+    async fn create_then_read_back_journals_and_routes() {
+        let mut h = approved_harness().await;
+        let target = h.ws.join("revenue.xlsx");
+        let sheets = json!([{
+            "name": "Q3",
+            "columns": [
+                { "header": "Client", "format": { "kind": "text" } },
+                { "header": "Billed", "format": { "kind": "currency", "symbol": "$", "decimals": 2 } }
+            ],
+            "rows": [
+                [{ "kind": "text", "value": "Acme Ltd" }, { "kind": "number", "value": 1240.5 }],
+                [{ "kind": "text", "value": "Brill Co" }, { "kind": "number", "value": 980.0 }]
+            ]
+        }]);
+        let (_, created) = rpc(
+            &h,
+            call(
+                "create_spreadsheet",
+                json!({"path": target, "sheets": sheets}),
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(created["result"]["isError"], false, "{created}");
+        assert!(target.exists());
+
+        let op = h.journal.recv().await.expect("journal entry");
+        assert_eq!(op.kind, commonspace_documents::FileOpKind::Create);
+        assert!(op.hash_after.is_some(), "undo needs the resulting hash");
+        let mut saw_artifact = false;
+        while let Ok(event) = h.events.try_recv() {
+            if matches!(event, AgentEvent::ArtifactCreated { .. }) {
+                saw_artifact = true;
+            }
+        }
+        assert!(saw_artifact, "expected an artifact.created event");
+
+        // Refusing to clobber uses the same wording as create_document.
+        let (_, again) = rpc(
+            &h,
+            call(
+                "create_spreadsheet",
+                json!({"path": target, "sheets": sheets}),
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(again["result"]["isError"], true, "{again}");
+        assert!(again["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already exists; ask before replacing it"));
+
+        for tool in ["read_spreadsheet", "read_document"] {
+            let (_, read) = rpc(&h, call(tool, json!({"path": target})), None).await;
+            assert_eq!(read["result"]["isError"], false, "{tool}: {read}");
+            let text = read["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default();
+            let workbook: sheets::Workbook =
+                serde_json::from_str(text).expect("a workbook comes back as JSON");
+            let sheet = workbook.sheets.first().expect("one sheet");
+            assert_eq!(sheet.name, "Q3");
+            assert_eq!(sheet.headers, vec!["Client", "Billed"]);
+            // The point of a spreadsheet: the amount survives as a number.
+            assert_eq!(
+                sheet.rows[0][1],
+                sheets::CellValue::Number { value: 1240.5 }
+            );
+        }
         h.handle.expect("handle").shutdown().await;
     }
 

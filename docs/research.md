@@ -263,6 +263,12 @@ table):
   available, filesystem-only in practice.
 - `bubblewrap` is stronger than landlock but is not guaranteed to be
   installed on an arbitrary Linux desktop.
+- `birdcage` — the embeddable sandbox crate most people suggest first — is a
+  non-starter here on two counts. It is **GPL-3.0-or-later**, which cannot
+  be linked into an MIT binary Commonspace ships, and its repository was
+  **archived in July 2026**, so it is unmaintained. It also covers Linux and
+  macOS only, with no Windows support, which is the platform that matters
+  most for this project.
 
 The resulting v1 decision: Commonspace does not claim to sandbox the
 provider CLI beyond what the CLI does for itself. It enforces a Rust-side
@@ -291,8 +297,16 @@ contract section.
 
 ## D. Document tooling libraries and licensing
 
-**DOCX.** `docx-rust` (MIT, a fork of the stalled PoiScript `docx-rs`)
-and `ooxmlsdk` (MIT OR Apache-2.0, young/pre-1.0, but the only library
+**DOCX.** `docx-rs` 0.4.22 (MIT) — bokuweb's crate,
+`github.com/bokuweb/docx-rs` — is what
+`crates/commonspace-documents/Cargo.toml` actually depends on. Two
+similarly named, unrelated projects exist and the confusion is easy to
+repeat in either direction: the crates.io name `docx-rs` belongs to
+bokuweb, while `docx-rust` is a fork of PoiScript's separate, stalled crate
+that was *also* called `docx-rs`. Both are MIT, so nothing about linking
+changes; what changes is which upstream and which issue tracker apply, so
+the distinction is worth keeping straight. Also surveyed:
+`ooxmlsdk` (MIT OR Apache-2.0, young/pre-1.0, but the only library
 found that explicitly claims and tests preservation of unknown/extension
 XML; covers DOCX, XLSX, and PPTX). Typed round-trip libraries re-serialize
 a fresh XML tree and so risk silently dropping unmodeled content;
@@ -364,6 +378,27 @@ dependency tree.
 | May be linked | MIT, Apache-2.0, BSD, MPL-2.0 (file-level) | Preferred; matches CONTRIBUTING.md's licensing policy |
 | Architecture reference only, never copied | opcode, OpenLoaf, Claude Code UI/CloudCLI (all AGPL-3.0); `mupdf-rs` (AGPL-3.0) | Study the pattern, write Commonspace's own implementation from scratch |
 | Optional detected subprocess only, never bundled or linked | LibreOffice (MPL-2.0), pandoc (GPL-2.0+) | Invoked as an external process the user already has installed; never shipped inside Commonspace's installer |
+
+**What `cargo-deny` cannot see.** The license gate in `deny.toml` reads
+Cargo metadata, and Cargo metadata describes Rust crates. Two blind spots
+follow from that, and both only bite at release time:
+
+- **A `-sys` crate's declared license describes the binding, not the
+  vendored C.** `git2` and `libgit2-sys` both declare `MIT OR Apache-2.0`,
+  so `cargo-deny` would pass them without comment — while `libgit2-sys`
+  vendors libgit2 itself and statically links it. libgit2 is GPL-2.0 *with
+  a linking exception*, which is what makes the combination distributable,
+  but nothing in the Cargo metadata says either half of that. Neither crate
+  is in Commonspace's tree today; the lesson is general. Any `-sys` crate
+  needs its bundled upstream's actual license read by a human before it
+  enters the dependency graph.
+- **Bundled non-Rust assets are invisible for the same reason.** Model
+  weights, fonts, dictionaries, and prebuilt native libraries are files in
+  a package, not nodes in a Cargo graph, and carry whatever terms their own
+  upstream sets. Two roadmap items make this concrete: OCR model weights,
+  and the PDFium binaries that `pdfium-render` binds. Their licenses have to
+  be recorded here by hand, because `cargo deny check licenses` stays green
+  either way.
 
 Two provider-compliance rules stand apart from open-source licensing but
 carry the same weight for Commonspace:

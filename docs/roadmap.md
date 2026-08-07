@@ -101,19 +101,55 @@ it:
 
 Reusable skills and workflows are explicitly out of scope for the MVP
 (status.md, "Not started"; ARCHITECTURE.md's deferral list); this is the
-design for what comes after. A workflow is a readable, versionable
-Markdown/YAML package, not a binary plugin, containing:
+design for what comes after.
 
-- A description and worked examples.
-- Input variables.
-- Required folders and tools.
-- Provider requirements (which agents/models it needs).
-- A permission envelope — what it's allowed to touch, declared up front.
-- Expected outputs.
-- Validation rules for its own results.
+The container format is decided: the [Agent Skills
+specification](https://agentskills.io/specification), rather than a bespoke
+Markdown/YAML package of our own. A workflow is a directory whose `SKILL.md`
+carries YAML frontmatter — `name` and `description`, plus the optional
+`license`, `compatibility`, `metadata` and `allowed-tools` — followed by
+Markdown instructions, alongside `references/` and `assets/`
+subdirectories. Loading is progressive: name and description at startup, the
+body once the workflow is chosen, referenced files only when a step needs
+them.
+
+Two consequences matter more than the file format itself:
+
+1. **A Commonspace workflow is also a working Claude Code skill.** For a
+   product whose premise is "use the CLI you already pay for", a workflow
+   that also runs in the CLI the user already has is worth more than a
+   better-designed private format.
+2. **`allowed-tools` is documented but not enforced.** The spec marks the
+   field experimental and says support varies between implementations, and
+   it has been reported repeatedly against Claude Code that tools stay
+   accessible regardless (anthropics/claude-code issues
+   [37683](https://github.com/anthropics/claude-code/issues/37683),
+   [27099](https://github.com/anthropics/claude-code/issues/27099) and
+   [14956](https://github.com/anthropics/claude-code/issues/14956)). So it
+   is a *declaration* — something the UI shows the user before they run a
+   workflow — and never an enforcement point. The permission envelope is
+   enforced by Commonspace's own policy engine, the same one that gates
+   every other operation, never by that field. This is the ecosystem
+   rediscovering the principle this project already holds: a manifest that
+   declares what something may do is documentation, not a control.
+
+Commonspace's own additions ride inside `metadata` rather than as new
+top-level frontmatter keys, so a workflow stays a valid skill:
+
+- A permission envelope — what it's allowed to touch, declared up front and
+  enforced by `commonspace-permissions`.
 - Deterministic pre- and post-processing steps around the model call.
 - Test fixtures, so a workflow can be verified the same way the app is.
+- Validation rules for its own results, and expected outputs.
+- Input variables, required folders, and provider requirements (which
+  agents/models it needs).
 - Version and author metadata.
+
+Descriptions and worked examples go in the `SKILL.md` body and
+`references/`. The spec's optional `scripts/` directory is deliberately
+**not** supported in v1: it is the one part of the format that introduces
+arbitrary code execution, and a package that can only describe work — never
+carry an executable — keeps that surface at zero.
 
 Candidate first workflows, chosen for being common and boring rather than
 impressive: compare two contracts, PDFs into a spreadsheet, rename a folder
@@ -149,14 +185,16 @@ cost and complexity of an embedding pipeline.
 `commonspace-documents` already does Markdown/text editing and DOCX/PDF work
 for the MVP (ARCHITECTURE.md, "Document tooling";
 [docs/document-tools.md](document-tools.md)); status.md lists
-formatting-preserving DOCX edits, XLSX, PPTX, OCR, and format conversion as
-not started. The order below is deliberate — it serves knowledge workers
-before it serves integrations, and it comes before adding new providers,
-local-model configuration, browser automation, arbitrary MCP servers,
-vector RAG, or multi-agent controls:
+formatting-preserving DOCX edits, PPTX, OCR, and format conversion as not
+started, and spreadsheet reading and creation as built and tested but not
+yet exercised by a human. The order below is deliberate — it serves
+knowledge workers before it serves integrations, and it comes before
+adding new providers, local-model configuration, browser automation,
+arbitrary MCP servers, vector RAG, or multi-agent controls:
 
 1. XLSX reading and polished spreadsheet creation, including formulas and
-   validation.
+   validation (in progress — see status.md for what is built and what is
+   still unverified).
 2. OCR for scans and image-only PDFs, with confidence scores and
    page-level provenance — not a black-box transcription.
 3. DOCX edits that preserve existing formatting instead of regenerating

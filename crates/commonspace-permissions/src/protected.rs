@@ -6,6 +6,42 @@
 use crate::path_guard::path_starts_with;
 use std::path::{Path, PathBuf};
 
+/// Credential stores under the user profile, as home-relative paths with `/`
+/// separators (accepted on Windows too, so one list serves every platform).
+///
+/// Two groups, one list: the user's own secrets (THREAT_MODEL.md §5), then
+/// the credential homes of the provider CLIs Commonspace launches — an agent
+/// must never be able to read the credentials of the tool running it.
+const CREDENTIAL_STORES: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".docker",
+    ".netrc",
+    ".config/gcloud",
+    ".config/gh",
+    ".password-store",
+    ".claude",
+    ".codex",
+    ".gemini",
+    ".config/opencode",
+];
+
+/// The credential stores denied here, as home-relative paths.
+///
+/// Exposed so a provider adapter can mirror the same set into the CLI it
+/// launches — a provider's own file-reading tools never reach this engine, so
+/// without a mirror they are bounded only by that CLI's working-directory
+/// rules. Sharing one list keeps the two from drifting apart.
+///
+/// Paths only. Whatever pattern syntax a given CLI wants is that adapter's
+/// business and stays in `commonspace-agents` (docs/provider-adapters.md).
+pub fn credential_store_paths() -> &'static [&'static str] {
+    CREDENTIAL_STORES
+}
+
 /// True when the resolved path lies inside a protected location.
 pub fn is_protected_location(resolved: &Path) -> bool {
     // The per-user temporary directory is scratch space the user owns, not a
@@ -80,23 +116,7 @@ fn protected_roots() -> Vec<PathBuf> {
 
     // -- credential stores under the user profile --
     if let Some(home) = dirs::home_dir() {
-        for rel in [
-            ".ssh",
-            ".gnupg",
-            ".aws",
-            ".azure",
-            ".kube",
-            ".docker",
-            ".netrc",
-            ".config/gcloud",
-            ".config/gh",
-            ".password-store",
-        ] {
-            roots.push(home.join(rel));
-        }
-        // Provider CLI credential homes: Commonspace must never read the
-        // credentials of the CLIs it launches.
-        for rel in [".claude", ".codex", ".gemini", ".config/opencode"] {
+        for rel in CREDENTIAL_STORES {
             roots.push(home.join(rel));
         }
         #[cfg(windows)]
@@ -142,6 +162,22 @@ mod tests {
         assert!(is_protected_location(
             &home.join(".claude").join("session.json")
         ));
+    }
+
+    /// The exported list is what provider adapters mirror into the CLIs they
+    /// launch. If an entry ever stopped being denied here, that mirror would
+    /// go on advertising a protection this engine no longer applies.
+    #[test]
+    fn every_exported_credential_store_is_denied() {
+        let home = dirs::home_dir().expect("home dir");
+        for rel in credential_store_paths() {
+            let inside = home.join(rel).join("secret");
+            assert!(
+                is_protected_location(&inside),
+                "{} is exported but not denied",
+                inside.display()
+            );
+        }
     }
 
     #[test]

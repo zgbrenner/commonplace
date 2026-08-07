@@ -1,10 +1,16 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Artifact, OperationResult } from "@commonspace/protocol";
+import type { TaskUsage } from "../lib/activity";
+import { formatCount, formatDuration } from "../lib/format";
 import { summarizeUndo, type TaskOutcome as TaskOutcomeModel } from "../lib/replay";
-import { Button, Card, ErrorNotice, StatusPill } from "./primitives";
+import { Button, Card, Disclosure, ErrorNotice, StatusPill } from "./primitives";
 
 interface TaskOutcomeProps {
   outcome: TaskOutcomeModel;
+  /** How long the task ran, when it ran on screen rather than in history. */
+  elapsedMs?: number | undefined;
+  /** Token counts the provider reported, when it reported any. */
+  usage?: TaskUsage | undefined;
   onOpen: (artifact: Artifact) => void;
   onReveal: (artifact: Artifact) => void;
   onUndoArtifact: (artifact: Artifact) => Promise<OperationResult>;
@@ -20,6 +26,8 @@ interface TaskOutcomeProps {
  */
 export function TaskOutcome({
   outcome,
+  elapsedMs,
+  usage,
   onOpen,
   onReveal,
   onUndoArtifact,
@@ -30,6 +38,15 @@ export function TaskOutcome({
     | { kind: "working" }
     | { kind: "done"; message: string; allUndone: boolean }
   >({ kind: "idle" });
+  const undoResultRef = useRef<HTMLParagraphElement>(null);
+
+  // The button the user pressed is gone by the time its result appears, and
+  // focus with it. Moving focus onto the result keeps the keyboard where the
+  // person was, and reads them the answer without a second live region
+  // competing with the conversation's one.
+  useEffect(() => {
+    if (undoState.kind === "done") undoResultRef.current?.focus();
+  }, [undoState.kind]);
 
   if (outcome.kind === "none") return null;
 
@@ -60,7 +77,14 @@ export function TaskOutcome({
 
       {outcome.error ? (
         <div className="mt-2.5">
-          <ErrorNotice message={outcome.error.message} recovery={outcome.error.recovery} />
+          <ErrorNotice
+            message={outcome.error.message}
+            recovery={outcome.error.recovery}
+            // The conversation's live region has already said the task
+            // didn't finish; this card is the detail behind that sentence,
+            // not a second announcement of it.
+            announce={false}
+          />
         </div>
       ) : null}
 
@@ -106,7 +130,8 @@ export function TaskOutcome({
 
       {undoState.kind === "done" ? (
         <p
-          role="status"
+          ref={undoResultRef}
+          tabIndex={-1}
           className={`mt-2 text-sm ${
             undoState.allUndone ? "text-[var(--color-ok)]" : "text-[var(--color-warn)]"
           }`}
@@ -117,7 +142,60 @@ export function TaskOutcome({
           {undoState.message}
         </p>
       ) : null}
+
+      <OutcomeDetails elapsedMs={elapsedMs} usage={usage} />
     </Card>
+  );
+}
+
+/**
+ * What the task cost, in time and in the provider's own units.
+ *
+ * Folded away on purpose. The card above is what the task did; this is
+ * bookkeeping, and a person who never opens it should lose nothing. The
+ * numbers go through `Intl`, because a European reader writes twelve
+ * hundred as 1.200.
+ */
+function OutcomeDetails({
+  elapsedMs,
+  usage,
+}: {
+  elapsedMs: number | undefined;
+  usage: TaskUsage | undefined;
+}) {
+  const sent = usage?.inputTokens;
+  const received = usage?.outputTokens;
+  if (elapsedMs === undefined && sent === undefined && received === undefined) return null;
+
+  return (
+    <Disclosure label="Details">
+      <dl className="space-y-1 text-xs">
+        {elapsedMs === undefined ? null : (
+          <DetailRow label="Time spent working" value={formatDuration(elapsedMs)} />
+        )}
+        {sent === undefined ? null : (
+          <DetailRow label="Sent to the agent" value={`${formatCount(sent)} tokens`} />
+        )}
+        {received === undefined ? null : (
+          <DetailRow label="Written back" value={`${formatCount(received)} tokens`} />
+        )}
+      </dl>
+      {sent === undefined && received === undefined ? null : (
+        <p className="mt-2 text-xs text-[var(--color-ink-faint)]">
+          Tokens are how a provider counts the text an agent reads and writes. They are what
+          your plan or bill is measured in.
+        </p>
+      )}
+    </Disclosure>
+  );
+}
+
+function DetailRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex flex-wrap gap-x-2">
+      <dt className="text-[var(--color-ink-faint)]">{label}</dt>
+      <dd className="text-[var(--color-ink-muted)]">{value}</dd>
+    </div>
   );
 }
 
@@ -173,6 +251,13 @@ function OutcomeFileRow({
   const [undoState, setUndoState] = useState<
     { kind: "idle" } | { kind: "working" } | { kind: "done"; result: OperationResult }
   >({ kind: "idle" });
+  const undoResultRef = useRef<HTMLParagraphElement>(null);
+
+  // Same reason as the task-level undo above: the button leaves with the
+  // press, so focus follows the answer instead of falling to the page top.
+  useEffect(() => {
+    if (undoState.kind === "done") undoResultRef.current?.focus();
+  }, [undoState.kind]);
 
   const undo = async () => {
     setUndoState({ kind: "working" });
@@ -215,7 +300,8 @@ function OutcomeFileRow({
       </div>
       {undoState.kind === "done" ? (
         <p
-          role="status"
+          ref={undoResultRef}
+          tabIndex={-1}
           className={`mt-1.5 text-xs ${
             undoState.result.success ? "text-[var(--color-ok)]" : "text-[var(--color-danger)]"
           }`}

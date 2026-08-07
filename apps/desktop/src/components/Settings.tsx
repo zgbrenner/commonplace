@@ -138,6 +138,77 @@ function UpdatesSection() {
   );
 }
 
+type DiagnosticsUiState =
+  | { phase: "idle" }
+  | { phase: "writing" }
+  | { phase: "written"; path: string }
+  | { phase: "failed"; message: string; recovery?: string | undefined };
+
+function DiagnosticsSection() {
+  const [diagnostics, setDiagnostics] = useState<DiagnosticsUiState>({ phase: "idle" });
+
+  const write = async () => {
+    setDiagnostics({ phase: "writing" });
+    try {
+      setDiagnostics({ phase: "written", path: await ipc.writeDiagnosticsReport() });
+    } catch (cause) {
+      if (cause instanceof CommonspaceError) {
+        setDiagnostics({
+          phase: "failed",
+          message: cause.message,
+          ...(cause.recovery ? { recovery: cause.recovery } : {}),
+        });
+      } else {
+        setDiagnostics({
+          phase: "failed",
+          message: cause instanceof Error ? cause.message : String(cause),
+        });
+      }
+    }
+  };
+
+  return (
+    <section className="mt-6">
+      <h2 className="text-sm font-semibold">Diagnostics</h2>
+      <p className="mt-1.5 text-sm text-[var(--color-ink-muted)]">
+        If something goes wrong, Commonspace can write a file describing this computer, which
+        provider tools are installed, and the end of its own log. It is saved next to the logs and
+        shown in your file manager. Nothing is sent anywhere — read it, and share it only if you
+        choose to. Home folder paths, your username, and anything shaped like an API key are
+        replaced before it is written; names of your own files can still appear in the log part.
+      </p>
+
+      <div className="mt-2 flex items-center gap-2">
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => void write()}
+          disabled={diagnostics.phase === "writing"}
+        >
+          {diagnostics.phase === "writing" ? "Writing…" : "Write a diagnostics file"}
+        </Button>
+      </div>
+
+      {diagnostics.phase === "written" ? (
+        <div className="mt-2 text-sm text-[var(--color-ink-muted)]" role="status">
+          <p>Written, and shown in your file manager:</p>
+          <code className="selectable mt-1 block rounded bg-[var(--color-surface)] px-2 py-1.5 font-mono text-xs break-all text-[var(--color-ink)]">
+            {diagnostics.path}
+          </code>
+        </div>
+      ) : diagnostics.phase === "failed" ? (
+        <div className="mt-2">
+          <ErrorNotice
+            message={diagnostics.message}
+            recovery={diagnostics.recovery}
+            onRetry={() => void write()}
+          />
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 type NotificationsNote =
   | { kind: "info"; message: string }
   | { kind: "error"; message: string; recovery?: string | undefined };
@@ -284,6 +355,8 @@ export function SettingsView() {
         <NotificationsSection />
 
         <UpdatesSection />
+
+        <DiagnosticsSection />
 
         <section className="mt-6">
           <h2 className="text-sm font-semibold">Privacy</h2>

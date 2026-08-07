@@ -18,4 +18,4 @@ mod protected;
 
 pub use path_guard::{PathGuard, PathGuardError, ResolvedPath};
 pub use policy::{ModifyPolicy, PolicyEngine, PolicyRequest, PolicySettings};
-pub use protected::is_protected_location;
+pub use protected::{credential_store_paths, is_protected_location};

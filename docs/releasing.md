@@ -17,7 +17,7 @@ list of commands, so a green run locally means the same checks passed.
 |---|---|---|
 | `ci.yml` | push to `main`, every PR, manual | `scripts/lint` and `scripts/test` on Linux, macOS and Windows; `scripts/typecheck`, lint and production build for the frontend; `scripts/security`; coverage and script/workflow lint |
 | `pr-builds.yml` | PRs touching code paths, manual | Builds real installers per OS, silently installs the Windows one, and attaches everything as 7-day artifacts |
-| `release.yml` | `v*` tag, manual | Verifies, builds installers per OS, drafts a release, then silently installs the drafted Windows installer and checks the binary landed |
+| `release.yml` | `v*` tag, manual | Verifies, builds installers per OS, attests their provenance, drafts a release, then silently installs the drafted Windows installer and checks the binary landed |
 | `codeql.yml` | push to `main`, every PR, weekly | CodeQL code scanning |
 | `audit.yml` | Mondays 07:00 UTC, manual | `scripts/security` alone, to catch advisories filed against an unchanged dependency tree |
 
@@ -82,6 +82,24 @@ Releases are unsigned by default, and the release notes say so:
   Developer account.
 - **Linux** — no OS-level signing gate.
 
+## Build provenance
+
+`release.yml` runs `actions/attest-build-provenance` (MIT) over every
+installer it builds. Each artifact gets a keyless, Sigstore-signed SLSA
+provenance statement binding its digest to the workflow, commit and runner
+that produced it. Anyone can check one:
+
+```sh
+gh attestation verify Commonspace_0.1.1_x64-setup.exe --repo zgbrenner/commonplace
+```
+
+What this is not: attestations are not code signing. They do nothing for
+Gatekeeper or SmartScreen, they are not an OS trust anchor, and they do not
+make installing any smoother — every warning in the section above still
+happens. Their value is that a security-minded reader can verify where a
+binary came from instead of trusting a release page, which is worth having
+while signing is still outstanding, not a substitute for it.
+
 ## In-app updates
 
 Settings has a "Check for updates" button. It asks the GitHub releases API
@@ -95,6 +113,25 @@ compares versions. What happens next depends on how the release was built:
 - **Unsigned release** (the default today) — there is nothing to verify a
   download against, so the button offers the release's download page
   instead. Honest and manual rather than silently broken.
+
+Two things to settle before turning the signed path on.
+
+**Losing the private key is unrecoverable.** The minisign public key is
+compiled into every shipped binary, so there is no rotation path: lose the
+private key and every installed copy is permanently stranded on the version
+it already has, with no way to update it. There is no revocation mechanism
+and no recovery mechanism — the only remedy left is asking every user to
+find, download and reinstall by hand. Store the private key *and* its
+password in two independent places, one of them offline, before cutting the
+first signed release rather than after.
+
+**Notarize macOS before enabling in-place updates.** The order matters more
+than it looks. An in-place update that installs an unsigned app on macOS
+replaces the user's working copy and then drops them at the Gatekeeper wall
+with no obvious way back — strictly worse than today's download-page
+fallback, which at least leaves the installed app alone. Get macOS
+notarization done first (see "Code signing" above), then turn the updater
+on.
 
 To enable the signed, in-place path:
 

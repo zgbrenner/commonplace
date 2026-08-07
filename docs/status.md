@@ -105,16 +105,36 @@ shipped binary, but no one has yet clicked through them:
 - Desktop notifications when a task finishes. Off until turned on in
   Settings, sent only when the window is not in front. The wording is
   unit-tested; no one has yet seen one arrive from the operating system.
+- Plan approval as a distinct step. A task now plans in a read-only
+  provider session (no mutation tools are offered at all), parks in
+  `AwaitingApproval`, and executes only when the person presses Start.
+  Execution resumes that same provider session under an approval envelope
+  covering create, modify, rename and move inside the authorized folders;
+  deletes, anything outside those folders, uploads, and protected
+  locations still interrupt for a separate answer. "Change plan" sends
+  feedback back into planning; Cancel ends the task. Covered by unit and
+  orchestrator tests; nobody has yet approved a plan in a packaged build.
+- Spreadsheets. Reading `.xlsx`, `.xlsm`, `.xls`, `.xlsb` and `.ods` through
+  `calamine`, plus `.csv` and `.tsv` parsed directly, with row and sheet
+  limits so a large workbook cannot swamp a model's context; and creating a
+  new `.xlsx` with a styled header row, frozen panes, autofilter, column
+  widths, per-column number formats, and real numbers and dates rather than
+  text. A created file is re-parsed with `calamine` before success is
+  reported — a different library from the one that wrote it, which makes
+  this the strongest validation in the document layer. Covered by unit
+  tests; nobody has yet asked an agent for a spreadsheet in a packaged
+  build and opened the result in Excel. Creation only: there is no
+  formatting-preserving edit of an existing workbook, no charts or images,
+  and formulas are written for the recipient's application to evaluate,
+  not computed here. See `docs/document-tools.md`.
 
 ## Not started
 
 Named here so the roadmap is not mistaken for the product:
 
-- Plan approval as a distinct step. The task state machine has
-  `AwaitingApproval` and the orchestrator can resolve a plan, but no adapter
-  emits `plan.created` yet, so tasks currently run without a plan gate. Per-
-  operation approval still applies.
-- Formatting-preserving DOCX edits, XLSX, PPTX, OCR, and format conversion.
+- Formatting-preserving DOCX edits, PPTX, OCR, and format conversion.
+  Editing an existing spreadsheet in place belongs here too — the
+  spreadsheet work listed above reads and creates, it does not modify.
 - Artifact previews. Artifacts are listed, opened in their default
   application, and revealed in the file manager; there is no in-app preview
   of PDF pages, documents, or diffs yet.
