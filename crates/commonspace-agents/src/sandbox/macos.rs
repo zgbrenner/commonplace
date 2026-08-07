@@ -60,7 +60,101 @@ const SYSTEM_READ_PATHS: &[&str] = &[
     "/dev",
     "/opt/homebrew",
     "/usr/local",
+    // `/bin/sh` re-execs itself as bash, dash or zsh according to this
+    // symlink — see sh(1). Nix grants it explicitly for the same reason
+    // ("This is used by /bin/sh on macOS 10.15 and later"), and a shell that
+    // cannot resolve it cannot start.
+    "/private/var/select",
+    "/var/select",
 ];
+
+/// Paths the dynamic linker must be able to *map executable*, which is a
+/// separate SBPL operation from reading: `file-read*` is a glob over the read
+/// operations and never covers it.
+///
+/// Every profile that wants both spells out both — Chromium copies its
+/// cryptex block verbatim from Apple's own `dyld-support.sb`, Firefox denies
+/// `file-map-executable` explicitly and re-allows these trees, Codex emits
+/// its own block. Firefox's profiles also note that `file-map-executable` is
+/// *not* covered by `(deny default)`, which makes this most likely
+/// belt-and-braces rather than load-bearing. It costs a few dozen bytes and
+/// removes a whole class of "why did the linker fail" from the table.
+const SYSTEM_EXEC_MAP_PATHS: &[&str] = &[
+    "/usr/lib",
+    "/System/Library/Frameworks",
+    "/System/Library/PrivateFrameworks",
+    "/System/Library/SubFrameworks",
+    "/System/Library/Extensions",
+    "/Library/Apple/usr/lib",
+    // The dyld shared cache moved into cryptexes in Ventura.
+    "/System/Cryptexes/App",
+    "/System/Cryptexes/OS",
+    "/System/Volumes/Preboot/Cryptexes/App/System",
+    "/System/Volumes/Preboot/Cryptexes/OS",
+];
+
+/// Mach services the child may reach, named individually.
+///
+/// The first version of this profile allowed `mach-lookup` unfiltered, with a
+/// comment arguing that a service name is not a file or a socket, so allowing
+/// it did not widen the boundary. That argument was wrong, and the people who
+/// ship these sandboxes say so plainly. Anthropic's own sandbox runtime puts
+/// `com.apple.trustd.agent` behind an opt-in flag it labels a potential data
+/// exfiltration vector, and the Apple Events services behind another that it
+/// documents as meaning the sandbox no longer provides code-execution
+/// isolation — a confined command can `open` an application which then runs
+/// outside every restriction here. Chromium goes further and *denies* one
+/// service deliberately, so that CFPreferences falls back to reading
+/// preference files in-process where the file rules can bind it.
+///
+/// So this is enumerated, as every shipping profile surveyed does it. The
+/// cost is exactly what the old comment feared — a service missing from this
+/// list becomes a silent breakage on some future macOS — and it is the right
+/// trade. Being too narrow produces a bug report. Being too wide produces a
+/// boundary that is not there.
+const MACH_SERVICES: &[&str] = &[
+    // User and group lookup. `getpwuid` runs during startup in more places
+    // than one would expect.
+    "com.apple.system.opendirectoryd.libinfo",
+    "com.apple.system.opendirectoryd.membership",
+    "com.apple.system.DirectoryService.libinfo_v1",
+    "com.apple.bsd.dirhelper",
+    // Logging. A process that cannot log still runs, but the diagnostics are
+    // worth more than the narrowing.
+    "com.apple.logd",
+    "com.apple.logd.events",
+    "com.apple.system.logger",
+    "com.apple.diagnosticd",
+    "com.apple.analyticsd",
+    "com.apple.system.notification_center",
+    // Preferences.
+    "com.apple.cfprefsd.daemon",
+    "com.apple.cfprefsd.agent",
+    // Process startup and power assertions.
+    "com.apple.secinitd",
+    "com.apple.PowerManagement.control",
+    // Certificate validation, which a CLI talking to its provider's API over
+    // TLS needs. Included deliberately despite being the service Anthropic
+    // flags: this profile leaves the network open by design, so the route it
+    // opens is one that is already open here. A profile that closed the
+    // network would have to revisit this line.
+    "com.apple.trustd",
+    "com.apple.trustd.agent",
+];
+
+/// Tag on every denial, so `log show` can be filtered down to this profile's
+/// violations and nothing else:
+///
+/// ```text
+/// log show --last 5m --info --debug --style compact \
+///   --predicate 'eventMessage ENDSWITH "commonspace-sandbox"'
+/// ```
+///
+/// Without it, diagnosing a denial means reading every sandbox violation on
+/// the machine. This is the technique Anthropic's sandbox runtime uses, and
+/// it is the difference between "something was denied" and knowing which
+/// operation and which path.
+const DENY_TAG: &str = "commonspace-sandbox";
 
 /// Directory names, relative to `$HOME`, that a provider CLI owns and must
 /// be able to read *and write* regardless of what the caller's policy says
@@ -147,7 +241,8 @@ pub fn probe() -> Containment {
 pub fn profile(policy: &SandboxPolicy) -> String {
     let mut out = String::new();
 
-    out.push_str("(version 1)\n(deny default)\n\n");
+    out.push_str("(version 1)\n");
+    out.push_str(&format!("(deny default (with message \"{DENY_TAG}\"))\n\n"));
 
     out.push_str(
         "; Network stays open: the CLI has to reach its own provider's API \
@@ -162,31 +257,89 @@ policed separately, at the tool layer (THREAT_MODEL.md).\n",
         "; Baseline operations every process needs merely to run, none of \
 which touch the filesystem or network this profile actually bounds: \
 forking and exec-ing its own subprocesses (git, npm, language runtimes), \
-signalling itself, sysctl reads (libSystem probes these on startup), and \
-file *metadata* reads so ordinary path resolution — stat-ing ancestor \
-directories, following symlinks — doesn't fail on locations that are \
-otherwise denied for content access. mach-lookup is left unrestricted \
-rather than enumerated: the well-known service names a process needs \
-(opendirectoryd for user lookups, cfprefsd, notifyd, distnoted, ...) \
-differ across macOS versions and would be a silent-breakage trap on every \
-OS update, and a mach service name is not a file or a socket — allowing \
-it does not widen the write/read/network boundary this module exists to \
-enforce.\n",
+signalling and inspecting others in the same sandbox, sysctl reads \
+(libSystem probes these on startup), and file *metadata* reads so ordinary \
+path resolution — stat-ing ancestor directories, following symlinks — \
+doesn't fail on locations that are otherwise denied for content access.\n",
     );
     out.push_str("(allow process-fork)\n");
     out.push_str("(allow process-exec)\n");
-    out.push_str("(allow signal (target self))\n");
+    // `(target self)` is not enough: /bin/sh re-execs, node forks workers,
+    // and a process signalling its own child is not signalling itself.
+    // Codex, Nix and Anthropic's sandbox runtime all use `same-sandbox`,
+    // which still cannot reach anything outside this confinement.
+    out.push_str("(allow signal (target same-sandbox))\n");
+    out.push_str("(allow process-info* (target same-sandbox))\n");
     out.push_str("(allow sysctl-read)\n");
     out.push_str("(allow file-read-metadata)\n");
-    out.push_str("(allow mach-lookup)\n\n");
+    out.push_str("(allow user-preference-read)\n\n");
 
     out.push_str(
-        "; /dev/null and /dev/tty are behaviour sinks, not exfiltration \
-routes: any CLI that redirects a subprocess's output, or talks to a \
-controlling terminal, needs to write to them. Read access to both is \
-already covered by the system read-paths block below.\n",
+        "; The root directory itself, readable. Not a way into anything — \
+`(literal \"/\")` is the directory entry, not its contents — but without it \
+`getcwd` fails and the loader can abort before the program starts, with \
+nothing on stderr to say why. Both Codex and Anthropic's sandbox runtime \
+emit this line, each with a comment about the failure it prevents.\n",
     );
-    out.push_str("(allow file-write-data (literal \"/dev/null\") (literal \"/dev/tty\"))\n\n");
+    out.push_str("(allow file-read* file-test-existence (literal \"/\"))\n\n");
+
+    out.push_str(
+        "; Inter-process primitives, which sound exotic and are not: POSIX \
+semaphores and shared memory are how Python's multiprocessing and libomp \
+start up, and the SysV pair is what an embedded database reaches for. None \
+of them carries data across this boundary — the sandbox is the boundary, \
+and these are only reachable within it. They are here because a process \
+denied one of them aborts with signal 6 and prints nothing at all, which \
+is the single most opaque failure this profile can produce, and the one \
+that cost this module a CI round to find.\n",
+    );
+    out.push_str("(allow ipc-posix-sem)\n");
+    out.push_str("(allow ipc-posix-shm)\n");
+    out.push_str("(allow ipc-sysv-sem)\n");
+    out.push_str("(allow ipc-sysv-shm)\n\n");
+
+    out.push_str(
+        "; Startup checks every Mach-O binary makes through the MAC layer: \
+whether a vnode is guarded, and whether it is expected to be inside a \
+container. Denying either is the same silent abort.\n",
+    );
+    out.push_str("(allow system-mac-syscall (mac-policy-name \"vnguard\"))\n");
+    out.push_str(
+        "(allow system-mac-syscall (require-all (mac-policy-name \"Sandbox\") \
+(mac-syscall-number 67)))\n",
+    );
+    out.push_str("(allow system-fsctl (fsctl-command FSIOC_CAS_BSDFLAGS))\n");
+    out.push_str("(allow iokit-open (iokit-registry-entry-class \"RootDomainUserClient\"))\n\n");
+
+    out.push_str(
+        "; Mach services, named one at a time rather than allowed wholesale. \
+See MACH_SERVICES for why the wholesale version was a mistake.\n",
+    );
+    out.push_str("(allow mach-lookup\n");
+    for service in MACH_SERVICES {
+        out.push_str(&format!("    (global-name \"{service}\")\n"));
+    }
+    // cfprefsd is reachable under either name depending on context.
+    out.push_str("    (local-name \"com.apple.cfprefsd.agent\")\n");
+    out.push_str(")\n\n");
+
+    out.push_str(
+        "; Device nodes are behaviour sinks, not exfiltration routes: any CLI \
+that redirects a subprocess's output, talks to a controlling terminal, or \
+seeds a random number generator needs these. /dev/fd matters more than it \
+looks — a shell reopens its own descriptors through it, and clang's \
+configure tests write to /dev/null through it. Read access is already \
+covered by the system read-paths block below; this is the write half.\n",
+    );
+    out.push_str(
+        "(allow file-write-data \
+(literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\"))\n",
+    );
+    out.push_str("(allow file-read-data file-write-data (subpath \"/dev/fd\"))\n");
+    out.push_str("(allow file-read* file-write-data file-ioctl (literal \"/dev/dtracehelper\"))\n");
+    out.push_str("(allow file-read* file-write* file-ioctl (literal \"/dev/ptmx\"))\n");
+    out.push_str("(allow file-read* file-write* file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))\n");
+    out.push_str("(allow pseudo-tty)\n\n");
 
     out.push_str(
         "; Read-only: the OS itself. The dynamic linker, shared libraries, \
@@ -194,8 +347,18 @@ frameworks, and language runtimes installed system-wide or via Homebrew. \
 None of this is writable.\n",
     );
     out.push_str(&allow_block(
-        "file-read*",
+        "file-read* file-test-existence",
         SYSTEM_READ_PATHS.iter().map(Path::new),
+    ));
+    out.push('\n');
+
+    out.push_str(
+        "; Mapping a file executable is its own operation in SBPL, not part \
+of file-read*. See SYSTEM_EXEC_MAP_PATHS.\n",
+    );
+    out.push_str(&allow_block(
+        "file-map-executable file-read*",
+        SYSTEM_EXEC_MAP_PATHS.iter().map(Path::new),
     ));
     out.push('\n');
 
@@ -203,7 +366,7 @@ None of this is writable.\n",
         let readable = both_spellings(policy.readable.clone());
         out.push_str("; Read-only: caller-specified paths outside the writable set.\n");
         out.push_str(&allow_block(
-            "file-read*",
+            "file-read* file-test-existence file-map-executable",
             readable.iter().map(PathBuf::as_path),
         ));
         out.push('\n');
@@ -226,9 +389,17 @@ the latter and *will* write there mid-run; a sandbox that stopped it \
 resuming a session would have broken the product, not secured it.\n",
     );
     out.push_str(&allow_block(
-        "file-read* file-write*",
+        "file-read* file-write* file-test-existence file-map-executable",
         writable.iter().map(PathBuf::as_path),
     ));
+
+    // On `file-map-executable` over a *writable* tree: this is normally the
+    // thing a sandbox exists to prevent — write a dylib, then load it. It is
+    // granted here because `process-exec` above is already unfiltered, so a
+    // child that can write a file can already run it; withholding the map
+    // would block a legitimate case (a CLI installing a native module into
+    // its own config directory) without closing anything. If `process-exec`
+    // ever becomes path-filtered, this line has to be revisited with it.
 
     out
 }
@@ -407,7 +578,13 @@ mod tests {
     #[test]
     fn profile_denies_by_default() {
         let text = profile(&SandboxPolicy::default());
-        assert!(text.starts_with("(version 1)\n(deny default)\n"), "{text}");
+        assert!(text.starts_with("(version 1)\n(deny default"), "{text}");
+        // Tagged, or a denial cannot be found in the machine's log without
+        // reading every sandbox violation on it.
+        assert!(
+            text.contains(&format!("(deny default (with message \"{DENY_TAG}\"))")),
+            "{text}"
+        );
     }
 
     #[test]
@@ -700,6 +877,18 @@ mod tests {
             assert!(containment.is_enforced(), "{containment:?}");
             let output = std::process::Command::new(&program)
                 .args(&args)
+                // In production the child's working directory *is* a
+                // workspace root, so it is inside the writable set. Running
+                // the test from cargo's directory instead would confine a
+                // process whose cwd it cannot read, which is a documented way
+                // to break getcwd and has nothing to do with what this test
+                // is checking.
+                .current_dir(
+                    policy
+                        .writable
+                        .first()
+                        .map_or(Path::new("/"), |p| p.as_path()),
+                )
                 .output()
                 .expect("run the sandboxed shell");
             let detail = format!(
@@ -782,7 +971,54 @@ mod tests {
                 .map(|o| o.status.to_string())
                 .unwrap_or_else(|e| format!("could not run: {e}"));
             report.push_str(&format!("  same redirect with no profile: {unconfined}\n"));
+            report.push_str(&sandbox_violations());
             report
+        }
+
+        /// What the kernel says it denied.
+        ///
+        /// Every denial in this profile is tagged (see `DENY_TAG`), so this
+        /// filters the unified log down to this profile's violations and
+        /// nothing else on the machine. It is the only source that names the
+        /// *operation* and the *path or service* — a wait status says a
+        /// process died, and this says why.
+        fn sandbox_violations() -> String {
+            let filtered = std::process::Command::new("/usr/bin/log")
+                .args([
+                    "show",
+                    "--last",
+                    "2m",
+                    "--info",
+                    "--debug",
+                    "--style",
+                    "compact",
+                    "--predicate",
+                    &format!("eventMessage CONTAINS \"{DENY_TAG}\""),
+                ])
+                .output();
+            let mut out = String::from("\nsandbox violations from the unified log:\n");
+            match filtered {
+                Ok(result) => {
+                    let text = String::from_utf8_lossy(&result.stdout);
+                    // The last few lines are the interesting ones and the
+                    // whole log would bury the rest of the report.
+                    let lines: Vec<&str> = text.lines().rev().take(40).collect();
+                    if lines.is_empty() {
+                        out.push_str(
+                            "  (nothing tagged — either the denial was not logged, or \
+                             `(deny default (with message ...))` is not doing what this \
+                             module thinks it does)\n",
+                        );
+                    }
+                    for line in lines.into_iter().rev() {
+                        out.push_str("  ");
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+                Err(error) => out.push_str(&format!("  could not read the log: {error}\n")),
+            }
+            out
         }
 
         #[test]

@@ -1504,6 +1504,33 @@ mod tests {
         h.handle.expect("handle").shutdown().await;
     }
 
+    #[test]
+    fn the_words_a_person_uses_reach_the_tool_that_does_the_job() {
+        // Over the real tool definitions, not a fixture: this is the pairing
+        // that matters, and a wording change in a tool description that
+        // breaks it should fail here rather than in front of someone.
+        let (registry, _) = build_registry(&[]);
+        for (query, expected) in [
+            ("read the excel file", "builtin:read_spreadsheet"),
+            ("put this in the trash", "builtin:delete_to_trash"),
+            ("write it up as a word document", "builtin:create_document"),
+            ("what is in this folder", "builtin:list_folder"),
+        ] {
+            let matches = registry.search(query, 3);
+            let top = matches
+                .first()
+                .unwrap_or_else(|| panic!("nothing matched “{query}”"));
+            assert_eq!(
+                top.capability.id.0, expected,
+                "“{query}” ranked {:?} first, reasons {:?}",
+                top.capability.id.0, top.reasons
+            );
+            // The result has to be able to say why, or the explanation
+            // contract in the registry is decoration.
+            assert!(!top.reasons.is_empty(), "{query}");
+        }
+    }
+
     #[tokio::test]
     async fn searching_for_something_nothing_provides_says_that_in_words() {
         let h = harness().await;
