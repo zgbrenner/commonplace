@@ -61,7 +61,32 @@ impl SandboxPolicy {
     /// conversation depends on in the other. Confining either would not make
     /// anything safer; it would stop tasks resuming, and the fix people reach
     /// for then is turning containment off.
-    pub fn for_session(workspace_roots: &[std::path::PathBuf], provider_dirs: &[&str]) -> Self {
+    /// `program` is the CLI about to be executed. Its directory is granted
+    /// read and execute, because confinement is applied immediately before
+    /// `execve` and a program the ruleset cannot reach does not fail to be
+    /// confined — it fails to start. A CLI installed under nvm, `~/.local/bin`
+    /// or npm-global lives nowhere in the system hierarchies, so without this
+    /// the first rule of this module — containment never fails a spawn —
+    /// would be inverted by the containment itself.
+    pub fn for_session(
+        workspace_roots: &[std::path::PathBuf],
+        provider_dirs: &[&str],
+        program: &std::path::Path,
+    ) -> Self {
+        let mut readable: Vec<PathBuf> = Vec::new();
+        // Both spellings: the resolved one is what the kernel matches, and
+        // the unresolved one covers a symlink whose target moved.
+        for candidate in [Some(program.to_path_buf()), program.canonicalize().ok()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(parent) = candidate.parent() {
+                let parent = parent.to_path_buf();
+                if !readable.contains(&parent) {
+                    readable.push(parent);
+                }
+            }
+        }
         let mut writable: Vec<PathBuf> = workspace_roots.to_vec();
         writable.push(std::env::temp_dir());
         if let Some(home) = home_dir() {
@@ -69,10 +94,7 @@ impl SandboxPolicy {
                 writable.push(home.join(dir));
             }
         }
-        Self {
-            writable,
-            readable: Vec::new(),
-        }
+        Self { writable, readable }
     }
 }
 
