@@ -15,6 +15,7 @@ pub mod claude;
 pub mod codex;
 pub mod detect;
 pub mod process;
+pub mod sandbox;
 
 pub use adapter::{
     AdapterError, AgentAdapter, EventSink, McpEndpoint, RunningSession, SessionRequest,

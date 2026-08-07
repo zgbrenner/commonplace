@@ -526,9 +526,14 @@ mod tests {
 
     #[test]
     fn probe_is_unavailable_without_the_binary() {
-        assert!(!Path::new(SANDBOX_EXEC).exists(), "test assumes a container without sandbox-exec");
+        assert!(
+            !Path::new(SANDBOX_EXEC).exists(),
+            "test assumes a container without sandbox-exec"
+        );
         let containment = probe();
-        assert!(matches!(containment, Containment::Unavailable { mechanism, .. } if mechanism == MECHANISM));
+        assert!(
+            matches!(containment, Containment::Unavailable { mechanism, .. } if mechanism == MECHANISM)
+        );
     }
 
     /// Tests below this line need a real macOS kernel and did not run in

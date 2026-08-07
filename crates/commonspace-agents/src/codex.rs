@@ -144,11 +144,20 @@ impl AgentAdapter for CodexCliAdapter {
         // Prompt via stdin.
         args.push("-".into());
 
-        let mut cli =
-            spawn_cli(&path, &args, &request.cwd, &envs).map_err(|source| AdapterError::Spawn {
-                cli: "Codex CLI",
-                source,
-            })?;
+        let mut cli = spawn_cli(
+            &path,
+            &args,
+            &request.cwd,
+            &envs,
+            Some(&crate::sandbox::SandboxPolicy::for_session(
+                &request.workspace_roots,
+                &[".codex"],
+            )),
+        )
+        .map_err(|source| AdapterError::Spawn {
+            cli: "Codex CLI",
+            source,
+        })?;
         cli.write_line(&request.prompt).await?;
         cli.close_stdin();
 

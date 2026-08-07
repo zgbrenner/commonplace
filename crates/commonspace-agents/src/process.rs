@@ -8,8 +8,9 @@
 //! - `.cmd`/`.bat` shims (npm on Windows) are launched through `cmd.exe`;
 //!   the Job Object still captures every descendant.
 
+use crate::sandbox::{Containment, SandboxPolicy};
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -47,6 +48,10 @@ pub struct SpawnedCli {
     /// `take_stdin`.
     stdin: Option<tokio::process::ChildStdin>,
     child: Arc<Mutex<Box<dyn ChildWrapper>>>,
+    /// What confinement this process actually got. Carried rather than
+    /// assumed: the caller reports it, and a boundary that silently was not
+    /// applied is the failure this whole layer exists to make visible.
+    pub containment: Containment,
 }
 
 impl SpawnedCli {
@@ -138,7 +143,14 @@ pub fn spawn_cli(
     args: &[String],
     cwd: &Path,
     envs: &[(String, String)],
+    policy: Option<&SandboxPolicy>,
 ) -> std::io::Result<SpawnedCli> {
+    // Confinement, where this platform offers it. Deliberately infallible:
+    // an old kernel or a missing profile means the CLI runs unconfined, not
+    // that it refuses to run. What was actually achieved rides along on the
+    // handle so the caller can report it rather than assume it.
+    let (program, args, containment) = contain(program, args, policy);
+    let (program, args) = (program.as_path(), &args[..]);
     // npm shims on Windows are .cmd batch files; CreateProcess can only run
     // them via cmd.exe. The Job Object wraps cmd.exe and every descendant.
     let is_batch = matches!(
@@ -166,7 +178,7 @@ pub fn spawn_cli(
             {
                 let _ = full;
             }
-            configure(c, cwd, envs);
+            configure(c, cwd, envs, policy);
         });
         // Only Windows has `.cmd` shims, so only Windows wraps here. The
         // rebinding keeps `w` immutable elsewhere, which would otherwise be
@@ -181,7 +193,7 @@ pub fn spawn_cli(
     } else {
         let mut w = CommandWrap::with_new(program, |c| {
             c.args(args);
-            configure(c, cwd, envs);
+            configure(c, cwd, envs, policy);
         });
         #[cfg(windows)]
         no_console(&mut w);
@@ -236,6 +248,7 @@ pub fn spawn_cli(
         stderr_tail,
         stdin,
         child,
+        containment,
     })
 }
 
@@ -257,7 +270,103 @@ fn no_console(w: &mut CommandWrap) {
     w.wrap(CreationFlags(CREATE_NO_WINDOW));
 }
 
-fn configure(c: &mut tokio::process::Command, cwd: &Path, envs: &[(String, String)]) {
+/// Rewrite the command, or arrange for the child to restrict itself, so it
+/// starts confined. Returns what was actually achieved.
+///
+/// The platforms genuinely differ in shape: macOS wraps the command in
+/// `sandbox-exec`, Linux has the child restrict itself between fork and exec,
+/// and Windows has no mechanism this product can ship. One function hides
+/// that from the spawn path without pretending the difference is not there.
+fn contain(
+    program: &Path,
+    args: &[String],
+    policy: Option<&SandboxPolicy>,
+) -> (PathBuf, Vec<String>, Containment) {
+    let Some(policy) = policy else {
+        return (
+            program.to_path_buf(),
+            args.to_vec(),
+            Containment::NotRequested,
+        );
+    };
+    let _ = policy;
+
+    #[cfg(target_os = "macos")]
+    {
+        crate::sandbox::macos::wrap(program, args, policy)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Nothing is rewritten on Linux. The ruleset is built here, in the
+        // parent, and applied by `install_linux_restriction` between fork and
+        // exec — see there for why the halves are split.
+        (
+            program.to_path_buf(),
+            args.to_vec(),
+            crate::sandbox::linux::prepare(policy).containment().clone(),
+        )
+    }
+    #[cfg(windows)]
+    {
+        (
+            program.to_path_buf(),
+            args.to_vec(),
+            crate::sandbox::windows::probe(),
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        (
+            program.to_path_buf(),
+            args.to_vec(),
+            Containment::NotImplemented {
+                platform: "this platform",
+            },
+        )
+    }
+}
+
+/// Have the child confine itself to `policy` immediately before `exec`.
+///
+/// Landlock restricts a thread, and the only thread that survives into the
+/// new program is the one between `fork` and `exec` — so this has to happen
+/// there, not in the parent, which would confine Commonspace itself.
+///
+/// The allocating half (opening paths, building the ruleset) runs here in the
+/// parent. The closure does three syscalls and no allocation, which is what
+/// makes it safe in a context where taking a lock could deadlock the child.
+#[cfg(target_os = "linux")]
+fn install_linux_restriction(c: &mut tokio::process::Command, policy: &SandboxPolicy) {
+    let prepared = crate::sandbox::linux::prepare(policy);
+    // SAFETY: the closure runs between `fork` and `exec`, where
+    // async-signal-unsafe work can deadlock the child. `Prepared::apply` is
+    // an `fcntl`, a `prctl` and a `landlock_restrict_self`, with no
+    // allocation, no locking and no logging — which is the entire reason
+    // `prepare` and `apply` are separate functions.
+    #[allow(unsafe_code)]
+    unsafe {
+        c.pre_exec(move || {
+            // Deliberately ignored: containment never fails a spawn, and what
+            // was actually achieved was already reported from `contain`.
+            let _ = prepared.apply();
+            Ok(())
+        });
+    }
+}
+
+fn configure(
+    c: &mut tokio::process::Command,
+    cwd: &Path,
+    envs: &[(String, String)],
+    policy: Option<&SandboxPolicy>,
+) {
+    #[cfg(target_os = "linux")]
+    if let Some(policy) = policy {
+        install_linux_restriction(c, policy);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = policy;
+
     c.current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -305,7 +414,7 @@ mod tests {
         args.push("echo one; echo two".into());
 
         let cwd = std::env::temp_dir();
-        let mut cli = spawn_cli(&sh, &args, &cwd, &[]).unwrap();
+        let mut cli = spawn_cli(&sh, &args, &cwd, &[], None).unwrap();
         let mut got = Vec::new();
         while let Some(line) = cli.stdout_lines.recv().await {
             got.push(line.trim().to_string());
@@ -324,7 +433,7 @@ mod tests {
         args.push("sleep 30".into());
 
         let cwd = std::env::temp_dir();
-        let cli = spawn_cli(&sh, &args, &cwd, &[]).unwrap();
+        let cli = spawn_cli(&sh, &args, &cwd, &[], None).unwrap();
         let started = std::time::Instant::now();
         cli.kill.kill().await;
         assert!(
@@ -343,7 +452,7 @@ mod tests {
         args.push("cat".into());
 
         let cwd = std::env::temp_dir();
-        let mut cli = spawn_cli(&sh, &args, &cwd, &[]).unwrap();
+        let mut cli = spawn_cli(&sh, &args, &cwd, &[], None).unwrap();
         cli.write_line("hello-stdin").await.unwrap();
         cli.close_stdin();
         let mut got = Vec::new();

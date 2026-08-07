@@ -50,6 +50,40 @@ pub struct SandboxPolicy {
     pub readable: Vec<PathBuf>,
 }
 
+impl SandboxPolicy {
+    /// The policy for a provider session: writable inside the project's
+    /// authorized roots, and read-only everywhere the CLI legitimately needs
+    /// to look.
+    ///
+    /// The temp directory and the provider's own configuration directory are
+    /// writable on purpose. The MCP session settings file lives in one, and
+    /// the CLI owns its credentials and the session state a resumed
+    /// conversation depends on in the other. Confining either would not make
+    /// anything safer; it would stop tasks resuming, and the fix people reach
+    /// for then is turning containment off.
+    pub fn for_session(workspace_roots: &[std::path::PathBuf], provider_dirs: &[&str]) -> Self {
+        let mut writable: Vec<PathBuf> = workspace_roots.to_vec();
+        writable.push(std::env::temp_dir());
+        if let Some(home) = home_dir() {
+            for dir in provider_dirs {
+                writable.push(home.join(dir));
+            }
+        }
+        Self {
+            writable,
+            readable: Vec::new(),
+        }
+    }
+}
+
+/// The user's home directory, for locating a provider's own configuration.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
 /// What containment a spawn actually achieved.
 ///
 /// Deliberately not a bool. "Off because this kernel lacks it" and "off

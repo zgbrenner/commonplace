@@ -104,20 +104,11 @@ const NO_LANDLOCK: &str = "the kernel does not provide it — Landlock needs Lin
 /// way up — `/etc/ld.so.cache`, `/etc/ssl`, `/etc/resolv.conf`. None of it is
 /// writable.
 const SYSTEM_READ_EXEC: &[&str] = &[
-    "/usr",
-    "/bin",
-    "/sbin",
-    "/lib",
-    "/lib32",
-    "/lib64",
-    "/libx32",
-    "/etc",
-    "/opt",
+    "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt",
     // Node's runtime asks the kernel about itself through these — processor
     // count, memory, its own open descriptors. A CLI that cannot read them
     // fails at startup, nowhere near the boundary this policy is about.
-    "/proc",
-    "/sys",
+    "/proc", "/sys",
     // On systemd distributions `/etc/resolv.conf` is a symlink into `/run`,
     // and Landlock evaluates the resolved target rather than the link. Name
     // resolution stops working without this.
@@ -390,20 +381,34 @@ mod tests {
             .expect("probe() must not confine the process that called it");
     }
 
+    /// [`build`] is exercised directly, not through [`prepare`], because
+    /// `prepare` stops at [`probe`] on a kernel without Landlock and the
+    /// builder would then never be reached on the machine running these tests.
+    /// Building is safe anywhere: it opens descriptors and closes them again
+    /// when the returned ruleset is dropped, and confines nothing.
     #[test]
     fn a_policy_naming_paths_that_do_not_exist_still_builds() {
-        let policy = SandboxPolicy {
+        let missing = SandboxPolicy {
+            // A workspace on a drive that has since been unplugged, and a
+            // provider that turned out not to be installed.
             writable: vec![PathBuf::from("/commonspace-no-such-workspace")],
             readable: vec![PathBuf::from("/commonspace-no-such-runtime")],
         };
-        let prepared = prepare(&policy);
-        assert_eq!(
-            prepared.containment().is_enforced(),
-            probe().is_enforced(),
-            "a path that has gone missing must not cost the boundary: {:?}",
-            prepared.containment()
-        );
-        std::fs::read(OUTSIDE_EVERY_POLICY).expect("prepare() must not confine its caller");
+        for policy in [policy(), missing, SandboxPolicy::default()] {
+            let built = build(&policy);
+            assert!(
+                built.is_ok(),
+                "a path that has gone missing must not cost the boundary: {built:?}"
+            );
+            let prepared = prepare(&policy);
+            assert_eq!(
+                prepared.containment().is_enforced(),
+                probe().is_enforced(),
+                "{:?}",
+                prepared.containment()
+            );
+        }
+        std::fs::read(OUTSIDE_EVERY_POLICY).expect("building must not confine the builder");
     }
 
     #[test]
@@ -495,19 +500,24 @@ mod tests {
             return;
         }
         let Some(home) = home_dir() else {
-            eprintln!("SKIPPED a_confined_child_cannot_read_outside_its_workspace: no HOME to \
-                       put a file the policy does not cover");
+            eprintln!(
+                "SKIPPED a_confined_child_cannot_read_outside_its_workspace: no HOME to put \
+                 a file the policy does not cover"
+            );
             return;
         };
         // The temp directory is granted unconditionally, so a secret placed
         // there would prove nothing.
         if home.starts_with(std::env::temp_dir()) {
-            eprintln!("SKIPPED a_confined_child_cannot_read_outside_its_workspace: HOME is \
-                       inside the temp directory this policy grants");
+            eprintln!(
+                "SKIPPED a_confined_child_cannot_read_outside_its_workspace: HOME is inside \
+                 the temp directory this policy grants"
+            );
             return;
         }
 
-        let workspace = std::env::temp_dir().join(format!("commonspace-landlock-{}", std::process::id()));
+        let workspace =
+            std::env::temp_dir().join(format!("commonspace-landlock-{}", std::process::id()));
         std::fs::create_dir_all(&workspace).unwrap();
         let allowed = workspace.join("inside.txt");
         std::fs::write(&allowed, b"workspace\n").unwrap();

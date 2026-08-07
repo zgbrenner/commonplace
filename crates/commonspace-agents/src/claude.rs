@@ -30,6 +30,7 @@ use crate::adapter::{
 };
 use crate::detect::{find_cli, probe_version};
 use crate::process::spawn_cli;
+use crate::sandbox::SandboxPolicy;
 use commonspace_core::{
     AdapterCapabilities, AgentErrorInfo, AgentEvent, AuthStatus, HealthCheck, HealthReport,
     InstallStatus, MessageId, MessageRole, ProviderId, SessionId, ToolCallId, ToolStatus,
@@ -276,7 +277,16 @@ impl AgentAdapter for ClaudeCodeAdapter {
             args.push("--strict-mcp-config".into());
         }
 
-        let mut cli = match spawn_cli(&path, &args, &request.cwd, &cli_quiet_env()) {
+        let mut cli = match spawn_cli(
+            &path,
+            &args,
+            &request.cwd,
+            &cli_quiet_env(),
+            Some(&SandboxPolicy::for_session(
+                &request.workspace_roots,
+                &[".claude"],
+            )),
+        ) {
             Ok(cli) => cli,
             Err(source) => {
                 // Nothing is going to consume the file, and it holds the
