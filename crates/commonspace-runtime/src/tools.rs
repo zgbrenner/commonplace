@@ -1531,6 +1531,142 @@ mod tests {
         }
     }
 
+    /// Writes a skill directory and returns the root it lives under.
+    fn seed_skill(root: &std::path::Path, name: &str, frontmatter: &str, body: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("skill directory");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\n{frontmatter}---\n\n{body}"),
+        )
+        .expect("SKILL.md");
+    }
+
+    #[tokio::test]
+    async fn a_skill_on_disk_is_found_by_words_and_loaded_only_when_asked_for() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills = tmp.path().join("skills");
+        seed_skill(
+            &skills,
+            "board-pack",
+            "name: board-pack\n\
+             description: Assemble the quarterly board pack from the finance exports and \
+             last quarter's minutes.\n\
+             allowed-tools: read_spreadsheet create_document\n",
+            "# Board pack\n\n1. Read every export in Finance/Q3.\n2. Follow the house order.\n",
+        );
+        std::fs::write(skills.join("board-pack").join("TEMPLATE.md"), "# Template")
+            .expect("bundled file");
+
+        let (registry, report) = build_registry(std::slice::from_ref(&skills));
+        assert_eq!(report.loaded, 1, "{:?}", report.skipped);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+
+        // Level one: found by the words a person would actually use, with the
+        // reasons visible.
+        let matches = registry.search("put together the quarterly board pack", 5);
+        let top = matches.first().expect("the skill should match");
+        assert_eq!(top.capability.id.0, "skill:board-pack");
+        assert!(!top.reasons.is_empty());
+        // The instructions are *not* in the search result. That is the whole
+        // point of the split — if the body leaked into a match, every search
+        // would cost what loading costs.
+        let rendered = serde_json::to_string(&matches).expect("serialize");
+        assert!(!rendered.contains("house order"), "{rendered}");
+
+        // Level two: the body arrives only on request.
+        let loaded = registry
+            .load(&top.capability.id)
+            .expect("the match must be loadable");
+        let LoadedCapability::Instructions {
+            body,
+            bundled,
+            requires,
+        } = loaded
+        else {
+            panic!("a skill must load as instructions: {loaded:?}");
+        };
+        assert!(body.contains("house order"), "{body}");
+        assert_eq!(requires, &["read_spreadsheet", "create_document"]);
+        // Level three: the bundled file is named, and its contents are not
+        // here.
+        assert!(
+            bundled.iter().any(|p| p.ends_with("TEMPLATE.md")),
+            "{bundled:?}"
+        );
+        assert!(!body.contains("# Template"), "{body}");
+    }
+
+    #[test]
+    fn a_broken_skill_is_named_and_the_others_still_load() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills = tmp.path().join("skills");
+        seed_skill(
+            &skills,
+            "good",
+            "name: good\ndescription: A fine skill.\n",
+            "Body.",
+        );
+        seed_skill(&skills, "broken", "description: no name at all\n", "Body.");
+
+        let (registry, report) = build_registry(&[skills]);
+        assert_eq!(report.loaded, 1);
+        assert_eq!(report.skipped.len(), 1);
+        // The path has to point at something the person can go and open.
+        let skipped = &report.skipped[0];
+        assert!(
+            skipped.path().to_string_lossy().contains("broken"),
+            "{skipped}"
+        );
+        assert!(registry.get(&CapabilityId::new("skill", "good")).is_some());
+        assert!(registry
+            .get(&CapabilityId::new("skill", "broken"))
+            .is_none());
+    }
+
+    #[test]
+    fn a_skill_cannot_grant_itself_anything_by_declaring_it() {
+        // allowed-tools is recorded, and that is all it does. If this ever
+        // starts feeding a permission decision, this test is where it will
+        // be noticed.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills = tmp.path().join("skills");
+        seed_skill(
+            &skills,
+            "greedy",
+            "name: greedy\n\
+             description: Claims everything.\n\
+             allowed-tools: delete_to_trash overwrite_file Bash(rm:*)\n",
+            "Delete whatever you like.",
+        );
+        let (registry, _) = build_registry(&[skills]);
+        let loaded = registry
+            .load(&CapabilityId::new("skill", "greedy"))
+            .expect("loaded");
+        let LoadedCapability::Instructions { requires, .. } = loaded else {
+            panic!("{loaded:?}");
+        };
+        assert!(requires.iter().any(|r| r == "delete_to_trash"));
+        // Nothing about the policy engine, the broker, or this session's
+        // grants has changed. The declaration is text on a page.
+        let context_policy = PolicyEngine::new(
+            PathGuard::new([tmp.path()]),
+            commonspace_permissions::PolicySettings::default(),
+        );
+        let verdict = context_policy
+            .evaluate(&PolicyRequest {
+                class: OperationClass::Delete,
+                targets: vec![tmp.path().join("anything.txt")],
+                destination: None,
+                permanent: false,
+            })
+            .expect("the path is inside the guard");
+        assert!(
+            !matches!(verdict, PolicyVerdict::Allow),
+            "a skill's declaration must not have loosened anything: {verdict:?}"
+        );
+    }
+
     #[test]
     fn a_query_naming_a_format_finds_a_tool_that_can_read_that_format() {
         // Deliberately weaker than the test above, because this query really
