@@ -146,7 +146,7 @@ async fn organize_a_folder_end_to_end() {
     seed_workspace(&ws_dir);
 
     let storage = Arc::new(Storage::open_in_memory().expect("storage"));
-    let orchestrator = Orchestrator::new(Arc::clone(&storage), tmp.path().join("backups"));
+    let orchestrator = Orchestrator::new(Arc::clone(&storage), tmp.path().to_path_buf());
     let workspace = storage
         .create_workspace("Documents", std::slice::from_ref(&ws_dir))
         .expect("workspace");
@@ -306,7 +306,7 @@ async fn declining_an_approval_changes_nothing() {
     .expect("seed");
 
     let storage = Arc::new(Storage::open_in_memory().expect("storage"));
-    let orchestrator = Orchestrator::new(Arc::clone(&storage), tmp.path().join("backups"));
+    let orchestrator = Orchestrator::new(Arc::clone(&storage), tmp.path().to_path_buf());
     let workspace = storage
         .create_workspace("Documents", std::slice::from_ref(&ws_dir))
         .expect("workspace");

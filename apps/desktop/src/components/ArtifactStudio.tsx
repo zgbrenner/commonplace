@@ -49,6 +49,12 @@ export interface ArtifactStudioProps {
   /** Throw these changes away. The user's files are not touched. */
   onDiscard: (changeIds: string[]) => Promise<void>;
   /**
+   * Leave the review and go back to the conversation. A surface this size
+   * with no way out is a trap, so when the caller mounts it in place of the
+   * conversation it should pass this.
+   */
+  onClose?: (() => void) | undefined;
+  /**
    * Fetch one change's comparison. Defaults to `stagedDiff` over IPC; the
    * parameter exists so the surface can be driven from somewhere else.
    */
@@ -80,6 +86,7 @@ export function ArtifactStudio({
   onReload,
   onApply,
   onDiscard,
+  onClose,
   loadPreview,
 }: ArtifactStudioProps) {
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => selectAll(changes));
@@ -223,9 +230,16 @@ export function ArtifactStudio({
       className="studio flex min-h-0 flex-1 flex-col bg-[var(--color-surface)]"
     >
       <header className="border-b border-[var(--color-line)] px-5 py-4">
-        <h2 id={`${domId}-heading`} className="text-base font-semibold">
-          Changes waiting for your review
-        </h2>
+        <div className="flex items-start justify-between gap-4">
+          <h2 id={`${domId}-heading`} className="text-base font-semibold">
+            Changes waiting for your review
+          </h2>
+          {onClose ? (
+            <Button size="sm" variant="quiet" className="shrink-0" onClick={onClose}>
+              Back to the conversation
+            </Button>
+          ) : null}
+        </div>
         <p className="mt-1 text-sm text-[var(--color-ink-muted)]">{pendingSummary(changes)}</p>
         <p className="mt-0.5 text-xs text-[var(--color-ink-faint)]">
           None of this has touched your files. Nothing is written until you apply it.

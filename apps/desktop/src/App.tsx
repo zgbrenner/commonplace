@@ -33,6 +33,7 @@ import { recommendedProvider, usableConnections as usable } from "./lib/recommen
 import { completionNotification, notifyTaskFinished } from "./lib/notify";
 import { Sidebar, type View } from "./components/Sidebar";
 import { Suggestions } from "./components/Suggestions";
+import { ArtifactStudio } from "./components/ArtifactStudio";
 import { Conversation as ConversationView } from "./components/Conversation";
 import { Composer } from "./components/Composer";
 import { ArtifactPanel } from "./components/ArtifactPanel";
@@ -71,6 +72,15 @@ export function App() {
   const [model, setModel] = useState("default");
   const [attachments, setAttachments] = useState<string[]>([]);
   const [suggestions, setSuggestions] = useState<ipc.TaskSuggestion[]>([]);
+  /** Changes the newest task has proposed and nobody has answered yet. */
+  const [staged, setStaged] = useState<ipc.StagedChange[]>([]);
+  const [stagedError, setStagedError] = useState<
+    { message: string; recovery?: string | undefined } | undefined
+  >();
+  const [reviewing, setReviewing] = useState(false);
+  /** Bumped when a task ends, so the staged list reloads without `onEvent`
+   *  needing to close over it. */
+  const [reloadStagedAt, setReloadStagedAt] = useState(0);
   const [error, setError] = useState<{ message: string; recovery?: string } | undefined>();
 
   const workspace = useMemo(
@@ -167,12 +177,44 @@ export function App() {
     };
   }, [activeWorkspaceId]);
 
+  /**
+   * Changes the newest task has proposed. Reloaded when the task changes and
+   * whenever one finishes, since staging is where a finished task's output
+   * now lives — nothing was written to the user's files.
+   */
+  const refreshStaged = useCallback(async (id: string | undefined) => {
+    if (!id) {
+      setStaged([]);
+      setStagedError(undefined);
+      return;
+    }
+    try {
+      setStaged(await ipc.listStagedChanges(id));
+      setStagedError(undefined);
+    } catch (cause) {
+      // Surfaced inside the studio rather than as a global banner: not
+      // knowing what is proposed is a problem with that panel, not with the
+      // conversation the person is reading.
+      setStaged([]);
+      setStagedError(
+        cause instanceof CommonspaceError
+          ? { message: cause.message, recovery: cause.recovery }
+          : { message: cause instanceof Error ? cause.message : String(cause) },
+      );
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshStaged(taskId);
+  }, [taskId, reloadStagedAt, refreshStaged]);
+
   /* ------------------------------------------------------------- actions */
 
   const onEvent = useCallback((event: AgentEvent) => {
     setLive((state) => applyEvent(state, event));
     if (event.type === "task.completed" || event.type === "error") {
       setRunning(false);
+      setReloadStagedAt(Date.now());
       // A task can run for minutes, so this is how it reaches someone who
       // moved on to another window. Deliberately unawaited and unguarded:
       // notify.ts stays silent when the window is focused, when the person
@@ -336,6 +378,39 @@ export function App() {
       }
     },
     [taskId, replayTask, reportError],
+  );
+
+  const applyStaged = useCallback(
+    async (changeIds: string[]) => {
+      if (!taskId) return [];
+      const results = await ipc.applyStagedChanges(taskId, changeIds);
+      // Applying is the moment files really change, so both the proposal
+      // list and the artifact list are now stale.
+      await refreshStaged(taskId);
+      try {
+        const refreshed = await ipc.listTaskArtifacts(taskId);
+        setArtifactGroups((groups) =>
+          groups.some((group) => group.taskId === taskId)
+            ? groups.map((group) =>
+                group.taskId === taskId ? { taskId, artifacts: refreshed } : group,
+              )
+            : [...groups, { taskId, artifacts: refreshed }],
+        );
+      } catch {
+        // The files did change; a stale panel is not worth an error over it.
+      }
+      return results;
+    },
+    [taskId, refreshStaged],
+  );
+
+  const discardStaged = useCallback(
+    async (changeIds: string[]) => {
+      if (!taskId) return;
+      await ipc.discardStagedChanges(taskId, changeIds);
+      await refreshStaged(taskId);
+    },
+    [taskId, refreshStaged],
   );
 
   const openConversation = useCallback(
@@ -640,6 +715,19 @@ export function App() {
             }}
             onPickFolder={pickFolder}
           />
+        ) : reviewing && taskId ? (
+          // A full-width slot: the studio's list-and-diff split needs room,
+          // and reviewing a change is the whole of what someone is doing
+          // while they are doing it.
+          <ArtifactStudio
+            taskId={taskId}
+            changes={staged}
+            loadError={stagedError}
+            onReload={() => void refreshStaged(taskId)}
+            onApply={applyStaged}
+            onDiscard={discardStaged}
+            onClose={() => setReviewing(false)}
+          />
         ) : view === "skills" ? (
           <EmptyState
             title="Reusable workflows are coming"
@@ -720,12 +808,17 @@ export function App() {
         )}
       </main>
 
-      {view === "task" && panelArtifacts.length > 0 ? (
+      {view === "task" && (panelArtifacts.length > 0 || staged.length > 0) ? (
+        // The panel lists files that exist; the studio lists changes that do
+        // not exist yet. Both can be true at once, so the panel keeps its
+        // notice and hands over rather than trying to show proposals itself.
         <ArtifactPanel
           artifacts={panelArtifacts}
           onOpen={openArtifact}
           onReveal={revealArtifact}
           onUndo={undoArtifact}
+          pendingCount={staged.length}
+          onReviewPending={() => setReviewing(true)}
         />
       ) : null}
     </div>

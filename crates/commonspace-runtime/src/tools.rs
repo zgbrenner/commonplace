@@ -6,9 +6,15 @@
 //! 1. is authenticated with a per-session bearer token,
 //! 2. is classified and evaluated by the deterministic policy engine,
 //! 3. is escalated to the user when policy says approval is needed,
-//! 4. is executed by [`commonspace_documents::SafeFs`], which backs up,
-//!    verifies, and journals it,
+//! 4. if it mutates a file, is staged by
+//!    [`commonspace_documents::staging::StagingStore`] rather than written —
+//!    nothing lands in the user's file until they review and apply it,
 //! 5. emits normalized events for the timeline and artifact panel.
+//!
+//! [`commonspace_documents::SafeFs`] still backs up, verifies, and journals
+//! for read-side tools and for the apply path (which turns an accepted
+//! proposal into a real write) — it just no longer runs inline with a tool
+//! call here.
 //!
 //! Transport is JSON-RPC 2.0 over HTTP bound to loopback only. Narrow typed
 //! tools are exposed — never a general shell tool.
@@ -22,7 +28,7 @@ use commonspace_core::{
     AgentEvent, Artifact, ArtifactId, ArtifactKind, OperationClass, PolicyVerdict, RiskLevel,
     TaskId, ToolCallId, ToolStatus,
 };
-use commonspace_documents::{inspect, office, sheets, textio, FileOperation, SafeFs};
+use commonspace_documents::{inspect, office, sheets, textio, FileOperation, SafeFs, StagingStore};
 use commonspace_permissions::{PolicyEngine, PolicyRequest};
 use serde_json::{json, Value};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -51,10 +57,18 @@ const MAX_COLS_CEILING: usize = 1_024;
 pub struct ToolContext {
     pub task_id: TaskId,
     pub policy: PolicyEngine,
+    /// Backs the apply path and read-side tools. A tool call arriving
+    /// through this server never writes through this directly — see
+    /// `staging` below.
     pub fs: SafeFs,
+    /// Where a mutating tool's output actually goes: held outside the
+    /// user's files until they review and apply it.
+    pub staging: StagingStore,
     pub broker: PermissionBroker,
     pub events: UnboundedSender<AgentEvent>,
-    /// Journaled operations are handed here for persistence + undo.
+    /// Journaled operations are handed here for persistence + undo. Only the
+    /// apply path feeds this now — staging a proposal journals nothing,
+    /// since nothing has happened to undo yet.
     pub journal: UnboundedSender<FileOperation>,
 }
 
@@ -234,7 +248,12 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "create_file",
-            "description": "Create a new file. Fails if the file already exists.",
+            "description": "Propose creating a new file. This stages the content for the person using \
+                            Commonspace to review — it does not write to disk, and the file does not exist \
+                            until they apply the change. Fails if the file already exists. After calling \
+                            this, do not read the path back expecting the content to be there, and do not \
+                            tell the person the file has been created — say a change is proposed and \
+                            awaiting their review.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -246,7 +265,11 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "overwrite_file",
-            "description": "Replace an existing file's contents. The original is backed up first and the change can be undone.",
+            "description": "Propose replacing an existing file's contents. This stages the new content for \
+                            the person using Commonspace to review — the file on disk keeps its original \
+                            contents until they apply the change. After calling this, do not read the path \
+                            back expecting the new content, and do not tell the person the file has been \
+                            updated — say a change is proposed and awaiting their review.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -301,13 +324,17 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "create_spreadsheet",
-            "description": "Create a spreadsheet (.xlsx) by describing its sheets, columns and rows. \
-                            Send every figure as a number cell — {\"kind\": \"number\", \"value\": 1240} — and never as \
-                            text: the person receiving this file needs to sort, total and chart these values, and a \
-                            number stored as text does none of those. Use a column 'format' to control how a number \
-                            looks (currency, percent, decimal places); formatting is display only and leaves the \
-                            underlying value computable. Commonspace builds and validates the file; never write \
-                            spreadsheet bytes yourself.",
+            "description": "Propose a spreadsheet (.xlsx) by describing its sheets, columns and rows. \
+                            Commonspace builds and validates it, then stages it for the person using \
+                            Commonspace to review — it does not write to disk, and the file does not exist \
+                            until they apply the change. Send every figure as a number cell — \
+                            {\"kind\": \"number\", \"value\": 1240} — and never as text: the person receiving \
+                            this file needs to sort, total and chart these values, and a number stored as text \
+                            does none of those. Use a column 'format' to control how a number looks (currency, \
+                            percent, decimal places); formatting is display only and leaves the underlying \
+                            value computable. Never write spreadsheet bytes yourself. After calling this, do \
+                            not read the path back expecting the file to be there, and do not tell the person \
+                            it has been created — say a change is proposed and awaiting their review.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -388,7 +415,13 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "create_document",
-            "description": "Create a Word document (.docx) from Markdown-style content. Headings use '#', bullets use '-'. Commonspace builds and validates the file; never write .docx bytes yourself.",
+            "description": "Propose a Word document (.docx) from Markdown-style content. Headings use '#', \
+                            bullets use '-'. Commonspace builds and validates the file, then stages it for \
+                            the person using Commonspace to review — it does not write to disk, and the \
+                            document does not exist until they apply the change. Never write .docx bytes \
+                            yourself. After calling this, do not read the path back expecting the file to be \
+                            there, and do not tell the person it has been created — say a change is proposed \
+                            and awaiting their review.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -403,7 +436,10 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rename_move",
-            "description": "Rename a file or move it to another folder.",
+            "description": "Propose renaming a file or moving it to another folder. This stages the change \
+                            for the person using Commonspace to review — the file stays exactly where it is \
+                            until they apply it. After calling this, do not tell the person the file has been \
+                            moved — say a change is proposed and awaiting their review.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -415,7 +451,10 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "delete_to_trash",
-            "description": "Move a file to the operating system's trash. A backup copy is kept so this can be undone.",
+            "description": "Propose deleting a file. This stages the deletion for the person using \
+                            Commonspace to review — the file stays exactly where it is, not the trash, until \
+                            they apply the change. After calling this, do not tell the person the file has \
+                            been deleted — say a change is proposed and awaiting their review.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "path": path_prop("Absolute path of the file to delete.") },
@@ -423,6 +462,32 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
     ]
+}
+
+/// What a successful call produces: the text handed back to the agent, and —
+/// for tools that staged a change — a short summary for the `tool.completed`
+/// event, so the UI learns what was proposed without waiting on the agent to
+/// describe it in its own words (which is exactly what must not happen: a
+/// proposal is not a fact until the person applies it).
+struct ToolOutcome {
+    text: String,
+    event_summary: Option<String>,
+}
+
+impl ToolOutcome {
+    fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            event_summary: None,
+        }
+    }
+
+    fn staged(text: impl Into<String>, event_summary: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            event_summary: Some(event_summary.into()),
+        }
+    }
 }
 
 async fn call_tool(context: &ToolContext, params: &Value) -> Result<Value, RpcError> {
@@ -436,13 +501,13 @@ async fn call_tool(context: &ToolContext, params: &Value) -> Result<Value, RpcEr
     let outcome = dispatch(context, name, &args, &call_id).await;
 
     match outcome {
-        Ok(text) => {
+        Ok(outcome) => {
             let _ = context.events.send(AgentEvent::ToolCompleted {
                 call_id,
                 status: ToolStatus::Succeeded,
-                summary: None,
+                summary: outcome.event_summary,
             });
-            Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": false }))
+            Ok(json!({ "content": [{ "type": "text", "text": outcome.text }], "isError": false }))
         }
         Err(ToolFailure::Denied(message)) => {
             let _ = context.events.send(AgentEvent::ToolCompleted {
@@ -563,12 +628,76 @@ fn read_workbook(path: &std::path::Path, args: &Value) -> Result<sheets::Workboo
     sheets::read_spreadsheet(path, limits).map_err(|e| ToolFailure::Failed(e.to_string()))
 }
 
+/// `create_docx`/`create_xlsx` write and self-verify by reading back the
+/// file at the exact path they're given — there's no in-memory form to ask
+/// them for instead. Building at a throwaway sibling under the OS temp
+/// directory and staging whatever bytes come out keeps that verification
+/// while guaranteeing the caller's real path is never touched.
+fn drafted_bytes(
+    extension: &str,
+    build: impl FnOnce(&std::path::Path) -> Result<(), String>,
+) -> Result<Vec<u8>, ToolFailure> {
+    let scratch = std::env::temp_dir().join(format!(
+        "commonspace-draft-{}.{extension}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let outcome = build(&scratch).and_then(|()| {
+        std::fs::read(&scratch).map_err(|e| format!("could not read the drafted file: {e}"))
+    });
+    // Best-effort: the scratch file is a throwaway either way, and its
+    // presence never reaches the agent or the user.
+    let _ = std::fs::remove_file(&scratch);
+    outcome.map_err(ToolFailure::Failed)
+}
+
+/// The agent-facing text for a staged create. Spelled out once so every
+/// creating tool tells the agent the same unambiguous thing: nothing exists
+/// yet, and it must not claim otherwise.
+fn staged_create_notice(target: &std::path::Path) -> String {
+    format!(
+        "Proposed: create {}. This is staged for the person using Commonspace to review — \
+         nothing has been written to disk. Do not tell them the file has been created, and \
+         do not try to read it back until they apply the change.",
+        display_name(target)
+    )
+}
+
+fn staged_modify_notice(target: &std::path::Path) -> String {
+    format!(
+        "Proposed: replace the contents of {}. This is staged for the person using \
+         Commonspace to review — the file on disk still holds its original contents. Do not \
+         tell them it has been updated, and do not rely on the new contents being there \
+         until they apply the change.",
+        display_name(target)
+    )
+}
+
+fn staged_move_notice(from: &std::path::Path, to: &std::path::Path) -> String {
+    format!(
+        "Proposed: move {} to {}. This is staged for the person using Commonspace to \
+         review — {} has not moved. Do not tell them it has been moved until they apply the \
+         change.",
+        display_name(from),
+        to.display(),
+        display_name(from)
+    )
+}
+
+fn staged_delete_notice(target: &std::path::Path) -> String {
+    format!(
+        "Proposed: delete {}. This is staged for the person using Commonspace to review — \
+         the file is still in place, nothing has been sent to the trash. Do not tell them it \
+         has been deleted until they apply the change.",
+        display_name(target)
+    )
+}
+
 async fn dispatch(
     context: &ToolContext,
     name: &str,
     args: &Value,
     call_id: &ToolCallId,
-) -> Result<String, ToolFailure> {
+) -> Result<ToolOutcome, ToolFailure> {
     match name {
         "list_folder" => {
             let path = arg_path(args, "path")?;
@@ -588,7 +717,9 @@ async fn dispatch(
                 .unwrap_or(500) as usize;
             let listing = inspect::list_dir(&path, depth, max)
                 .map_err(|e| ToolFailure::Failed(format!("could not list the folder: {e}")))?;
-            serde_json::to_string_pretty(&listing).map_err(|e| ToolFailure::Failed(e.to_string()))
+            serde_json::to_string_pretty(&listing)
+                .map(ToolOutcome::plain)
+                .map_err(|e| ToolFailure::Failed(e.to_string()))
         }
         "read_file" => {
             let path = arg_path(args, "path")?;
@@ -612,7 +743,7 @@ async fn dispatch(
             if text.truncated {
                 out.push_str("\n\n[Commonspace: file truncated for length]");
             }
-            Ok(out)
+            Ok(ToolOutcome::plain(out))
         }
         "find_duplicates" => {
             let path = arg_path(args, "path")?;
@@ -631,7 +762,9 @@ async fn dispatch(
                 .into_iter()
                 .map(|(hash, paths)| json!({ "content_hash": hash, "paths": paths }))
                 .collect();
-            serde_json::to_string_pretty(&described).map_err(|e| ToolFailure::Failed(e.to_string()))
+            serde_json::to_string_pretty(&described)
+                .map(ToolOutcome::plain)
+                .map_err(|e| ToolFailure::Failed(e.to_string()))
         }
         "read_document" => {
             let path = arg_path(args, "path")?;
@@ -664,6 +797,7 @@ async fn dispatch(
             if SPREADSHEET_EXTENSIONS.contains(&extension.as_str()) {
                 let workbook = read_workbook(&path, args)?;
                 return serde_json::to_string_pretty(&workbook)
+                    .map(ToolOutcome::plain)
                     .map_err(|e| ToolFailure::Failed(e.to_string()));
             }
             let extracted = match extension.as_str() {
@@ -678,7 +812,9 @@ async fn dispatch(
                 }
             }
             .map_err(|e| ToolFailure::Failed(e.to_string()))?;
-            serde_json::to_string_pretty(&extracted).map_err(|e| ToolFailure::Failed(e.to_string()))
+            serde_json::to_string_pretty(&extracted)
+                .map(ToolOutcome::plain)
+                .map_err(|e| ToolFailure::Failed(e.to_string()))
         }
         "read_spreadsheet" => {
             let path = arg_path(args, "path")?;
@@ -697,7 +833,9 @@ async fn dispatch(
                 None,
             );
             let workbook = read_workbook(&path, args)?;
-            serde_json::to_string_pretty(&workbook).map_err(|e| ToolFailure::Failed(e.to_string()))
+            serde_json::to_string_pretty(&workbook)
+                .map(ToolOutcome::plain)
+                .map_err(|e| ToolFailure::Failed(e.to_string()))
         }
         "create_spreadsheet" => {
             let path = arg_path(args, "path")?;
@@ -713,7 +851,7 @@ async fn dispatch(
             started(
                 context,
                 call_id,
-                &format!("Writing {}", display_name(&path)),
+                &format!("Drafting {}", display_name(&path)),
                 None,
             );
             if path.exists() {
@@ -727,14 +865,19 @@ async fn dispatch(
                     "A spreadsheet needs at least one sheet.".into(),
                 ));
             }
-            let result = sheets::create_xlsx(&path, &new_sheets)
+            let bytes = drafted_bytes("xlsx", |scratch| {
+                sheets::create_xlsx(scratch, &new_sheets)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })?;
+            context
+                .staging
+                .stage_create(&path, &bytes)
                 .map_err(|e| ToolFailure::Failed(e.to_string()))?;
-            // Journaled as a create so the artifact card can offer undo.
-            let mut op =
-                FileOperation::new(commonspace_documents::FileOpKind::Create, path.clone());
-            op.hash_after = inspect::hash_file(&path).ok();
-            record(context, &op, &path, false, None);
-            Ok(result.user_summary)
+            Ok(ToolOutcome::staged(
+                staged_create_notice(&path),
+                format!("Proposed creating {}", display_name(&path)),
+            ))
         }
         "create_document" => {
             let path = arg_path(args, "path")?;
@@ -750,7 +893,7 @@ async fn dispatch(
             started(
                 context,
                 call_id,
-                &format!("Writing {}", display_name(&path)),
+                &format!("Drafting {}", display_name(&path)),
                 None,
             );
             if path.exists() {
@@ -760,14 +903,19 @@ async fn dispatch(
                 )));
             }
             let blocks = office::blocks_from_markdown(&content);
-            let result = office::create_docx(&path, &blocks)
+            let bytes = drafted_bytes("docx", |scratch| {
+                office::create_docx(scratch, &blocks)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })?;
+            context
+                .staging
+                .stage_create(&path, &bytes)
                 .map_err(|e| ToolFailure::Failed(e.to_string()))?;
-            // Journaled as a create so the artifact card can offer undo.
-            let mut op =
-                FileOperation::new(commonspace_documents::FileOpKind::Create, path.clone());
-            op.hash_after = inspect::hash_file(&path).ok();
-            record(context, &op, &path, false, None);
-            Ok(result.user_summary)
+            Ok(ToolOutcome::staged(
+                staged_create_notice(&path),
+                format!("Proposed creating {}", display_name(&path)),
+            ))
         }
         "create_file" => {
             let path = arg_path(args, "path")?;
@@ -783,15 +931,17 @@ async fn dispatch(
             started(
                 context,
                 call_id,
-                &format!("Creating {}", display_name(&path)),
+                &format!("Drafting {}", display_name(&path)),
                 None,
             );
-            let (result, op) = context
-                .fs
-                .create_file(&path, content.as_bytes())
+            context
+                .staging
+                .stage_create(&path, content.as_bytes())
                 .map_err(|e| ToolFailure::Failed(e.to_string()))?;
-            record(context, &op, &path, false, None);
-            Ok(result.user_summary)
+            Ok(ToolOutcome::staged(
+                staged_create_notice(&path),
+                format!("Proposed creating {}", display_name(&path)),
+            ))
         }
         "overwrite_file" => {
             let path = arg_path(args, "path")?;
@@ -807,16 +957,17 @@ async fn dispatch(
             started(
                 context,
                 call_id,
-                &format!("Updating {}", display_name(&path)),
+                &format!("Drafting changes to {}", display_name(&path)),
                 None,
             );
-            let (result, op) = context
-                .fs
-                .overwrite_file(&path, content.as_bytes())
+            context
+                .staging
+                .stage_modify(&path, content.as_bytes())
                 .map_err(|e| ToolFailure::Failed(e.to_string()))?;
-            let summary = result.user_summary.clone();
-            record(context, &op, &path, true, Some("Contents replaced".into()));
-            Ok(summary)
+            Ok(ToolOutcome::staged(
+                staged_modify_notice(&path),
+                format!("Proposed changes to {}", display_name(&path)),
+            ))
         }
         "rename_move" => {
             let from = arg_path(args, "from")?;
@@ -838,16 +989,23 @@ async fn dispatch(
             started(
                 context,
                 call_id,
-                &format!("Moving {}", display_name(&from)),
+                &format!("Proposing to move {}", display_name(&from)),
                 None,
             );
-            let (result, op) = context
-                .fs
-                .rename_or_move(&from, &to)
-                .map_err(|e| ToolFailure::Failed(e.to_string()))?;
-            let summary = result.user_summary.clone();
-            record(context, &op, &to, true, Some("Renamed or moved".into()));
-            Ok(summary)
+            let staged = if same_folder {
+                context.staging.stage_rename(&from, &to)
+            } else {
+                context.staging.stage_move(&from, &to)
+            };
+            staged.map_err(|e| ToolFailure::Failed(e.to_string()))?;
+            Ok(ToolOutcome::staged(
+                staged_move_notice(&from, &to),
+                format!(
+                    "Proposed moving {} to {}",
+                    display_name(&from),
+                    to.display()
+                ),
+            ))
         }
         "delete_to_trash" => {
             let path = arg_path(args, "path")?;
@@ -862,16 +1020,17 @@ async fn dispatch(
             started(
                 context,
                 call_id,
-                &format!("Deleting {}", display_name(&path)),
+                &format!("Proposing to delete {}", display_name(&path)),
                 None,
             );
-            let (result, op) = context
-                .fs
-                .delete_to_trash(&path)
+            context
+                .staging
+                .stage_delete(&path)
                 .map_err(|e| ToolFailure::Failed(e.to_string()))?;
-            let summary = result.user_summary.clone();
-            let _ = context.journal.send(op);
-            Ok(summary)
+            Ok(ToolOutcome::staged(
+                staged_delete_notice(&path),
+                format!("Proposed deleting {}", display_name(&path)),
+            ))
         }
         other => Err(ToolFailure::Protocol(RpcError::invalid_params(format!(
             "unknown tool: {other}"
@@ -916,8 +1075,10 @@ async fn gate(
                         paths,
                         items: Vec::new(),
                         risk: risk_of(class),
-                        // Deletions go to the OS trash and keep a backup, so
-                        // nothing Commonspace does through these tools is
+                        // Approval here only authorizes staging a proposal,
+                        // not applying it — and even once applied, a delete
+                        // goes to the OS trash with a backup kept, so nothing
+                        // Commonspace does through these tools is
                         // irreversible today. This flag exists for the
                         // operations that will be (permanent delete, send,
                         // publish) and must be set honestly when they land.
@@ -956,7 +1117,16 @@ fn started(context: &ToolContext, call_id: &ToolCallId, title: &str, detail: Opt
 }
 
 /// Journal an operation and surface the resulting artifact.
-fn record(
+///
+/// Nothing in this file calls it anymore: a staged proposal has no
+/// `FileOperation` to journal until the person applies it, and an
+/// `Artifact` event asserting a create/modify/etc. happened would be false
+/// while it's still pending review. This is exactly what the apply path
+/// needs once a proposal is accepted — a real write goes through
+/// `ToolContext::fs`, producing the `FileOperation` this expects — so it
+/// stays `pub(crate)` rather than being deleted.
+#[allow(dead_code)]
+pub(crate) fn record(
     context: &ToolContext,
     op: &FileOperation,
     path: &std::path::Path,
@@ -1030,6 +1200,7 @@ mod tests {
                 PathGuard::new([&ws]),
                 BackupStore::new(tmp.path().join("backups")),
             ),
+            staging: StagingStore::new(tmp.path().join("staging")),
             broker: broker.clone(),
             events: event_tx,
             journal: journal_tx,
@@ -1130,7 +1301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_in_scope_succeeds_and_journals() {
+    async fn create_in_scope_is_staged_not_written() {
         let mut h = approved_harness().await;
         let target = h.ws.join("notes.md");
         let (_, response) = rpc(
@@ -1140,26 +1311,50 @@ mod tests {
         )
         .await;
         assert_eq!(response["result"]["isError"], false, "{response}");
-        assert_eq!(std::fs::read_to_string(&target).expect("read"), "# hello");
-
-        // The journal deliberately records the *resolved* path, which can be
-        // spelled differently from the one we asked for: on some Windows
-        // machines the temp directory contains an 8.3 short name (for example
-        // `RUNNER~1`) that canonicalization expands. Compare both canonically
-        // rather than asserting on one platform's spelling.
-        let op = h.journal.recv().await.expect("journal entry");
-        assert_eq!(
-            std::fs::canonicalize(&op.source).expect("canonicalize journaled path"),
-            std::fs::canonicalize(&target).expect("canonicalize target"),
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.to_lowercase().contains("proposed"),
+            "the agent must be told this is a proposal, not a completed write: {text}"
         );
 
-        let mut saw_artifact = false;
+        // The whole point of staging: the target is never touched.
+        assert!(
+            !target.exists(),
+            "a staged create must leave the target absent on disk"
+        );
+
+        // Journalling moves to apply time; a staged proposal journals
+        // nothing, since there is nothing yet to undo.
+        assert!(
+            h.journal.try_recv().is_err(),
+            "nothing should be journaled before the change is applied"
+        );
+
+        // No artifact.* event either — that shape asserts a file was
+        // created or modified, which would be false while this is still
+        // pending review. The proposal is instead named on the
+        // tool.completed event's summary.
+        let mut saw_proposal_summary = false;
         while let Ok(event) = h.events.try_recv() {
-            if matches!(event, AgentEvent::ArtifactCreated { .. }) {
-                saw_artifact = true;
+            match event {
+                AgentEvent::ArtifactCreated { .. } | AgentEvent::ArtifactModified { .. } => {
+                    panic!("a staged proposal must not claim an artifact was created or modified")
+                }
+                AgentEvent::ToolCompleted {
+                    summary: Some(summary),
+                    ..
+                } if summary.to_lowercase().contains("proposed") => {
+                    saw_proposal_summary = true;
+                }
+                _ => {}
             }
         }
-        assert!(saw_artifact, "expected an artifact.created event");
+        assert!(
+            saw_proposal_summary,
+            "expected a tool.completed event naming the proposal"
+        );
         h.handle.expect("handle").shutdown().await;
     }
 
@@ -1275,8 +1470,11 @@ mod tests {
         h.handle.expect("handle").shutdown().await;
     }
 
+    /// Approval authorizes staging the proposal, not writing it — the file
+    /// stays exactly as it was even after the person says yes, because
+    /// applying is a separate, later action they take from the preview.
     #[tokio::test]
-    async fn modify_waits_for_approval_then_applies() {
+    async fn modify_waits_for_approval_then_stages() {
         let mut h = harness().await;
         let target = h.ws.join("contract.txt");
         std::fs::write(&target, "original").expect("seed");
@@ -1317,7 +1515,12 @@ mod tests {
 
         let response = request.await.expect("join");
         assert_eq!(response["result"]["isError"], false, "{response}");
-        assert_eq!(std::fs::read_to_string(&target).expect("read"), "revised");
+        // Still original: approval staged the proposal, it did not write it.
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "original");
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.to_lowercase().contains("proposed"), "{text}");
         h.handle.expect("handle").shutdown().await;
     }
 
@@ -1357,6 +1560,67 @@ mod tests {
         let response = request.await.expect("join");
         assert_eq!(response["result"]["isError"], true, "{response}");
         assert_eq!(std::fs::read_to_string(&target).expect("read"), "original");
+        h.handle.expect("handle").shutdown().await;
+    }
+
+    /// `delete_to_trash` proposes a deletion; it must never actually reach
+    /// the OS trash until the person applies the change.
+    #[tokio::test]
+    async fn delete_to_trash_stages_and_leaves_the_file_in_place() {
+        let mut h = approved_harness().await;
+        let target = h.ws.join("draft.txt");
+        std::fs::write(&target, "keep me").expect("seed");
+
+        // Deleting asks even under an approved plan — the envelope covers
+        // creating, changing and arranging files, never sending one to the
+        // trash. Staging does not soften that, so the request has to be
+        // answered before it can resolve.
+        let url = h.url.clone();
+        let token = h.token.clone();
+        let path = target.clone();
+        let request = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(&url)
+                .bearer_auth(token)
+                .json(&call("delete_to_trash", json!({ "path": path })))
+                .send()
+                .await
+                .expect("request")
+                .json::<Value>()
+                .await
+                .expect("json")
+        });
+
+        let asked = loop {
+            let event = h.events.recv().await.expect("event");
+            if let AgentEvent::PermissionRequested { request } = event {
+                break request;
+            }
+        };
+        assert_eq!(asked.operation, OperationClass::Delete);
+        assert!(h.broker.respond(
+            &asked.id,
+            PermissionDecision::Approve {
+                scope: DecisionScope::Once
+            }
+        ));
+
+        let response = request.await.expect("join");
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.to_lowercase().contains("proposed"), "{text}");
+
+        assert!(
+            target.exists(),
+            "a staged delete must not trash the real file"
+        );
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "keep me");
+        assert!(
+            h.journal.try_recv().is_err(),
+            "nothing should be journaled before the change is applied"
+        );
         h.handle.expect("handle").shutdown().await;
     }
 
@@ -1402,9 +1666,20 @@ mod tests {
             description.contains("\"kind\": \"number\""),
             "the number-cell form must be spelled out: {description}"
         );
+        // Case-insensitive: the sentence reads better mid-paragraph with a
+        // capital, and what matters is that the instruction is present.
         assert!(
-            description.contains("never write spreadsheet bytes yourself"),
+            description
+                .to_lowercase()
+                .contains("never write spreadsheet bytes yourself"),
             "the agent must be told Commonspace builds the file: {description}"
+        );
+        // The staging promise is part of the contract with the agent now: a
+        // model that reads the path back, or reports the file as created,
+        // tells the person something untrue.
+        assert!(
+            description.to_lowercase().contains("stages it"),
+            "the agent must be told the file is staged, not written: {description}"
         );
         let cell = &create["inputSchema"]["properties"]["sheets"]["items"]["properties"]["rows"]
             ["items"]["items"];
@@ -1540,10 +1815,12 @@ mod tests {
         h.handle.expect("handle").shutdown().await;
     }
 
-    /// The wiring end to end: a written workbook is journaled for undo, and
-    /// both the spreadsheet tool and `read_document` can read it back.
+    /// A spreadsheet is built (and self-verified by its own writer) at a
+    /// scratch location, then staged — the caller's real path is never
+    /// touched, and re-proposing over a file that genuinely exists there is
+    /// still refused up front, before staging is even attempted.
     #[tokio::test]
-    async fn create_then_read_back_journals_and_routes() {
+    async fn create_spreadsheet_stages_without_writing_and_refuses_to_clobber_a_real_file() {
         let mut h = approved_harness().await;
         let target = h.ws.join("revenue.xlsx");
         let sheets = json!([{
@@ -1567,20 +1844,23 @@ mod tests {
         )
         .await;
         assert_eq!(created["result"]["isError"], false, "{created}");
-        assert!(target.exists());
+        let text = created["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.to_lowercase().contains("proposed"), "{text}");
 
-        let op = h.journal.recv().await.expect("journal entry");
-        assert_eq!(op.kind, commonspace_documents::FileOpKind::Create);
-        assert!(op.hash_after.is_some(), "undo needs the resulting hash");
-        let mut saw_artifact = false;
-        while let Ok(event) = h.events.try_recv() {
-            if matches!(event, AgentEvent::ArtifactCreated { .. }) {
-                saw_artifact = true;
-            }
-        }
-        assert!(saw_artifact, "expected an artifact.created event");
+        assert!(
+            !target.exists(),
+            "a staged spreadsheet must leave the target absent on disk"
+        );
+        assert!(
+            h.journal.try_recv().is_err(),
+            "nothing should be journaled before the change is applied"
+        );
 
-        // Refusing to clobber uses the same wording as create_document.
+        // Refusing to clobber an existing file uses the same wording as
+        // create_document, and is checked before staging is attempted.
+        std::fs::write(&target, "not actually a workbook").expect("seed a real file");
         let (_, again) = rpc(
             &h,
             call(
@@ -1595,24 +1875,6 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("already exists; ask before replacing it"));
-
-        for tool in ["read_spreadsheet", "read_document"] {
-            let (_, read) = rpc(&h, call(tool, json!({"path": target})), None).await;
-            assert_eq!(read["result"]["isError"], false, "{tool}: {read}");
-            let text = read["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap_or_default();
-            let workbook: sheets::Workbook =
-                serde_json::from_str(text).expect("a workbook comes back as JSON");
-            let sheet = workbook.sheets.first().expect("one sheet");
-            assert_eq!(sheet.name, "Q3");
-            assert_eq!(sheet.headers, vec!["Client", "Billed"]);
-            // The point of a spreadsheet: the amount survives as a number.
-            assert_eq!(
-                sheet.rows[0][1],
-                sheets::CellValue::Number { value: 1240.5 }
-            );
-        }
         h.handle.expect("handle").shutdown().await;
     }
 
