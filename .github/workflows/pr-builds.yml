@@ -63,7 +63,7 @@ jobs:
           - os: macos-latest
             bundles: app,dmg
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Key kept distinct from ci.yml's (`<os>`) and release.yml's
       # (`release-<os>`) so caches for lint/test, release, and PR-build
