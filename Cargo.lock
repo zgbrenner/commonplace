@@ -892,6 +892,7 @@ dependencies = [
  "axum",
  "chrono",
  "commonspace-agents",
+ "commonspace-capabilities",
  "commonspace-core",
  "commonspace-documents",
  "commonspace-permissions",

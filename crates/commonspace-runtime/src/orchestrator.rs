@@ -196,6 +196,18 @@ pub struct Orchestrator {
     /// user's own folders would be a place their files could appear without
     /// them having asked for it.
     staging_root: PathBuf,
+    /// Where a user's own skills live: skill directories Commonspace manages,
+    /// under its data directory rather than in anyone else's namespace.
+    ///
+    /// Commonspace reads the portable Agent Skills format, but deliberately
+    /// does not auto-load `.claude/skills` out of a project folder. A skill is
+    /// instructions the model will follow, and a repository someone cloned is
+    /// not a place to pick those up silently — the same reason Commonspace
+    /// passes `--setting-sources user` to the provider CLI instead of letting
+    /// a checked-in settings file configure the run. A project's own skills
+    /// live at `<workspace>/.commonspace/skills`, which is somewhere a person
+    /// had to deliberately put them.
+    skills_root: PathBuf,
     policy_settings: PolicySettings,
     /// Tasks holding in `AwaitingApproval`, keyed by task. In-memory only:
     /// after a restart the sessions are gone, and crash recovery fails these
@@ -215,9 +227,23 @@ impl Orchestrator {
             broker: PermissionBroker::new(),
             backup_root: data_dir.join("backups"),
             staging_root: data_dir.join("staged"),
+            skills_root: data_dir.join("skills"),
             policy_settings: PolicySettings::default(),
             pending: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Where to look for skills, in precedence order: the user's own first,
+    /// then each workspace root's `.commonspace/skills`, so a project can
+    /// deliberately override a personal skill of the same name.
+    fn skill_roots(&self, workspace_roots: &[PathBuf]) -> Vec<PathBuf> {
+        let mut roots = vec![self.skills_root.clone()];
+        roots.extend(
+            workspace_roots
+                .iter()
+                .map(|root| root.join(".commonspace").join("skills")),
+        );
+        roots
     }
 
     pub fn broker(&self) -> &PermissionBroker {
@@ -511,6 +537,19 @@ impl Orchestrator {
         // unreviewed changes with it rather than leaving them for the next
         // task to inherit.
         let staging = StagingStore::new(self.staging_root.join(task_id.as_ref()));
+        // Built per task, not cached: a skill the person just installed
+        // should be there for the next thing they ask, without restarting.
+        // A dozen tool descriptors and a handful of small Markdown files is
+        // not a cost worth a cache-invalidation bug.
+        let (capabilities, skill_report) = crate::tools::build_registry(&self.skill_roots(&roots));
+        if !skill_report.skipped.is_empty() {
+            // Surfaced, not swallowed. A skill that quietly does not exist is
+            // the most confusing failure this feature can have, and the user
+            // is the only one who can fix the file.
+            let _ = events.send(AgentEvent::Warning {
+                message: skills_skipped_message(&skill_report),
+            });
+        }
         let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
         let context = Arc::new(ToolContext {
             task_id: task_id.clone(),
@@ -520,6 +559,7 @@ impl Orchestrator {
             broker: self.broker.clone(),
             events: events.clone(),
             journal: journal_tx,
+            capabilities: Arc::new(capabilities),
         });
         let tool_server = ToolServer::start(context).await?;
 
@@ -1097,6 +1137,27 @@ fn preview_of(store: &StagingStore, change: &StagedChange) -> commonspace_docume
     }
     let _ = extracted_text_diff;
     text_diff(&old_text, &new_text, budget)
+}
+
+/// What to tell someone when a skill they installed did not load.
+///
+/// Names the file rather than the count. "1 skill was skipped" sends a person
+/// looking; the path and the reason let them go and fix it.
+fn skills_skipped_message(report: &commonspace_capabilities::LoadReport) -> String {
+    const SHOWN: usize = 3;
+    let mut lines: Vec<String> = report
+        .skipped
+        .iter()
+        .take(SHOWN)
+        .map(|error| error.to_string())
+        .collect();
+    if report.skipped.len() > SHOWN {
+        lines.push(format!("…and {} more.", report.skipped.len() - SHOWN));
+    }
+    format!(
+        "Some skills could not be used, so they are not available in this task:\n{}",
+        lines.join("\n")
+    )
 }
 
 /// The file a proposal is about, named the way a person would name it.
